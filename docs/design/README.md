@@ -1,14 +1,16 @@
 # Design
 
-*How* Leash is built. This layer is written **after** the specification's open questions (`../spec/SPEC.md` §11) are resolved — a design that commits to *how* before *what* is settled builds the wrong thing precisely.
+*How* Leash is built. This layer is written after the specification is settled: a design that
+commits to *how* before *what* builds the wrong thing precisely.
 
-Status: **not started.** The design phase begins once SPEC.md leaves DRAFT (open questions closed into requirements/ADRs).
+Status: **not started.** The spec is settled (v0.2), so the design phase can begin.
 
-When it begins, this directory will hold, at minimum:
-- the module decomposition (matching the responsibilities named in the architecture contract: `policy`, `supervisor`, `recorder`, `snapshot`, `sandbox`, `cli`);
-- the mediated-syscall enumeration and how each is decided;
-- the notify-loop protocol and its fail-closed handling;
-- the snapshot/rewind mechanism chosen in OQ-1/OQ-2;
-- the policy schema chosen in OQ-3.
+This directory will hold, at minimum:
+- the module decomposition (`policy`, `supervisor`, `recorder`, `snapshot`, `sandbox`, `cli`);
+- the mediated-syscall enumeration and how each is decided (FR-4);
+- the notify-loop protocol and its fail-closed handling (FR-9);
+- the snapshot/rewind mechanism (ADR-0009, FR-17);
+- the policy schema (FR-18).
 
-Each design choice cites the spec requirement it satisfies and, where it is a hard-to-reverse trade-off, is accompanied by an ADR.
+Each design choice cites the spec requirement it satisfies and, where it is a hard-to-reverse
+trade-off, is accompanied by an ADR.

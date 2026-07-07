@@ -40,6 +40,14 @@ _Avoid_: config, ruleset (reserve "ruleset" for the Landlock kernel object)
 A decision that pauses the child and requests a human yes/no before proceeding.
 _Avoid_: prompt (collides with LLM "prompt"), confirm
 
+**Record-only** (mode):
+The run mode in which every mediated syscall is allowed and traced; nothing is enforced (FR-19). The mode a run gets when no policy file exists.
+_Avoid_: monitor mode, audit mode, dry-run
+
+**Enforce** (mode):
+The run mode in which decisions are enforced deny-by-default per the **policy** (FR-19). Requires a policy file.
+_Avoid_: strict mode, secure mode, sandbox mode
+
 ## Recording & time travel
 
 **Event**:
@@ -59,7 +67,7 @@ The captured state of the workspace at a **step** boundary, enabling rewind and 
 _Avoid_: checkpoint, backup
 
 **Step**:
-A boundary in a run at which a snapshot may be taken. (Exactly what constitutes a step is an open question — see SPEC.)
+One coalesced burst of the child's mediated filesystem writes; steps partition a run, and a snapshot is captured at each step boundary (FR-17). Rewind targets are step boundaries.
 _Avoid_: tick, frame
 
 **Rewind**:

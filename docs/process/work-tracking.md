@@ -148,7 +148,7 @@ Don't mass-create issues for unresolved work. Seed only what's real now:
 ```bash
 # example: seed the open-question issues
 gh issue create -t "Decide OQ-1: what is a \"step\"?" \
-  -b "Resolve SPEC.md §11 OQ-1 with the operator; record as requirement/ADR." \
+  -b "Resolve SPEC.md section 11 OQ-1 with the operator; record as requirement/ADR." \
   -l "type:docs,status:needs-decision" -m "M0 · Spike"
 # …repeat for OQ-2…OQ-8
 ```

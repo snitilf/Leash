@@ -39,5 +39,7 @@ Numbering: scan this directory for the highest number, increment by one.
 | [0006](0006-mediate-at-os-boundary-not-sdk.md) | Mediate at the OS boundary, never via an agent SDK | accepted |
 | [0007](0007-implementation-language-rust.md) | Implement in Rust | accepted |
 | [0008](0008-project-name-leash.md) | Name the project "Leash" | accepted |
+| [0009](0009-snapshot-mechanism-overlayfs-with-copy-fallback.md) | Snapshot mechanism is overlayfs, with a plain-copy fallback | accepted |
+| [0010](0010-two-explicit-modes-record-only-and-enforce.md) | Two explicit run modes, record-only and enforce | accepted |
 
 These encode the project's load-bearing decisions. They are the committed, authoritative source.
