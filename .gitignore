@@ -1,22 +1,14 @@
-#local
-.claude/
-CLAUDE.local.md
-.claude/settings.local.json
-CLAUDE.md
-notes/
-CONTEXT.md
-
-# Rust 
+# rust
 /target/
 **/*.rs.bk
 Cargo.lock          # binary crate: remove this line once the app ships; libraries commit it
 
-# OS / editor noise
+# os / editor noise
 .DS_Store
 *.swp
 .idea/
 .vscode/
 
-# Leash runtime artifacts (traces & snapshots are per-run local state)
+# leash runtime artifacts (traces and snapshots are per-run local state)
 /runs/
 *.leash-trace
