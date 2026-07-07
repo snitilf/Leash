@@ -41,5 +41,6 @@ Numbering: scan this directory for the highest number, increment by one.
 | [0008](0008-project-name-leash.md) | Name the project "Leash" | accepted |
 | [0009](0009-snapshot-mechanism-overlayfs-with-copy-fallback.md) | Snapshot mechanism is overlayfs, with a plain-copy fallback | accepted |
 | [0010](0010-two-explicit-modes-record-only-and-enforce.md) | Two explicit run modes, record-only and enforce | accepted |
+| [0011](0011-single-threaded-notify-decision-loop.md) | Single-threaded notify decision loop | accepted |
 
 These encode the project's load-bearing decisions. They are the committed, authoritative source.
