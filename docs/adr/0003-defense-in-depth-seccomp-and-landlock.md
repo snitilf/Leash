@@ -1,6 +1,6 @@
 # ADR-0003: Enforce with seccomp user-notification *and* Landlock
 
-- Status: accepted
+- Status: accepted (the defense-in-depth decision stands; the "never rely on seccomp alone" clause in the Decision is refined by ADR-0013)
 - Date: 2026-07-07
 
 ## Context

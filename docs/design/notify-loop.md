@@ -3,8 +3,8 @@
 - Status: draft, in review (slate 2)
 - Governs: the protocol the supervisor runs on the seccomp notification fd, how it reads child
   memory safely, and how every error path resolves to deny.
-- Cites: FR-2, FR-3, FR-9, FR-10, FR-20; NFR-1, NFR-6; SR-2, SR-3; ADR-0002, ADR-0011. Invariants
-  I2, I3, I4, I5 are defined in [`architecture.md`](architecture.md).
+- Cites: FR-2, FR-3, FR-9, FR-10, FR-20; NFR-1, NFR-6; SR-2, SR-3; ADR-0002, ADR-0011, ADR-0012.
+  Invariants I2, I3, I4, I5 are defined in [`architecture.md`](architecture.md).
 
 This is the state machine that turns one `seccomp_notif` into one **decision** and one **event**. It
 runs on the single decision thread (ADR-0011). Which syscalls arrive here, and how each allow is
@@ -20,7 +20,7 @@ One notification, start to finish, before the next is received (ADR-0011):
    child pid, the syscall number, and the register arguments (a kernel-trusted snapshot at trap
    time).
 2. **Validate.** `ioctl(SECCOMP_IOCTL_NOTIF_ID_VALID)` confirms the notification is still live (the
-   target has not died, the id has not been reused). If it fails, the target is gone; there is
+   child has not died, the id has not been reused). If it fails, the child is gone; there is
    nothing to release (section 4, case B).
 3. **Gather facts.** Register arguments are used directly. Any **pointer** argument (a path, a
    `sockaddr`) is read from `/proc/<pid>/mem` at the address the registers give, into a bounded
@@ -33,8 +33,9 @@ One notification, start to finish, before the next is received (ADR-0011):
    timestamp) before the response is sent. The ordering is deliberate and load-bearing: see
    section 3.
 6. **Respond.** `ioctl(SECCOMP_IOCTL_NOTIF_SEND)` carries the response: `CONTINUE`, an errno (deny or
-   the spoofed return of a supervisor-executed operation), or an `ADDFD` injection followed by a
-   success return. Which one is fixed by the allow-realization rule.
+   the spoofed return of a supervisor-executed operation), or an `ADDFD` injection whose return value
+   is the injected fd number, done atomically with `SECCOMP_ADDFD_FLAG_SEND` so the inject and the
+   response are one step. Which one is fixed by the allow-realization rule.
 7. **Loop.** Receive the next notification.
 
 An **ask** (FR-10) suspends step 4 until the operator answers or the timeout fires; this is the only
@@ -49,7 +50,7 @@ The child's pointer arguments are the whole TOCTOU problem (SR-2, I4). The rules
 - Never dereference a child pointer in the supervisor's own address space. Read it out of
   `/proc/<pid>/mem` at the address from the trap-time registers.
 - Bracket the read with `ID_VALID`: check validity, read, check validity again. A read that spans the
-  target's death is discarded, and the id cannot have been silently reused underneath it.
+  child's death is discarded, and the id cannot have been silently reused underneath it.
 - Cap every read (path length, `sockaddr` length). An unbounded or attacker-chosen length is a
   denial-of-service on the single decision thread; over the cap resolves to deny (section 4, case C).
 - The value read is used once, to build the typed fact, and for a pointer-argument allow it is never
@@ -75,18 +76,38 @@ path: an unrecordable allow is not an allow.
 
 Every way the loop can fail, and how each resolves to deny (FR-9, NFR-1, I3). The enumeration is
 finite and checkable precisely because the loop is single-threaded (ADR-0011); each arc is listed
-with the escape or fault test that proves it in [`escapes.md`](escapes.md).
+with the escape or fault test that proves it in [`escapes.md`](escapes.md) (I5). A deny is a decision
+and is written as an event (FR-2); a dropped notification (case B, case I) made no decision and its
+syscall never took effect, so it records none.
 
 | # | Fault | Resolution | Why it does not fail open |
 |---|---|---|---|
 | A | `NOTIF_RECV` returns `EINTR` | retry the receive | no notification was dequeued; nothing is pending release |
-| B | `ID_VALID` fails, or `RECV`/`SEND` reports the target gone | drop the notification, continue | the target syscall never completes; the kernel returns to a dead or dying task |
+| B | `ID_VALID` fails, or `RECV`/`SEND` reports the notification dead (the child exited, or a fatal signal is ending it) | drop the notification, continue | the child's syscall does not complete; there is nothing to release to a dead or dying process |
 | C | child-memory read fails, or exceeds the size cap | deny (`SEND` an errno, e.g. `EACCES`) | a fact that cannot be trusted cannot be allowed (I4) |
 | D | the `policy` engine cannot decide | impossible by construction: the engine is total and returns a decision for every fact; deny-by-default is the base rule in **enforce** mode (FR-19) | there is no undecided fact |
 | E | the recorder write fails | deny this action, then abort the run and tear down | no allow the supervisor cannot record (section 3, FR-3) |
 | F | an **ask** reaches its timeout (FR-10), or the run is unattended (FR-20) | deny | timeout-to-deny and unattended-to-deny are the specified behaviors |
 | G | the supervisor process crashes or is killed | the kernel closes the notification fd; every pending and subsequent mediated syscall in the child fails (documented as `-ENOSYS` for the no-listener case) and none executes | the boundary holds by the action not taking effect; fail-closed is enforced by the kernel, not by supervisor code that is no longer running |
 | H | the decision thread hangs on a non-ask step | prevented: every non-ask step is bounded (section 1); the only unbounded wait is the ask, which has a timeout (case F) | there is no unbounded blocking point outside the ask |
+| I | a non-fatal signal to the child cancels a received notification, restarting the syscall | prevented by `WAIT_KILLABLE_RECV` (section 4.1); only a fatal signal cancels, and a child being killed does not need its action completed | a supervisor-performed side effect cannot run twice, and no event is recorded for an action that then restarts |
+
+### 4.1 Signal cancellation and double execution
+
+Without protection, a non-fatal signal delivered to a child blocked on a notification cancels it: the
+supervisor's `SEND` fails `ENOENT`, and with `SA_RESTART` the syscall restarts and re-traps as a fresh
+notification. For an allow realized by the supervisor performing the side effect and spoofing the
+return (rename, unlink, mkdir, a host-enforced connect; [`syscalls.md`](syscalls.md) section 4), a
+cancellation after the side effect but before `SEND` would re-trap the syscall and run the side effect
+a second time, and the trace would already carry an event for a response that was never delivered.
+Agents take `SIGCHLD` and timer signals routinely, so this is a normal path.
+
+The filter is installed with `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (ADR-0012), which makes a
+received notification interruptible only by a fatal signal. Once the supervisor has `RECV`d, the
+notification will not be cancelled by an ordinary signal, so the perform-then-`SEND` sequence
+completes; the only interruption left is a fatal signal, in which case the child is being killed and
+its syscall correctly does not complete (case B). This is why the kernel floor is 5.19: the
+supervisor-executed allow is unsound below the kernel that provides this flag.
 
 Case G is the backstop under all the others and is the reason a supervisor bug cannot fail open: even
 an outright crash degrades to the kernel denying the child's next mediated syscall. It carries one

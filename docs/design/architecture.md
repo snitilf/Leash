@@ -54,12 +54,18 @@ scope, and the mechanism that stops each, are enumerated in [`escapes.md`](escap
 These are the properties every design choice in this layer preserves. Other design files cite them
 by ID. ADR-0002 already refers to I2 by this number; the full list is fixed here.
 
-- **I1** - No policy-relevant syscall of the monitored child tree reaches the kernel un-mediated.
+- **I1** - No policy-relevant syscall of the supervised child tree reaches the kernel un-mediated.
   New processes created by `fork`, `clone`, `clone3`, and `execve` inherit the seccomp filter, so
   a grandchild is mediated exactly as the agent is. Any change to process handling re-verifies this.
   (FR-1, FR-4, SR-2.)
-- **I2** - The child can never read, mutate, delay, or block the **trace** or the supervisor's
-  decision path. The supervisor is the sole author of the trace. (FR-3, ADR-0002.)
+- **I2** - The supervisor is the sole author of the **trace** and the sole owner of the decision
+  path. In **enforce** mode the child is denied the state directory by both layers (FR-3, FR-21), so
+  it can never read, mutate, delay, or block the trace. In **record-only** mode no Landlock ruleset
+  is applied (nothing is enforced, ADR-0010), so trace integrity rests on filesystem permissions: the
+  state directory lies outside the **workspace** with restrictive permissions, but a hostile same-uid
+  child is not defended against. This matches the spec, which scopes state-directory denial to enforce
+  mode (FR-21), and matches record-only being a camera, not a bouncer; the residual is named in
+  [`escapes.md`](escapes.md). (FR-3, FR-21, ADR-0002.)
 - **I3** - Every decision **fails closed**. Any supervisor error, crash, or decision timeout
   resolves the pending action to deny; the child never gets a default-allow. (FR-9, NFR-1.)
 - **I4** - Decisions are made against kernel-trusted data, never against child-controlled memory
@@ -70,7 +76,7 @@ by ID. ADR-0002 already refers to I2 by this number; the full list is fixed here
 ## 4. Module decomposition
 
 Six modules. The split exists so the security-critical, hard-to-test machinery (the notify loop,
-the sandbox setup) stays thin and delegates every judgement to pure, exhaustively testable code
+the sandbox setup) stays thin and delegates every decision to pure, exhaustively testable code
 (NFR-6, ADR-0004).
 
 | Module | Responsibility | Depends on |
@@ -95,31 +101,41 @@ decision (deny, allow, ask, or fd injection) is the supervisor's job, not the en
 Before any child exists, the supervisor confirms the host can support the boundary it is about to
 claim, and refuses to run rather than silently degrade (FR-14). Preflight bundles three probes:
 
-- **Kernel floor.** seccomp user-notification requires Linux 5.9 or later; Landlock requires 5.13
-  or later (FR-14). Below the floor, refuse with a clear message. `ptrace`-based interception was
-  considered as a below-floor fallback and rejected: it is high-overhead, racy on `fork`/`clone`,
-  and awkward with multi-threaded children, so degrading to it would weaken the boundary Leash
-  claims. Refusing to run is the honest failure.
-- **Landlock ABI.** The supported ABI is queried at runtime, never assumed. Capabilities were added
-  over versions: filesystem rules exist from ABI 1, network (TCP connect/bind) rules from ABI 4.
-  The floor (5.13) guarantees filesystem Landlock but not network Landlock. The degrade table below
-  fixes what happens when the policy needs a capability the running ABI lacks.
+- **Kernel floor.** Leash requires Linux 5.19 or later, and preflight verifies the capabilities, not
+  just the version string (FR-14, ADR-0012): `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`,
+  `SECCOMP_ADDFD` with `ADDFD_FLAG_SEND`, and Landlock ABI 2. Below the floor, refuse with a clear
+  message. `ptrace`-based interception was considered as a below-floor fallback and rejected: it is
+  high-overhead, racy on `fork`/`clone`, and awkward with multi-threaded children, so degrading to it
+  would weaken the boundary Leash claims. Refusing to run is the honest failure.
+- **Landlock ABI.** The supported ABI is queried at runtime and the handled access rights are masked
+  to it, never assumed (an unmasked right on an older ABI fails ruleset creation with `EINVAL`).
+  Rights arrived over versions: filesystem access from ABI 1, cross-directory rename/link
+  (`FS_REFER`) from ABI 2 (Linux 5.19, the floor), file truncation (`FS_TRUNCATE`) from ABI 3 (Linux
+  6.2), TCP connect/bind (`NET_*`) from ABI 4 (Linux 6.7). The floor guarantees ABI 2; anything above
+  it is probed, and the degrade table fixes what happens when a backstop the policy could use is
+  above the running ABI.
 - **Overlay support.** Whether an overlay mount is available (privileged mount, or an unprivileged
   user namespace) selects the snapshot mechanism: overlay if available, plain-copy fallback
   otherwise (ADR-0009). The selected mechanism is stamped into the trace.
 
-Landlock ABI degrade table:
+Landlock backstop degrade table. Record-only applies no Landlock at all (nothing is enforced,
+ADR-0010); the table is about which backstop the enforce-mode ruleset can carry at a given ABI. Per
+ADR-0013 the seccomp layer is the primary decision layer, so a missing backstop degrades to
+seccomp-only with a named residual, it does not refuse the run:
 
-| Policy needs | ABI provides it | Record-only mode | Enforce mode |
+| Backstop | Needs | Record-only | Enforce |
 |---|---|---|---|
-| Filesystem rules | yes (ABI >= 1, floor guarantees) | apply | apply |
-| Network rules | yes (ABI >= 4) | apply | apply |
-| Network rules | no (ABI < 4) | warn, stamp the gap in the trace, continue (nothing is enforced anyway) | refuse to start: the policy asks for a boundary the kernel cannot back |
+| Landlock ruleset at all | - | not applied | applied |
+| Filesystem access + cross-dir rename/link | ABI 2 (floor guarantees) | not applied | applied |
+| Truncation | ABI 3 (Linux 6.2) | not applied | applied where present; below, seccomp mediates `truncate` and the missing backstop is stamped as a residual |
+| Network port | ABI 4 (Linux 6.7) | not applied | applied where present; below, seccomp enforces the port and the missing backstop is stamped |
+| Network host | kernel cannot express it at any ABI | not applied | always seccomp-only; residual named (ADR-0013) |
 
-The rule behind the table: in enforce mode Leash never starts a run in which a policy-required
-boundary would silently not hold (I3, SR-3). In record-only mode nothing is enforced, so a missing
-capability is recorded as a gap rather than a refusal. The seccomp layer still mediates network
-syscalls for the trace in both modes; the table is only about the Landlock backstop.
+The rule behind the table: in enforce mode no policy-required boundary is left to hold **silently**
+(I3, SR-3), but "silently" is the operative word. Where the kernel can back a dimension, Leash uses
+the backstop; where it cannot at the running ABI, the seccomp layer enforces it and the gap is
+stamped into the trace, never hidden (ADR-0013). The only hard refusal is below the kernel floor. The
+seccomp layer mediates the relevant syscalls for the trace in both modes regardless of Landlock.
 
 ### 5.2 Spawn protocol
 
@@ -129,14 +145,18 @@ stated reason.
 1. Supervisor prepares the per-run directory in the state directory and mounts the overlay write
    layer over the workspace (or selects the copy fallback). (FR-21, ADR-0009.)
 2. Supervisor creates a socketpair for the notify-fd handoff, then forks the child.
-3. Child installs the seccomp filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER`, which returns the
-   notification fd, and sets `no_new_privs` so the filter and the coming Landlock ruleset survive
-   `execve`.
+3. Child installs the seccomp filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER` and
+   `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (so a non-fatal signal cannot cancel a received
+   notification and let a supervisor-performed action double-execute, ADR-0012), which returns the
+   notification fd, and sets `no_new_privs`. The filter survives `execve` regardless; `no_new_privs`
+   is what lets an unprivileged supervisor install the filter and makes it bind across a setuid
+   `execve` so the agent cannot shed it.
 4. Child sends the notification fd to the supervisor over the socketpair using `SCM_RIGHTS`, then
    waits for the supervisor to acknowledge that it holds the fd and is ready to serve.
-5. Child applies the Landlock ruleset granting exactly the workspace and the explicitly allowed
-   paths and hosts (ADR-0003). Landlock is applied by the child, pre-exec, because a process can
-   only restrict itself and its descendants.
+5. In **enforce** mode the child applies the Landlock ruleset granting exactly the workspace, the
+   explicitly allowed paths, and the TCP port backstop for allowed hosts (ADR-0003, ADR-0013). In
+   **record-only** mode this step is skipped: nothing is enforced (ADR-0010). Landlock is applied by
+   the child, pre-exec, because a process can only restrict itself and its descendants.
 6. Child closes every file descriptor not on its allowlist (to close fd-inheritance escapes, see
    [`escapes.md`](escapes.md)) and calls `execve` on the agent command. Because the filter is
    already installed, the `execve` of the agent is itself the first mediated event (FR-1, FR-4).

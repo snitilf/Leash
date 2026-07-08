@@ -3,8 +3,8 @@
 - Status: draft, in review (slate 2)
 - Governs: the policy file format, the predicate vocabulary, how a decision is evaluated from it, how
   it is rejected, and how the Landlock ruleset is derived from it.
-- Cites: FR-6, FR-7, FR-18, FR-19; NFR-3, NFR-6; SR-3; ADR-0003, ADR-0004, ADR-0010. Invariants I3,
-  I4 are defined in [`architecture.md`](architecture.md).
+- Cites: FR-6, FR-7, FR-18, FR-19; NFR-3, NFR-6; SR-3; ADR-0003, ADR-0004, ADR-0010, ADR-0013.
+  Invariants I3, I4 are defined in [`architecture.md`](architecture.md).
 
 The **policy** is declarative data (ADR-0004): the operator reads, diffs, and reviews one file, and a
 pure engine evaluates it (NFR-6). This file fixes the schema and the evaluation model. The engine
@@ -50,7 +50,10 @@ action = "allow"
 `{workspace}` expands to the run's **workspace** root. The workspace is granted read and write as a
 built-in base allow before any rule is read, so a policy that lists nothing still lets the agent work
 in its project; rules extend access beyond the workspace or carve restrictions inside it (a `deny`
-for `{workspace}/.git/**` placed above the base allow).
+for `{workspace}/.git/**` placed above the base allow). This base allow is a deliberate, documented
+part of the effective ruleset, not a hidden exception to deny-by-default: it is echoed in the
+**session report** so the operator sees the full effective policy (FR-5, NFR-3), and a policy may
+override it with an earlier `deny`.
 
 ## 2. Predicate vocabulary (versioned)
 
@@ -59,7 +62,7 @@ security-relevant change (ADR-0004). Version 1 covers exactly what FR-7 requires
 
 | Family | Key(s) | Matches | Notes |
 |---|---|---|---|
-| `fs` | `path` (glob), `mode` (set) | filesystem decisions (section 3.1 of [`syscalls.md`](syscalls.md)) | `mode` in `read`, `write`, `create`, `delete`, `execute` |
+| `fs` | `path` (glob), `mode` (set) | filesystem decisions ([`syscalls.md`](syscalls.md) sections 3.1-3.2, and `execute` at 3.3) | `mode` in `read`, `write`, `create`, `delete`, `execute`; metadata syscalls map to `write` |
 | `net` | `host`, `port` | `connect` / `bind` decisions | host and port matching semantics are an open parameter, section 6 |
 | `exec` | `binary` (glob) | `execve` / `execveat` decisions | the binary path, resolved |
 
@@ -70,7 +73,8 @@ ignored.
 ## 3. Evaluation
 
 The engine is pure and total (ADR-0004, NFR-6): a fact in, a decision plus matched-rule id out, no
-IO, no child memory, no panic path. It is exhaustively unit-testable without a live child.
+IO, no child memory read (it sees only the kernel-trusted typed fact, I4), no panic path. It is
+exhaustively unit-testable without a live child.
 
 1. Select the table for the fact's family (`fs`, `net`, `exec`).
 2. Walk the rules top to bottom. The first rule whose predicate matches the fact wins, and its
@@ -97,7 +101,7 @@ is no partial application: a policy is loaded whole or not at all. This is a fai
 (I3), because a silently-half-applied policy would be a boundary the operator believes exists and does
 not. Validation runs entirely before the child is spawned, in the preflight step
 ([`architecture.md`](architecture.md) section 5.1), so a bad policy fails the run at the command line,
-never mid-execution.
+never mid-run.
 
 ## 5. Linting (advisory, not enforcement)
 
@@ -109,9 +113,11 @@ confusing.
 
 ## 6. Landlock derivation
 
-The Landlock ruleset is the always-on kernel backstop (ADR-0003), and it is derived from the same
-policy so the two layers cannot silently disagree. The derivation is a coarsening, and its direction
-matters for correctness:
+The Landlock ruleset is the kernel backstop in **enforce** mode (ADR-0003). In **record-only** no
+ruleset is applied at all, because nothing is enforced (ADR-0010, [`architecture.md`](architecture.md)
+section 5.1); the rest of this section describes the enforce-mode derivation. It is derived from the
+same policy so the two enforcing layers cannot silently disagree. The derivation is a coarsening, and
+its direction matters for correctness:
 
 - Landlock must not deny what the policy allows or may allow. If the seccomp layer allows an access
   the Landlock ruleset forbids, the kernel blocks a legitimate action and the layers contradict. So
@@ -125,15 +131,20 @@ matters for correctness:
   (SR-3), not that the two are redundant.
 - Network derivation is limited by what Landlock can express: TCP `connect`/`bind` **ports** only,
   not hosts (see [`syscalls.md`](syscalls.md) section 3.5). The derived net ruleset grants the union
-  of ports any `net` allow/ask rule permits; host enforcement stays in the seccomp layer, which is
-  why the host allowlist is the part of the policy the seccomp layer must get exactly right.
+  of ports any `net` allow/ask rule permits; host enforcement stays in the seccomp layer. This is not
+  a gap in defense-in-depth but the refined backstop rule of ADR-0013: a boundary is backstopped in
+  every dimension the kernel can express (here, the port), and where it cannot (TCP host identity) the
+  seccomp layer enforces it alone and the residual is named. It is why the host allowlist is the part
+  of the policy the seccomp layer must get exactly right.
 - `exec` derives the Landlock `FS_EXECUTE` right on the union of allowed binary paths, which is the
   enforcing control for program execution (`execve` cannot be injected, [`syscalls.md`](syscalls.md)
   section 3.3).
 
-The derivation runs once, in preflight, against the running Landlock ABI; when the ABI cannot back a
-required dimension (network on ABI < 4), the degrade table in [`architecture.md`](architecture.md)
-section 5.1 governs (refuse in enforce, warn-and-stamp in record-only).
+The derivation runs once, in preflight (enforce mode only), against the running Landlock ABI, with the
+handled rights masked to it. Where the ABI cannot back a dimension the policy uses, the degrade table
+in [`architecture.md`](architecture.md) section 5.1 governs: the seccomp layer enforces that dimension
+and the missing backstop is stamped into the trace, rather than the run being refused (ADR-0013). The
+only hard refusal is below the kernel floor (ADR-0012).
 
 ## 7. Open parameters (resolved at slate 2)
 

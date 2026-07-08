@@ -1,7 +1,7 @@
 # Leash — Software Specification
 
-- Status: **v0.2, settled** (section 11 holds one explicitly deferred item, OQ-5, with a named closing trigger)
-- Date: 2026-07-07
+- Status: **v0.3, settled** (section 11 holds one explicitly deferred item, OQ-5, with a named closing trigger)
+- Date: 2026-07-08 (v0.3 revised FR-14's kernel floor to 5.19 per ADR-0012; v0.2 dated 2026-07-07)
 - Governs: what Leash must do and why. *How* it is built is the design (`docs/design/`).
 
 Key words **MUST**, **MUST NOT**, **SHOULD**, **MAY** per RFC 2119. IDs are stable and cited by other documents, tests, and code: `F-n` features, `FR-n` functional requirements, `NFR-n` non-functional requirements, `SR-n` security requirements, `OQ-n` open questions. Terms in **bold** are defined in [`CONTEXT.md`](../CONTEXT.md) and used exactly as defined there.
@@ -77,7 +77,7 @@ These carry no requirements yet and nothing in this table is promised; promoting
 - **FR-17** — A **step** is a coalesced burst of the child's mediated filesystem writes: writes closer together than a coalescing window (a design parameter) belong to one step; the boundary falls when write activity quiesces and MUST NOT fall inside a burst. Run start and end are always step boundaries. Steps MUST be derived solely from supervisor-observed events (ADR-0006).
 
 ### 6.4 Interface & portability
-- **FR-14** — Leash MUST run on Linux meeting the kernel floor (seccomp user-notification ≥ 5.9, Landlock ≥ 5.13). Below the floor it MUST refuse to run with a clear message rather than silently degrade security.
+- **FR-14** — Leash MUST run on Linux 5.19 or later (ADR-0012). This floor is set by the capabilities the supervisor depends on, not by either mechanism's earliest appearance: `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (5.19), so a signal-cancelled notification cannot double-execute a supervisor-performed action; `SECCOMP_ADDFD` and `SECCOMP_ADDFD_FLAG_SEND` (5.9, 5.14); and Landlock ABI 2 (5.19), so cross-directory rename and link the policy allows are not denied by the backstop. Preflight MUST verify the capabilities, not merely the version string. Below the floor Leash MUST refuse to run with a clear message rather than silently degrade security.
 - **FR-15** — Leash MUST run on x86-64 and ARM64 (the Raspberry Pi and VPS targets).
 - **FR-16** — Traces MUST persist in a documented, machine-readable format (e.g. JSONL); the format SHOULD align with the draft agent-audit-trail schema where practical.
 - **FR-21** — Traces and snapshots MUST persist under a per-run directory in an operator-configurable state directory (default per XDG, e.g. `$XDG_STATE_HOME/leash/runs/<run-id>`). The state directory MUST lie outside the **workspace**, and in enforce mode the child MUST be denied access to it (FR-3). Leash MUST NOT delete run data automatically; retention is the operator's, assisted by a listing/pruning subcommand.
