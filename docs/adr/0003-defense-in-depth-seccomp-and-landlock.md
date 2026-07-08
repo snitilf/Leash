@@ -1,6 +1,6 @@
 # ADR-0003: Enforce with seccomp user-notification *and* Landlock
 
-- Status: accepted (the defense-in-depth decision stands; the "never rely on seccomp alone" clause in the Decision is refined by ADR-0013)
+- Status: accepted (the defense-in-depth decision stands; two clauses in the Decision are refined by ADR-0013: "never rely on seccomp alone" becomes per-expressible-dimension, and "allowed paths/hosts" is corrected because Landlock cannot express hosts, only TCP ports)
 - Date: 2026-07-07
 
 ## Context

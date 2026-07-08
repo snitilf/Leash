@@ -10,6 +10,8 @@ ADRs are **immutable once accepted**. A decision that changes is not edited; a n
 # ADR-NNNN: {short title of the decision}
 
 - Status: proposed | accepted | superseded by ADR-NNNN
+  (an accepted ADR whose core decision stands but a clause is later narrowed may carry a short
+  "refined by ADR-NNNN" note on the status line; the body stays immutable)
 - Date: YYYY-MM-DD
 
 ## Context

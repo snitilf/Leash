@@ -13,7 +13,7 @@ That yields three capabilities in one tool:
   the agent's self-report.
 - **Enforce.** A declarative policy over paths, hosts, and binaries. Actions are allowed, denied,
   or held for human approval; any supervisor error resolves to deny.
-- **Rewind.** Workspace snapshots at step boundaries, so a run can be rolled back or two runs
+- **Rewind.** Workspace snapshots at step boundaries, so a run can be rewound, or two runs
   diffed by their actual effects.
 
 Because Leash works at the syscall layer, it is agent-agnostic and vendor-agnostic: no SDK
@@ -21,11 +21,15 @@ integration, nothing the supervised process can reason around.
 
 ## Status
 
-Specification stage. There is no code yet; the current work is settling the spec.
+Design stage. The specification is settled (v0.3) and the design layer is drafted and in review.
+There is no implementation code yet. The next gate is the M0 overlay spike on the reference
+targets; once it passes, the design freezes and work on the M1 recorder begins. Leash targets
+Linux 5.19 or later and runs on x86-64 and ARM64.
 
 ## Documentation
 
 The project is documentation-driven: every decision is recorded before it is implemented.
 Start at [docs/README.md](docs/README.md) for the document hierarchy. The specification is
-[docs/spec/SPEC.md](docs/spec/SPEC.md), the decision records are in [docs/adr/](docs/adr/),
-and the project vocabulary is [docs/CONTEXT.md](docs/CONTEXT.md).
+[docs/spec/SPEC.md](docs/spec/SPEC.md), the design (how it is built) is in
+[docs/design/](docs/design/), the decision records are in [docs/adr/](docs/adr/), and the
+project vocabulary is [docs/CONTEXT.md](docs/CONTEXT.md).

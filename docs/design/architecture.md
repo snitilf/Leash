@@ -14,9 +14,11 @@ Leash is one **supervisor** process mediating one **child** process tree at the 
 boundary (ADR-0006). The child is launched under a seccomp filter that returns
 `SECCOMP_RET_USER_NOTIF` for every **mediated syscall**; the child blocks and the supervisor,
 holding the notification fd, decides allow / deny / **ask**, records an **event**, and only then
-lets the kernel proceed. **Landlock** adds a second, always-on filesystem and network boundary
-applied by the child before it execs the agent, so the kernel enforces a floor even where the
-decision logic has a gap (ADR-0003).
+lets the kernel proceed. **Landlock** adds a second, kernel-enforced boundary in **enforce** mode,
+applied by the child before it execs the agent: a filesystem boundary always, and a network-port
+boundary where the running ABI supports it (ADR-0003, ADR-0013). It holds even where the decision
+logic has a gap. In **record-only** mode nothing is enforced, so no Landlock ruleset is applied
+(ADR-0010).
 
 ```
   leash (supervisor, trusted)              child (agent + whole process tree, untrusted)

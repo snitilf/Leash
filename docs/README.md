@@ -36,5 +36,6 @@ Each layer references the ones above it by **stable ID** (requirement IDs like `
 
 ## Status
 
-- **Phase 0** — specification stage. See [`spec/SPEC.md`](spec/SPEC.md) (draft; open questions tracked at its end).
-- Design begins once the spec's open questions are resolved.
+- **Design stage.** The spec is settled at v0.3 (see [`spec/SPEC.md`](spec/SPEC.md)); the design layer in [`design/`](design/) is drafted and in review. Implementation has not started.
+- The design layer freezes once the M0 overlay spike passes; `design/snapshot.md` stays provisional until then (ADR-0009).
+- One spec item remains deferred on purpose: OQ-5 (the overhead budget), closing on M1 measurements.

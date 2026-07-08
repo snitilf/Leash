@@ -55,12 +55,16 @@ One recorded fact about something the child did — a mediated syscall and its d
 _Avoid_: log line, record (reserve "record" for ADRs)
 
 **Trace**:
-The ordered, append-only sequence of events for one supervised session. The ground-truth account of what the agent did.
+The ordered, append-only sequence of events for one supervised run. The ground-truth account of what the agent did.
 _Avoid_: log, history, transcript (a transcript is the agent's *self-report*; a trace is ground truth — the distinction is the whole point of the project)
 
 **Run**:
 One complete supervised session — one invocation of `leash run`. Produces one trace.
 _Avoid_: session, execution
+
+**Session report**:
+The human-readable summary produced at the end of a **run** (FR-5): the files touched, processes spawned, and network connections attempted, each with its **decision**, plus the active **mode**. A fixed compound term carried from the spec; it is the one sanctioned use of the word "session", which is otherwise avoided in favor of **run**.
+_Avoid_: run report, summary (the canonical compound is "session report")
 
 **Snapshot**:
 The captured state of the workspace at a **step** boundary, enabling rewind and diff. Implemented over the workspace's write layer.

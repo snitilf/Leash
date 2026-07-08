@@ -57,17 +57,17 @@ These carry no requirements yet and nothing in this table is promised; promoting
 - **FR-1** — Leash MUST launch an agent via `leash run -- <command>` and supervise the entire **child** process tree, including descendants created by `fork`/`clone`/`exec`.
 - **FR-2** — Leash MUST record every **mediated syscall** and its **decision** as an ordered, append-only **event** in the run's **trace**.
 - **FR-3** — The **trace** MUST be authored solely by the **supervisor**; the **child** MUST NOT be able to read, modify, delay, or suppress it (ADR-0002).
-- **FR-4** — The mediated set MUST cover at minimum: filesystem access (open/read/write/create/delete/rename), process creation and program execution, and network connection establishment. The exact syscall list is enumerated in the design.
+- **FR-4** — The mediated set MUST cover at minimum: filesystem access (opening a path, with read and write access decided at that point, plus create, delete, and rename), process creation and program execution, and network connection establishment. The exact syscall list is enumerated in the design.
 - **FR-5** — Leash MUST produce, at the end of a run, a human-readable **session report**: files touched, processes spawned, network connections attempted, each with its decision.
 
 ### 6.2 Policy & enforcement
 - **FR-6** — Leash MUST evaluate each mediated syscall against a declarative **policy** (ADR-0004) and resolve a **decision** of allow, deny, or **ask**.
 - **FR-7** — Policy MUST be expressible over at least: filesystem paths, network hosts, and executable binaries.
-- **FR-8** — Enforcement MUST be defense-in-depth: the seccomp-unotify decision layer AND an always-on Landlock boundary (ADR-0003). A denied action MUST NOT take effect.
+- **FR-8** — In **enforce** mode, enforcement MUST be defense-in-depth: the seccomp-unotify decision layer AND a Landlock boundary applied by the child before the agent executes, backstopping every dimension the kernel can express (ADR-0003, ADR-0013). A denied action MUST NOT take effect. Record-only enforces nothing and applies no Landlock ruleset (FR-19).
 - **FR-9** — Every **decision** MUST be **fail-closed**: any supervisor error, crash, or decision timeout resolves the pending action to **deny** (NFR-1).
 - **FR-10** — For an **ask** decision, Leash MUST pause the child and block the action until the operator approves or denies; on no response within a configured bound, it MUST deny.
 - **FR-18** — The **policy** MUST be a TOML file with an explicit schema-version field and a fixed, versioned predicate vocabulary covering at least: filesystem path globs, network host allowlists, and executable binary allowlists, each rule resolving to allow, deny, or **ask**. A policy that fails to parse, has an unknown schema version, or contains unknown predicates MUST be rejected before the run starts, never partially applied.
-- **FR-19** — Leash MUST run in exactly one of two modes (ADR-0010), announced at run start, stamped into the **trace**, and named in the **session report**: **record-only** (every mediated syscall allowed and traced; actions a present policy would have denied are flagged) and **enforce** (deny-by-default per the policy; requires a policy file). A run with no policy file is record-only. The mode MUST NOT change mid-run. Record-only output MUST NOT be described as enforcement.
+- **FR-19** — Leash MUST run in exactly one of two modes (ADR-0010), announced at run start, stamped into the **trace**, and named in the **session report**: **record-only** (every mediated syscall allowed and traced, except syscalls that establish an un-mediated I/O path, which are denied and recorded so the trace stays complete, SR-4; actions a present policy would have denied are flagged) and **enforce** (deny-by-default per the policy, with the **workspace** allowed by default per its definition; requires a policy file). A run with no policy file is record-only. The mode MUST NOT change mid-run. Record-only output MUST NOT be described as enforcement.
 - **FR-20** — In an attended run, an **ask** is a terminal prompt, subject to FR-10's timeout-to-deny. In an unattended run (no controlling terminal, or explicitly requested), an **ask** MUST resolve to deny immediately unless the policy pre-authorizes the action; unattended asks MUST NOT queue or block. Attendance is stamped into the trace.
 
 ### 6.3 Time travel
@@ -98,7 +98,7 @@ The threat model is a working document, promoted into `docs/` once load-bearing 
 - **SR-1** — The system MUST treat the agent and all its descendants as hostile.
 - **SR-2** — The system MUST resist the enumerated **escape** classes: child-process laundering, symlink/TOCTOU races, `/proc` self-reference, alternate-syscall equivalents (including `io_uring` and `openat2`), fd inheritance/passing, recorder-tampering. Each enforced control MUST map to tests for the escapes it claims to stop.
 - **SR-3** — The system MUST NOT rely on any control the child can disable or reason around (ADR-0003).
-- **SR-4** — In **enforce** mode, syscalls that establish un-mediated I/O paths (notably `io_uring_setup`) MUST be denied. Relaxing this for a path requires a spec change adding equivalent mediation and escape tests for that path first.
+- **SR-4** — Syscalls that establish an un-mediated I/O path (notably `io_uring_setup`) MUST be denied in both modes: in **enforce** because the policy could not otherwise constrain the path, and in **record-only** because the path would make the **trace** silently incomplete. The denial MUST be recorded as an **event**, so the attempt is visible and record-only remains non-enforcing in every other respect. Relaxing this for a path requires a spec change adding equivalent mediation and escape tests for that path first.
 
 ## 9. Out of scope (explicit)
 
@@ -129,16 +129,18 @@ OQ-1..OQ-4 and OQ-6..OQ-8 were resolved on 2026-07-07 into FR-17..FR-21, SR-4, A
 
 | Requirement | Realized by decision | Verified by |
 |---|---|---|
-| FR-3 (log integrity) | ADR-0002 | recorder-tamper escape tests |
-| FR-8 (defense in depth) | ADR-0003 | per-layer escape tests |
+| FR-3 (trace integrity) | ADR-0002 | recorder-tamper escape tests |
+| FR-8 (defense in depth) | ADR-0003, ADR-0013 | per-layer escape tests |
 | FR-6/FR-7 (policy) | ADR-0004 | policy-engine unit tests |
+| FR-2/FR-9 (ordered trace, fail-closed), NFR-6 | ADR-0011 | fail-closed enumeration, notify-loop fault tests |
 | FR-11..13 (time travel) | ADR-0005, ADR-0009 | overlay-semantics tests, mechanism-equivalence tests |
+| FR-14 (kernel floor) | ADR-0012 | preflight capability probes on 5.19+ |
 | FR-17 (step semantics) | ADR-0006, ADR-0009 | step-boundary tests |
 | FR-18 (policy format) | ADR-0004 | policy schema/rejection tests |
 | FR-19 (run modes) | ADR-0010 | mode-stamping and would-deny tests |
 | FR-20 (approval UX) | ADR-0010 | attended/unattended ask tests |
 | FR-21 (trace persistence) | ADR-0002 | state-dir isolation escape tests |
-| SR-4 (io_uring denial) | ADR-0003 | io_uring bypass escape tests |
+| SR-4 (io_uring denial) | design (syscalls.md section 5) | io_uring escape tests |
 | FR-1/FR-4 (agent-agnostic coverage) | ADR-0006 | inheritance + coverage tests |
 | NFR-4 (footprint), FR-15 | ADR-0007 | build/run on Pi + VPS |
 

@@ -118,8 +118,7 @@ fallback's capture format must preserve enough to answer them identically.
 ## 6. Escape and fault surface (SR-2, NFR-5)
 
 Two families of hostile input bear on this file, both enumerated and tested in
-[`escapes.md`](escapes.md) (planned; written last, as the traceability layer over the rest of the
-design):
+[`escapes.md`](escapes.md), the traceability layer over the rest of the design:
 
 - **Rename and hard-link races on the overlay** (SR-2): the child racing capture with renames or
   link games to smuggle content past a snapshot boundary or to make the diff misattribute a change.
