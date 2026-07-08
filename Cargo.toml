@@ -1,0 +1,22 @@
+[package]
+name = "leash"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "Supervise an AI coding agent at the OS boundary: record, enforce, rewind."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/snitilf/Leash"
+
+# no dependencies yet; every crate is attack surface and each addition is justified in review
+
+[dependencies]
+
+[lints.clippy]
+# the supervisor never panics on a runtime path; tests opt out explicitly per module
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

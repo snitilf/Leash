@@ -1,7 +1,6 @@
 # rust
 /target/
 **/*.rs.bk
-Cargo.lock          # binary crate: remove this line once the app ships; libraries commit it
 
 # os / editor noise
 .DS_Store
