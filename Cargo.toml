@@ -7,9 +7,16 @@ description = "Supervise an AI coding agent at the OS boundary: record, enforce,
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/snitilf/Leash"
 
-# no dependencies yet; every crate is attack surface and each addition is justified in review
+# every crate is attack surface; each addition is justified in review.
+# serde/serde_json: the trace is jsonl (FR-16); hand-rolled json is not defensible.
+# getrandom: run-id uniqueness needs os randomness, nothing more.
+# thiserror: typed library errors per the rust standard.
 
 [dependencies]
+getrandom = "0.4.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
 
 [lints.clippy]
 # the supervisor never panics on a runtime path; tests opt out explicitly per module
@@ -20,3 +27,6 @@ panic = "warn"
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
+
+[dev-dependencies]
+tempfile = "3.27.0"
