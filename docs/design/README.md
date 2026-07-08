@@ -4,8 +4,9 @@
 commits to *how* before *what* builds the wrong thing precisely. Every design choice cites the spec
 requirement it satisfies and, where it is a hard-to-reverse trade-off, an ADR.
 
-Status: **in progress.** The mediation and recording files are drafted and in review; the snapshot
-file and the escape-traceability file are still to come (see the file table).
+Status: **drafted, in review.** All seven files exist and are in slate review. The layer freezes when
+the M0 spike (issue #13) passes on both reference targets; `snapshot.md` stays provisional until then,
+and if the spike fails on a target ADR-0009 is superseded and `snapshot.md` is rewritten.
 
 ## Reading order
 
@@ -16,8 +17,8 @@ file and the escape-traceability file are still to come (see the file table).
 3. [`notify-loop.md`](notify-loop.md) - the notify-fd protocol and the fail-closed enumeration (FR-9).
 4. [`policy.md`](policy.md) - the TOML schema, evaluation, and Landlock derivation (FR-18).
 5. [`trace.md`](trace.md) - run directory, event schema, session report (FR-2, FR-16, FR-5).
-6. [`snapshot.md`](snapshot.md) - step detection, overlay and copy fallback, rewind, diff (planned).
-7. [`escapes.md`](escapes.md) - escape-vector-to-mechanism traceability (planned).
+6. [`snapshot.md`](snapshot.md) - step detection, overlay and copy fallback, rewind, diff (FR-11-13).
+7. [`escapes.md`](escapes.md) - escape-vector-to-mechanism traceability (SR-2, NFR-5).
 
 ## Files and status
 
@@ -28,8 +29,8 @@ file and the escape-traceability file are still to come (see the file table).
 | `notify-loop.md` | notify protocol, fail-closed (FR-9) | draft, in review (slate 2) |
 | `policy.md` | policy schema, evaluation, Landlock derivation (FR-18) | draft, in review (slate 2) |
 | `trace.md` | run dir, event schema, report (FR-2, FR-16, FR-5) | draft, in review (slate 2) |
-| `snapshot.md` | step, snapshot, rewind, diff (FR-11-13, FR-17) | planned (slate 3, provisional until the M0 spike) |
-| `escapes.md` | escape traceability (SR-2, NFR-5) | planned (slate 5, written last) |
+| `snapshot.md` | step, snapshot, rewind, diff (FR-11-13, FR-17) | draft, provisional (slate 3); settles when the M0 spike passes |
+| `escapes.md` | escape traceability (SR-2, NFR-5) | draft, in review (slate 5) |
 
 ## Open parameters
 

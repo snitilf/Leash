@@ -1,0 +1,103 @@
+# Escapes and residuals
+
+- Status: draft, in review (slate 5). Settles with the design layer once the M0 spike (issue #13) passes.
+- Governs: the escape classes the design must resist, the mechanism and test that stop each, and the residual risks that are accepted and named.
+- Cites: FR-1, FR-3, FR-4, FR-9; NFR-5; SR-1, SR-2, SR-3, SR-4; ADR-0002, ADR-0003, ADR-0011, ADR-0012, ADR-0013. Invariants I1-I5 are defined in [`architecture.md`](architecture.md).
+
+This file is written last because it audits the rest of the design layer. Every other file points a
+residual or an escape test here; this is where those promises are collected and checked against each
+other. It is the traceability layer: each control the design describes as enforced maps to the escape
+it stops and the test that proves it, and each risk the design does not defend against is named rather
+than hidden. Terms in **bold** are defined in [`../CONTEXT.md`](../CONTEXT.md).
+
+## 1. The discipline (SR-2, NFR-5, I5)
+
+No control is described as enforced without a passing **escape**-attempt test (I5, NFR-5). This is the
+rule that overrides convenience: an enforcement claim is not the design saying a boundary holds, it is
+a test demonstrating a hostile child cannot cross it. This file is where every enforced control across
+the design layer maps to the escape it stops and the test that proves it (section 3), and where every
+residual the design accepts is stated with what bounds it (section 4). The adversary is fixed by the
+trust model in [`architecture.md`](architecture.md) section 2: the agent and every process it spawns,
+treated as hostile (SR-1), acting through prompt injection, a compromised dependency, or plain error,
+and running with the operator's privileges. It actively tries to do what the **policy** forbids. A
+control that has not been red-teamed against that adversary is not enforced, it is hoped for.
+
+## 2. In scope and out of scope
+
+A precise scope is the strength of the design, not an admission. Overclaiming any out-of-scope item
+is disqualifying: it makes the operator trust a boundary that is not there.
+
+In scope, and defended against with a mechanism and a test in section 3:
+
+- A hostile child reading, writing, or connecting outside the policy: the direct case the boundary exists for.
+- Child-process laundering: doing the forbidden thing from a grandchild, subshell, or helper binary spawned by the agent.
+- Path tricks: symlink swaps, `..` traversal, hardlinks, `/proc/<pid>/...` and `/proc/self` self-reference, and TOCTOU on a path argument between the supervisor's check and the kernel's use.
+- Alternate-syscall equivalents: reaching a mediated effect through a syscall the design failed to enumerate, or through an out-of-band submission path (`io_uring`).
+- fd inheritance and passing: obtaining a file descriptor the child was never authorized for, from a parent, over `SCM_RIGHTS`, or by pulling it out of another process.
+- Recorder tampering: making the supervisor block, crash, drop an **event**, or lose the **trace**, and getting a default-allow when it does.
+
+Out of scope, stated plainly (spec section 9). These are not defended against, and the design does not
+claim otherwise:
+
+- Kernel exploits and privilege escalation past the OS boundary. If the child gains root or breaks the kernel, the boundary Leash mediates is gone; Leash does not defend the kernel.
+- Hardware and micro-architectural side channels.
+- A malicious operator. Leash protects the operator from their agent, not the world from the operator.
+- Covert exfiltration through channels the policy allows. If the policy permits `api.anthropic.com`, data can leave through it by timing or steganography; an allowed channel is allowed.
+
+## 3. Escape-to-mechanism traceability
+
+One row per escape class. The mechanism is the control that stops it, the invariant is the property
+that control preserves, and the escape test states concretely what is attempted and what must be
+observed (denied, recorded, or fails-closed). No claim in this table is settled until its test passes
+(I5). No cell is blank; where a control leans on a residual, the residual is in section 4 and the row
+says so.
+
+| Escape | Mechanism that stops it | Invariant | Escape test (what it attempts, what must be observed) |
+|---|---|---|---|
+| Child-process laundering (do the forbidden thing from a grandchild) | Seccomp filter inherited across `fork`, `clone`, `clone3` and preserved across `execve` unconditionally; the process-creation family is mediated only to record and to let policy forbid spawning, not to preserve inheritance ([`syscalls.md`](syscalls.md) section 1) | I1 | Agent spawns `bash -c` and a helper binary that each attempt a forbidden `openat` and `connect`; both grandchildren must be mediated and denied exactly as the agent is, including a `clone` variant the design never enumerated |
+| Symlink swap / TOCTOU on a path argument | Supervisor-side path resolution with `openat2` `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS` (which implies `NO_MAGICLINKS`) against a supervisor-held dirfd, then the allow realized by `ADDFD` (fd-returning) or supervisor-executed with a spoofed return (mutation), never `CONTINUE` on a pointer argument ([`syscalls.md`](syscalls.md) sections 3-4, [`notify-loop.md`](notify-loop.md) section 2) | I4 | A sibling thread swaps an allowed path to point at a forbidden target between the supervisor's read and the kernel's use; the injected fd or supervisor-executed operation must act on the resolved-beneath target, and the swap must not redirect it |
+| `/proc` self-reference (`/proc/self/cwd`, `/proc/<pid>/root`, `/proc/<pid>/fd/N`) | Same supervisor-side resolution: `RESOLVE_NO_SYMLINKS` plus `NO_MAGICLINKS` refuses the magic-link traversal that `/proc` paths rely on, resolved beneath the anchor ([`syscalls.md`](syscalls.md) section 4) | I4 | Child reaches for a forbidden file via `/proc/self/cwd/../secret` and `/proc/<pid>/fd/N`; resolution must refuse the magic link and the access must be denied, not silently followed |
+| Alternate-syscall equivalent for one filesystem effect (`open` vs `openat` vs `openat2`) | All path-introducing variants are in the mediated set on every supported arch, decided identically at the path-introducing syscall ([`syscalls.md`](syscalls.md) section 3.1) | I1, I4 | Child opens the same forbidden path via `open`, `openat`, and `openat2` in turn; each must produce a mediated event and the same deny |
+| `io_uring` out-of-band I/O submission | `io_uring_setup` (and thus `io_uring_enter`, `io_uring_register`) is denied-and-recorded in both modes: the trap records the attempt, then refuses it, so the ring never opens an un-mediated I/O path (SR-4, [`syscalls.md`](syscalls.md) section 5) | I3 | Child calls `io_uring_setup`; the attempt must appear as an event and the call must fail with an errno, in enforce and in record-only, so no ring I/O ever bypasses the mediation surface |
+| Alternate network path (`connect` vs `sendto` on an unconnected socket) | `connect`, `bind`, and `sendto` to an unconnected socket are all mediated at the connection boundary; a host-enforced allow is realized by a supervisor-side connect injected with `ADDFD`, never `CONTINUE` ([`syscalls.md`](syscalls.md) section 3.5) | I4 | Child sends to a forbidden host both via `connect` then write and via `sendto` on an unconnected socket; both must be mediated and denied against the host allowlist. `sendmsg` to an unconnected socket is the residual in section 4 |
+| Foreign-ABI / arch-confusion entry (x32, 32-bit `int 0x80`) | Filter pins `AUDIT_ARCH_*` and additionally denies any syscall number with `__X32_SYSCALL_BIT` (bit 30) set, so an x32 number is never read against the x86-64 table; the 32-bit path is caught by the arch pin ([`syscalls.md`](syscalls.md) section 5) | I1, I3 | Child issues an x32 syscall (arch reports x86-64, bit 30 set) and a 32-bit `int 0x80` call; both must be denied-and-recorded, never dispatched against the native table |
+| fd inheritance at spawn | Child closes every file descriptor not on its allowlist immediately before `execve` ([`architecture.md`](architecture.md) section 5.2 step 6) | I1 | Supervisor leaks an extra fd to a forbidden resource into the child; after exec the child must find that fd closed and unable to reach the resource |
+| fd passing by pulling one out of another process (`pidfd_getfd`) | `pidfd_getfd` is denied outright in v1: its argument is a pidfd (a mutable fd-table index), not a scalar pid, so it is not `CONTINUE`-safe and a sound in-tree form is deferred ([`syscalls.md`](syscalls.md) section 3.4) | I1 | Child obtains a pidfd for an out-of-tree process and calls `pidfd_getfd` to steal its fd; the call must be denied-and-recorded |
+| Cross-process laundering via `ptrace` / `process_vm_*` | Mediated on tree membership: the supervisor tracks the live child tree from the `fork`/`clone`/`clone3` events it already observes, and denies when the target pid is outside the tree; the pid is a kernel-trusted scalar register, so the decision is `CONTINUE`-safe ([`syscalls.md`](syscalls.md) section 3.4) | I4 | Child `ptrace`s and `process_vm_writev`s an out-of-tree process to make it perform a forbidden action; both must be denied, while in-tree use (agent tracing its own subprocess) is allowed. The pid-reuse window is the residual in section 4 |
+| Recorder tampering / blinding the supervisor | In enforce mode the child is denied the state directory by both layers (FR-3, FR-21); the recorder is the single writer of the trace (ADR-0002); record precedes respond, so an unrecordable allow becomes a deny-and-abort; on any recorder-write failure the run fails closed ([`notify-loop.md`](notify-loop.md) sections 3-4 case E) | I2, I3 | Child attempts to open, write, delete, or race the trace and the state directory; every attempt in enforce mode must be denied, and a forced recorder-write failure must abort the run rather than release an unrecorded action. Record-only trace protection is the residual in section 4 |
+| Supervisor death (crash or kill) as a way to shed mediation | The kernel closes the notification fd when the supervisor dies; every pending and subsequent mediated syscall in the child then fails (documented `-ENOSYS` for the no-listener case), enforced by the kernel, not by supervisor code that is no longer running ([`notify-loop.md`](notify-loop.md) section 4 case G) | I3 | The supervisor is killed mid-run; the child's next `openat` and `connect` must fail rather than fall through to an alternate code path that reaches the same effect un-mediated |
+| Signal-cancellation double execution | The filter is installed with `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (ADR-0012), so a received notification is cancellable only by a fatal signal; a supervisor-performed side effect (rename, unlink, mkdir, host-enforced connect) cannot then run twice ([`notify-loop.md`](notify-loop.md) section 4.1 case I) | I3 | A non-fatal signal (SIGCHLD, a timer) is delivered to a child blocked on a supervisor-executed mutation; the side effect must run exactly once and no event may record a response that was never delivered |
+| Resource exhaustion (fork bomb, fill the upper layer) | An upperdir size limit backstops the snapshot mechanism; hitting it resolves per fail-closed, the run stops rather than the host filling ([`snapshot.md`](snapshot.md) section 6) | I3 | Child runs a fork bomb and a fill-the-upper loop; the run must stop at the limit fail-closed, and the host disk must not be exhausted |
+| Rename / hardlink race on the overlay (smuggle content past a snapshot boundary or misattribute a diff) | The single-threaded decision loop (ADR-0011) plus supervisor-side execution of the whole mutation family bound what a race can do; the overlay-level behavior is claimed only when the tests pass ([`snapshot.md`](snapshot.md) sections 1, 6) | I1, I5 | Child races capture with cross-layer renames and hardlink games to hide content from a snapshot or make diff read a rename as an unrelated create-plus-delete; capture, rewind, and diff must interpret the write-layer semantics correctly at the overlay level. The mmap step-granularity gap is the residual in section 4 |
+| Un-enumerated policy-relevant syscall (the default-allow residual) | Filesystem and network effects are independently caught by the Landlock backstop, which does not depend on the enumeration being complete (ADR-0003); process creation cannot escape mediation because inheritance is automatic (I1); the enumeration is a tier:2 review surface with `strace`-based coverage tests ([`syscalls.md`](syscalls.md) section 6) | I1 | An `strace`-based coverage run over a real agent workload must surface any policy-relevant syscall reaching the kernel un-enumerated; a forbidden filesystem or network effect attempted through such a syscall must still be caught by Landlock. The host-egress dimension is the residual in section 4 |
+
+## 4. Accepted residuals
+
+Each item is a risk the design does not fully close, stated with why it is accepted or unavoidable and
+what bounds it. Every one is named here rather than hidden; that is the point of the section. Each is
+promised by a sibling file and consolidated here so the audit is in one place.
+
+- **Host-level TCP egress has no kernel backstop.** Landlock's network rules are port-based, so they cannot enforce a host allowlist ([`syscalls.md`](syscalls.md) section 3.5, [`policy.md`](policy.md) section 6, ADR-0013). Host identity is enforced by the seccomp decision alone, realized as a supervisor-side connect injected with `ADDFD`. What bounds it: the seccomp enumeration for the network family is treated as security-critical and drawn most conservatively, because it is the one dimension where the enumeration must be complete on its own. Named, not hidden.
+- **Injected-socket option fidelity.** A host-enforced `connect` is realized by the supervisor opening a fresh socket, connecting it to the validated address, and installing it over the child's fd with `ADDFD` ([`syscalls.md`](syscalls.md) sections 3.5, 4). Socket options the child set on its own socket before `connect` are not carried onto the injected socket. What bounds it: this is a fidelity limit on legitimate use, not an escape (the boundary still holds); the exact option set to preserve is an open parameter for slate 2. Named, not hidden.
+- **`sendmsg` to an unconnected socket is not conditionally trappable.** The BPF filter sees only register arguments; `sendmsg`'s destination lives in `msghdr.msg_name` behind the message pointer, so the filter cannot condition on it without trapping every `sendmsg`, a hot-path cost on connected-socket data traffic ([`syscalls.md`](syscalls.md) section 3.5). What bounds it: v1 mediates the connection boundary at `connect`, `bind`, and `sendto`; widening to all `sendmsg` is a tier:2 change if a workload sends to unconnected sockets that way. Named, not hidden.
+- **pid reuse in the tree-membership check.** `ptrace` and `process_vm_*` are decided on whether the target pid is in the supervisor's tracked tree ([`syscalls.md`](syscalls.md) section 3.4). Between the supervisor's bookkeeping and the kernel's use of the pid, a pid could be reused. What bounds it: the pid is a kernel-trusted scalar taken at trap time, the tree is rebuilt from observed `fork`/`clone`/`clone3` events, and the window is narrow; closing it fully would need pidfd-based identity, deferred with `pidfd_getfd`. Named, not hidden.
+- **Record-only trace protection rests on filesystem permissions only.** In record-only mode no Landlock ruleset is applied (nothing is enforced, ADR-0010), so trace integrity rests on the state directory lying outside the workspace with restrictive permissions; a hostile same-uid child is not defended against ([`architecture.md`](architecture.md) I2). What bounds it: the spec scopes state-directory denial to enforce mode (FR-21), and record-only is a camera, not a bouncer. Named, not hidden.
+- **`mmap(MAP_SHARED)` writes do not drive step timing.** Writes through a shared mapping are not syscalls, so they produce no mediated event and cannot tick the **step** clock; an mmap-heavy burst looks like quiescence ([`snapshot.md`](snapshot.md) section 1). What bounds it: content is never lost, the overlay holds the real resulting file state and the next boundary captures it; the cost is step granularity only, not fidelity of the captured content. Named, not hidden.
+- **`truncate` has no Landlock backstop below ABI 3.** The dedicated `FS_TRUNCATE` right arrived at Landlock ABI 3 (Linux 6.2), above the kernel floor of ABI 2 ([`syscalls.md`](syscalls.md) section 3.2, degrade table in [`architecture.md`](architecture.md) section 5.1). What bounds it: where the running ABI lacks the right, the seccomp layer mediates `truncate` and the missing backstop is stamped into the trace as a residual, per ADR-0013; the boundary still holds on the seccomp layer. Named, not hidden.
+- **The default-allow enumeration residual.** A policy-relevant syscall absent from the mediated set passes unmediated ([`syscalls.md`](syscalls.md) section 6). What bounds it: filesystem and network effects are independently caught by the Landlock backstop for enforce mode (which does not depend on a complete enumeration, ADR-0003), process creation cannot escape because filter inheritance is automatic (I1), and the enumeration is reviewed as a tier:2 surface with `strace`-based coverage tests over a real workload. The one dimension Landlock cannot backstop is host-level egress (first residual above), which is why the network family is drawn most conservatively. Named, not hidden.
+
+## 5. Coverage check
+
+This is the completeness audit over the design layer before the freeze: every security requirement is
+addressed, and every enforcement claim has a home in section 3 or an entry in section 4.
+
+- **SR-1** (treat the agent and all descendants as hostile) is the adversary fixed in section 1 and in [`architecture.md`](architecture.md) section 2; every row in section 3 red-teams against it.
+- **SR-2** (resist the enumerated escape classes, each control mapping to tests) is the whole of section 3: child-process laundering, symlink/TOCTOU, `/proc` self-reference, alternate-syscall equivalents (`open`/`openat`/`openat2`, `io_uring`, `connect`/`sendto`), fd inheritance/passing, and recorder-tampering each have a row with a mechanism, an invariant, and a test.
+- **SR-3** (do not rely on any control the child can disable) is preserved by every mechanism resting on a kernel-enforced property: filter inheritance (I1), the Landlock backstop and its degrade table, kernel-driven fail-closed on supervisor death (I3), and the arch pin. Where a dimension has no kernel backstop (host egress, record-only trace, sub-ABI `truncate`), it is named in section 4, not claimed as enforced.
+- **SR-4** (deny un-mediated I/O paths in enforce, notably `io_uring`) is the `io_uring` and foreign-ABI rows of section 3 and the denied-and-recorded set of [`syscalls.md`](syscalls.md) section 5.
+- **NFR-5** (no control described as enforced without a passing escape test) is the discipline of section 1 and the test column of section 3: an untested claim is not an enforcement claim.
+
+Every control the design layer describes as enforced has a row in the section 3 table; every risk it
+does not close has an entry in section 4. The design layer is complete and honest on the security axis
+when the section 3 tests pass and the M0 spike (issue #13) settles the snapshot mechanism, at which
+point this file and the design layer freeze together.
