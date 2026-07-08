@@ -1,8 +1,11 @@
 # Snapshots, rewind, and diff
 
-- Status: provisional, gated on the ADR-0009 M0 validation spike (issue #13). Settles when the
-  spike passes on both reference targets; if it fails on a target, ADR-0009 is superseded and this
-  file is rewritten around the surviving mechanism.
+- Status: provisional. The x86-64 leg of the ADR-0009 M0 spike passed on Ubuntu 24.04 / kernel 6.8
+  (2026-07-08): privileged overlay mount, capture, rewind, whiteout, cross-directory rename, hard
+  link, and copy-fallback equivalence all validated; the rootless overlay path was blocked by the
+  host's unprivileged-userns restriction (section 3). The ARM64 leg is deferred. Settles when the
+  ARM64 leg also passes; a failure on a target supersedes ADR-0009 and this file is rewritten around
+  the surviving mechanism (issue #13).
 - Governs: how workspace state is captured at step boundaries, how rewind restores it, and how
   diff compares two runs or steps.
 - Cites: FR-11, FR-12, FR-13, FR-17, FR-21; NFR-4, NFR-5; SR-2; ADR-0005, ADR-0006, ADR-0009.
@@ -74,9 +77,12 @@ reader of a run always knows which semantics its snapshots carry.
 ## 3. Copy fallback (ADR-0009)
 
 Overlay mounting needs either privilege or an unprivileged user namespace with overlay support,
-and availability varies by kernel config, distro policy, and filesystem. Preflight probes both
-routes; where neither works, Leash falls back to a documented plain-copy mechanism: the workspace
-is copied per step instead of layered. The fallback MUST have the same observable rewind and diff
+and availability varies by kernel config, distro policy, and filesystem. The M0 spike found one
+common instance: stock Ubuntu 24.04 sets `kernel.apparmor_restrict_unprivileged_userns=1`, which
+blocks unprivileged user-namespace creation outright, so the rootless overlay route is unavailable
+there and a privileged mount or the copy fallback carries the mechanism (2026-07-08). Preflight
+probes both routes; where neither works, Leash falls back to a documented plain-copy mechanism: the
+workspace is copied per step instead of layered. The fallback MUST have the same observable rewind and diff
 behavior as the overlay (ADR-0009), which is a shared test obligation: the equivalence suite runs
 against both mechanisms, and a behavior only one of them exhibits is a bug in one of them. The
 fallback's cost scales with workspace size rather than change size, which is exactly why it is the
@@ -153,3 +159,14 @@ each target:
 The gate, per ADR-0009's own text: all items pass on both targets, and this file settles and the
 design layer can freeze; any target fails, and ADR-0009 is superseded rather than quietly bent,
 with this file rewritten around the surviving mechanism.
+
+### Spike results
+
+x86-64 leg, Ubuntu 24.04.4 / kernel 6.8, 2026-07-08: every privileged-path item passed, mount with
+upper-only writes over an untouched lower, capture, exact rewind, whiteout recorded as a char device
+0/0, cross-directory rename as copy-up plus whiteout, hard link resolving to one inode, and
+copy-fallback equivalence. The unprivileged-user-namespace item did not run: the host blocks
+unprivileged userns via `apparmor_restrict_unprivileged_userns=1` (section 3), so on that class of
+host the privileged mount or the copy fallback carries the mechanism. The overlay mechanism holds on
+x86-64; no supersede is warranted. ARM64 leg (Raspberry Pi): deferred, so the design layer does not
+freeze yet (issue #14); the same spike script settles it when the ARM64 leg runs.

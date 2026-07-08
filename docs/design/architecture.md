@@ -118,7 +118,12 @@ claim, and refuses to run rather than silently degrade (FR-14). Preflight bundle
   above the running ABI.
 - **Overlay support.** Whether an overlay mount is available (privileged mount, or an unprivileged
   user namespace) selects the snapshot mechanism: overlay if available, plain-copy fallback
-  otherwise (ADR-0009). The selected mechanism is stamped into the trace.
+  otherwise (ADR-0009). The probe distinguishes a kernel that lacks overlay from a host that merely
+  restricts unprivileged user namespaces (for example stock Ubuntu 24.04 with
+  `apparmor_restrict_unprivileged_userns=1`, confirmed by the M0 spike): the latter still supports a
+  privileged overlay mount, so a privileged run gets overlay and only an unprivileged run on such a
+  host falls to the copy fallback. The selected mechanism, and the reason for it, is stamped into the
+  trace.
 
 Landlock backstop degrade table. Record-only applies no Landlock at all (nothing is enforced,
 ADR-0010); the table is about which backstop the enforce-mode ruleset can carry at a given ABI. Per
