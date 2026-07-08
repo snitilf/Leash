@@ -1,6 +1,6 @@
 # ADR-0009: Snapshot mechanism is overlayfs, with a plain-copy fallback
 
-- Status: accepted
+- Status: accepted (M0 gate clause refined by ADR-0014)
 - Date: 2026-07-07
 
 ## Context

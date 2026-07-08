@@ -1,6 +1,6 @@
 # Policy
 
-- Status: draft, in review (slate 2)
+- Status: settled (slate 2 closed 2026-07-08)
 - Governs: the policy file format, the predicate vocabulary, how a decision is evaluated from it, how
   it is rejected, and how the Landlock ruleset is derived from it.
 - Cites: FR-6, FR-7, FR-18, FR-19; NFR-3, NFR-6; SR-3; ADR-0003, ADR-0004, ADR-0010, ADR-0013.
@@ -62,13 +62,37 @@ security-relevant change (ADR-0004). Version 1 covers exactly what FR-7 requires
 
 | Family | Key(s) | Matches | Notes |
 |---|---|---|---|
-| `fs` | `path` (glob), `mode` (set) | filesystem decisions ([`syscalls.md`](syscalls.md) sections 3.1-3.2, and `execute` at 3.3) | `mode` in `read`, `write`, `create`, `delete`, `execute`; metadata syscalls map to `write` |
-| `net` | `host`, `port` | `connect` / `bind` decisions | host and port matching semantics are an open parameter, section 6 |
-| `exec` | `binary` (glob) | `execve` / `execveat` decisions | the binary path, resolved |
+| `fs` | `path` (glob), `mode` (set) | filesystem decisions ([`syscalls.md`](syscalls.md) sections 3.1-3.2) | `mode` in `read`, `write`, `create`, `delete`; metadata syscalls map to `write` |
+| `net` | `host`, `port` | `connect` / `bind` decisions | matching semantics in section 2.2 |
+| `exec` | `binary` (glob) | `execve` / `execveat` decisions ([`syscalls.md`](syscalls.md) section 3.3) | the binary path, resolved; the sole execution control (section 2.3) |
 
 Every rule carries `action` in `allow`, `deny`, `ask`. A rule with an unknown key, an unknown
 `action`, an unknown `mode`, or an unknown `schema_version` is a rejection (section 4), never
 ignored.
+
+### 2.1 Glob syntax (fixed at slate 2)
+
+`path` and `binary` are gitignore-style globs: `*` matches within one path component, `**` crosses
+components, `?` matches a single character. A glob is anchored: after `{workspace}` and `~`
+expansion it must match the entire resolved absolute path, never a substring. Schema version 1 has
+no brace expansion and no character classes; a fuller matcher would be a new schema version.
+
+### 2.2 Host matching (fixed at slate 2)
+
+A `net` rule's `host` is one of: an exact hostname, a `*.suffix` wildcard, an exact IP address, or
+a CIDR block. IP and CIDR rules match the destination address in the child's `sockaddr` directly.
+A hostname rule is enforced by the supervisor resolving the rule's name itself at decision time
+(with a short-lived cache) and matching the child's destination IP against the resolved set; the
+child's own resolver is never consulted, so a lying DNS answer inside the child cannot widen the
+allowlist. The residual this leaves (CDN address rotation, one IP serving several hosts) is named
+in [`escapes.md`](escapes.md).
+
+### 2.3 One execution control (fixed at slate 2)
+
+The `exec` table is the only spelling for execution control; there is no `execute` value in
+`fs.mode`. One syscall family, one table, one first-match answer: two vocabularies deciding the
+same `execve` would reintroduce exactly the ordering ambiguity first-match-in-file-order exists to
+remove.
 
 ## 3. Evaluation
 
@@ -146,14 +170,13 @@ in [`architecture.md`](architecture.md) section 5.1 governs: the seccomp layer e
 and the missing backstop is stamped into the trace, rather than the run being refused (ADR-0013). The
 only hard refusal is below the kernel floor (ADR-0012).
 
-## 7. Open parameters (resolved at slate 2)
+## 7. Parameters fixed at slate 2
 
-- Glob syntax for `path` and `binary` (shell-style `**` vs a fuller matcher), and whether globs are
-  anchored.
-- Host matching for `net`: exact hostname, suffix wildcard, IP and CIDR, and how a DNS name is
-  reconciled with the IP the child actually connects to (the name-versus-address gap is a real
-  enforcement question, not a formatting one).
-- Whether `mode = ["execute"]` on an `fs` rule and the `exec` table are two spellings of one control
-  or kept distinct.
+- Glob syntax and anchoring: gitignore-style `*` / `**` / `?`, anchored to the full resolved path
+  (section 2.1).
+- Host matching: exact hostname, `*.suffix` wildcard, IP, and CIDR; hostname rules enforced by
+  supervisor-side resolution against the connected address (section 2.2), with the
+  name-versus-address gap named as a residual in [`escapes.md`](escapes.md).
+- Execution control has one spelling, the `exec` table (section 2.3).
 
-These are carried in the open-parameters table in [`README.md`](README.md) with their closing trigger.
+The [`README.md`](README.md) open-parameters table records these as closed.

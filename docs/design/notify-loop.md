@@ -1,6 +1,6 @@
 # The notify loop
 
-- Status: draft, in review (slate 2)
+- Status: settled (slate 2 closed 2026-07-08)
 - Governs: the protocol the supervisor runs on the seccomp notification fd, how it reads child
   memory safely, and how every error path resolves to deny.
 - Cites: FR-2, FR-3, FR-9, FR-10, FR-20; NFR-1, NFR-6; SR-2, SR-3; ADR-0002, ADR-0011, ADR-0012.
@@ -51,8 +51,12 @@ The child's pointer arguments are the whole TOCTOU problem (SR-2, I4). The rules
   `/proc/<pid>/mem` at the address from the trap-time registers.
 - Bracket the read with `ID_VALID`: check validity, read, check validity again. A read that spans the
   child's death is discarded, and the id cannot have been silently reused underneath it.
-- Cap every read (path length, `sockaddr` length). An unbounded or attacker-chosen length is a
-  denial-of-service on the single decision thread; over the cap resolves to deny (section 4, case C).
+- Cap every read. The caps, fixed at slate 2, are the kernel's own limits: 4096 bytes for a path
+  (`PATH_MAX`), 128 bytes for a `sockaddr` (`sizeof(struct sockaddr_storage)`), the current kernel
+  struct size for `clone_args`, and one page as the absolute ceiling for any read. An unbounded or
+  attacker-chosen length is a denial-of-service on the single decision thread; over the cap
+  resolves to deny (section 4, case C), because a value larger than the kernel itself would accept
+  is hostile by definition.
 - The value read is used once, to build the typed fact, and for a pointer-argument allow it is never
   handed back to the child as a re-editable argument. That is why the allow-realization rule
   (section 3) forbids `CONTINUE` for pointer-argument decisions: `CONTINUE` re-reads child memory at
@@ -118,7 +122,9 @@ mid-run and confirms the child's next `openat` and `connect` fail rather than su
 
 ## 5. The ask, and the whole-tree stall
 
-An **ask** blocks the decision loop until the operator answers or the FR-10 timeout denies. Under
+An **ask** blocks the decision loop until the operator answers or the FR-10 timeout denies. The
+default timeout is 60 seconds, operator-configurable (slate 2): long enough for a person at the
+keyboard, short enough to bound the stall described below. Under
 ADR-0011 that stalls every other mediated syscall in the child tree behind it, which is the accepted
 cost recorded in that ADR: the asking child is paused by design, and a sibling only observes a slow
 syscall. The timeout is what bounds the stall and what makes case F above a finite arc rather than an

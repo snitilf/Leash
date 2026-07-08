@@ -36,6 +36,6 @@ Each layer references the ones above it by **stable ID** (requirement IDs like `
 
 ## Status
 
-- **Design stage.** The spec is settled at v0.3 (see [`spec/SPEC.md`](spec/SPEC.md)); the design layer in [`design/`](design/) is drafted and in review. Implementation has not started.
-- The design layer freezes once the M0 overlay spike passes; `design/snapshot.md` stays provisional until then (ADR-0009).
-- One spec item remains deferred on purpose: OQ-5 (the overhead budget), closing on M1 measurements.
+- **Design frozen, pre-implementation.** The spec is settled at v0.4 (see [`spec/SPEC.md`](spec/SPEC.md)); the design layer in [`design/`](design/) is frozen as of 2026-07-08, the M0 overlay spike having met its gate on x86-64 (ADR-0009 as refined by ADR-0014). Implementation has not started.
+- Two spec items remain deferred on purpose: OQ-5 (the overhead budget) closing on M1 measurements, and OQ-9 (the ARM64 target) closing on a real ARM64 need.
+- One design parameter remains deferred with the same discipline: the step-coalescing window, set from M1 measurement (see the design README's open-parameters table).

@@ -1,7 +1,7 @@
 # Leash — Software Specification
 
-- Status: **v0.3, settled** (section 11 holds one explicitly deferred item, OQ-5, with a named closing trigger)
-- Date: 2026-07-08 (v0.3 revised FR-14's kernel floor to 5.19 per ADR-0012; v0.2 dated 2026-07-07)
+- Status: **v0.4, settled** (section 11 holds two explicitly deferred items, OQ-5 and OQ-9, each with a named closing trigger)
+- Date: 2026-07-08 (v0.4 deferred the ARM64 target per ADR-0014; v0.3 revised FR-14's kernel floor to 5.19 per ADR-0012; v0.2 dated 2026-07-07)
 - Governs: what Leash must do and why. *How* it is built is the design (`docs/design/`).
 
 Key words **MUST**, **MUST NOT**, **SHOULD**, **MAY** per RFC 2119. IDs are stable and cited by other documents, tests, and code: `F-n` features, `FR-n` functional requirements, `NFR-n` non-functional requirements, `SR-n` security requirements, `OQ-n` open questions. Terms in **bold** are defined in [`CONTEXT.md`](../CONTEXT.md) and used exactly as defined there.
@@ -78,7 +78,7 @@ These carry no requirements yet and nothing in this table is promised; promoting
 
 ### 6.4 Interface & portability
 - **FR-14** — Leash MUST run on Linux 5.19 or later (ADR-0012). This floor is set by the capabilities the supervisor depends on, not by either mechanism's earliest appearance: `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (5.19), so a signal-cancelled notification cannot double-execute a supervisor-performed action; `SECCOMP_ADDFD` and `SECCOMP_ADDFD_FLAG_SEND` (5.9, 5.14); and Landlock ABI 2 (5.19), so cross-directory rename and link the policy allows are not denied by the backstop. Preflight MUST verify the capabilities, not merely the version string. Below the floor Leash MUST refuse to run with a clear message rather than silently degrade security.
-- **FR-15** — Leash MUST run on x86-64 and ARM64 (the Raspberry Pi and VPS targets).
+- **FR-15** — Leash MUST run on x86-64 (the VPS reference target). ARM64 support is deferred (OQ-9, ADR-0014).
 - **FR-16** — Traces MUST persist in a documented, machine-readable format (e.g. JSONL); the format SHOULD align with the draft agent-audit-trail schema where practical.
 - **FR-21** — Traces and snapshots MUST persist under a per-run directory in an operator-configurable state directory (default per XDG, e.g. `$XDG_STATE_HOME/leash/runs/<run-id>`). The state directory MUST lie outside the **workspace**, and in enforce mode the child MUST be denied access to it (FR-3). Leash MUST NOT delete run data automatically; retention is the operator's, assisted by a listing/pruning subcommand.
 
@@ -87,7 +87,7 @@ These carry no requirements yet and nothing in this table is promised; promoting
 - **NFR-1 — Fail-closed integrity.** The system MUST never fail open. Where any requirement conflicts with this, fail-closed wins.
 - **NFR-2 — Overhead.** Added latency per mediated syscall and end-to-end wall-clock overhead on a representative agent task MUST be measured and reported (section 10). Leash SHOULD keep overhead low enough to run always-on. The concrete budget is deferred (section 11, OQ-5).
 - **NFR-3 — Auditability.** Policy MUST be human-readable and diffable; the trace MUST suffice to reconstruct what the agent did without the agent's cooperation.
-- **NFR-4 — Portability & footprint.** MUST build and run on a Raspberry Pi 4 class device; MUST NOT require significant ongoing cloud/compute spend.
+- **NFR-4 — Portability & footprint.** MUST NOT require significant ongoing cloud/compute spend; SHOULD stay light enough for modest hardware. The Raspberry Pi 4 class target is deferred with ARM64 (OQ-9).
 - **NFR-5 — Defensibility.** Every control described as *enforced* MUST have passing **escape**-attempt tests. No claim without a test.
 - **NFR-6 — Reviewability.** Security-critical code paths (decision loop, enforcement setup, recorder) MUST be small and isolated enough to audit; policy evaluation MUST be pure and exhaustively unit-testable.
 
@@ -121,9 +121,10 @@ The certified/golden test inventory is maintained alongside the test suite.
 
 ## 11. Open questions
 
-OQ-1..OQ-4 and OQ-6..OQ-8 were resolved on 2026-07-07 into FR-17..FR-21, SR-4, ADR-0009, and ADR-0010. One item remains, deferred on purpose:
+OQ-1..OQ-4 and OQ-6..OQ-8 were resolved on 2026-07-07 into FR-17..FR-21, SR-4, ADR-0009, and ADR-0010. Two items remain, deferred on purpose:
 
-- **OQ-5 — Overhead budget (deferred).** The concrete NFR-2 target is set from real measurements once the M1 recorder exists on both reference targets; a number chosen earlier would be a guess. *Trigger to close:* M1 measurements per section 10, item 4.
+- **OQ-5 — Overhead budget (deferred).** The concrete NFR-2 target is set from real measurements once the M1 recorder exists on the reference target; a number chosen earlier would be a guess. *Trigger to close:* M1 measurements per section 10, item 4.
+- **OQ-9 — ARM64 target (deferred).** FR-15 and NFR-4 originally named ARM64 and a Raspberry Pi 4 class device; the ARM64 leg of the M0 spike was cancelled and the MVP targets x86-64 only (ADR-0014). *Trigger to reopen:* a real need for an ARM64 host. Before any support claim, the M0 spike's ARM64 leg must pass on hardware and the syscall table's ARM64 column (design, syscalls.md section 3) must be validated there.
 
 ## 12. Traceability
 
@@ -142,6 +143,6 @@ OQ-1..OQ-4 and OQ-6..OQ-8 were resolved on 2026-07-07 into FR-17..FR-21, SR-4, A
 | FR-21 (trace persistence) | ADR-0002 | state-dir isolation escape tests |
 | SR-4 (io_uring denial) | design (syscalls.md section 5) | io_uring escape tests |
 | FR-1/FR-4 (agent-agnostic coverage) | ADR-0006 | inheritance + coverage tests |
-| NFR-4 (footprint), FR-15 | ADR-0007 | build/run on Pi + VPS |
+| NFR-4 (footprint), FR-15 | ADR-0007, ADR-0014 | build/run on the VPS reference target |
 
 Every FR/NFR should trace to a decision and a verification; the table grows with the spec.

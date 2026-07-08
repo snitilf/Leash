@@ -1,11 +1,12 @@
 # Snapshots, rewind, and diff
 
-- Status: provisional. The x86-64 leg of the ADR-0009 M0 spike passed on Ubuntu 24.04 / kernel 6.8
-  (2026-07-08): privileged overlay mount, capture, rewind, whiteout, cross-directory rename, hard
+- Status: settled (2026-07-08). The x86-64 leg of the ADR-0009 M0 spike passed on Ubuntu 24.04 /
+  kernel 6.8: privileged overlay mount, capture, rewind, whiteout, cross-directory rename, hard
   link, and copy-fallback equivalence all validated; the rootless overlay path was blocked by the
-  host's unprivileged-userns restriction (section 3). The ARM64 leg is deferred. Settles when the
-  ARM64 leg also passes; a failure on a target supersedes ADR-0009 and this file is rewritten around
-  the surviving mechanism (issue #13).
+  host's unprivileged-userns restriction and that skip is accepted as a documented host-class
+  limitation (section 3, ADR-0014). The ARM64 leg was cancelled with the target deferral
+  (ADR-0014, spec OQ-9), which narrows ADR-0009's gate to the x86-64 leg; with that gate met, this
+  file settles (issue #13).
 - Governs: how workspace state is captured at step boundaries, how rewind restores it, and how
   diff compares two runs or steps.
 - Cites: FR-11, FR-12, FR-13, FR-17, FR-21; NFR-4, NFR-5; SR-2; ADR-0005, ADR-0006, ADR-0009.
@@ -36,7 +37,8 @@ the agent's; a subshell writing files is not a blind spot.
 
 The boundary falls when mutating-event activity quiesces for longer than a coalescing window. The
 window's value is an open parameter (the [`README.md`](README.md) table), to be set from real
-measurement at slate 3 with M1 as the closing trigger, not guessed. Two properties are fixed
+measurement with M1 as the closing trigger, not guessed; 500 ms is the placeholder for pre-M1
+testing and carries no claim. Two properties are fixed
 regardless of the value: the boundary MUST NOT fall inside a burst, and run start and run end are
 always step boundaries, so every run has at least the initial and final snapshots even if the agent
 never writes. Each boundary emits a `step` event into the trace ([`trace.md`](trace.md) section 2)
@@ -57,8 +59,8 @@ workspace directory is the `lowerdir` and stays untouched, the child's writes la
 `upperdir`, and overlayfs uses a `workdir` for its internal atomicity. A **snapshot** is a capture
 of the upper layer at a step boundary. Because the upper layer contains only what changed, snapshot
 cost scales with the size of the change, not the size of the workspace, which is what makes
-frequent step boundaries affordable on a Raspberry Pi 4 class device (NFR-4) and on workspaces with
-large dependency trees.
+frequent step boundaries affordable on modest hardware (NFR-4) and on workspaces with large
+dependency trees.
 
 Upper-layer semantics are not a plain file tree, and everything downstream inherits them:
 
@@ -131,9 +133,10 @@ Two families of hostile input bear on this file, both enumerated and tested in
   The single-threaded decision loop and supervisor-side execution of the mutation family bound what
   a race can do, but the overlay-level behavior is claimed only when the escape tests pass.
 - **Resource exhaustion**: a fork bomb or a deliberate fill-the-upper-layer loop turning the
-  snapshot mechanism into a disk-exhaustion vector. The backstop is an upperdir size limit, an open
-  parameter in the [`README.md`](README.md) table (slate 3); hitting it resolves per fail-closed,
-  the run stops rather than the host filling.
+  snapshot mechanism into a disk-exhaustion vector. The backstop is an upperdir size limit, fixed
+  at slate 3: 2 GiB by default, operator-configurable, with preflight warning when free disk on the
+  state directory's filesystem is below the cap. Hitting it resolves per fail-closed, the run stops
+  rather than the host filling.
 
 Per I5 and NFR-5, no reversibility claim is made anywhere (docs, report, pitch) until the
 write-layer-semantics tests of section 5 pass. Until then, rewind and diff are described as
@@ -142,9 +145,8 @@ implemented, not as correct.
 ## 7. The M0 spike checklist
 
 This section doubles as the acceptance criteria of the ADR-0009 validation spike (issue #13). The
-spike is run by the operator on both reference targets, the Raspberry Pi and the KVM VPS (FR-15,
-NFR-4), because it needs the physical hardware; the spike scripts can be authored in advance. On
-each target:
+spike was run by the operator on the x86-64 reference target, a KVM VPS (FR-15); the ARM64 leg was
+cancelled when that target was deferred (ADR-0014, spec OQ-9). On the target:
 
 - [ ] overlay mount of a workspace via privileged mount
 - [ ] overlay mount via an unprivileged user namespace
@@ -156,9 +158,11 @@ each target:
 - [ ] the copy fallback, on a host (or configuration) where overlay is unavailable, produces
       identical observable rewind and diff behavior
 
-The gate, per ADR-0009's own text: all items pass on both targets, and this file settles and the
-design layer can freeze; any target fails, and ADR-0009 is superseded rather than quietly bent,
-with this file rewritten around the surviving mechanism.
+The gate, as narrowed by ADR-0014: all items pass on the x86-64 target, with the
+unprivileged-userns item accepted as a documented host-class limitation where the host blocks
+unprivileged user namespaces outright; with that met, this file settles and the design layer can
+freeze. A failure would have superseded ADR-0009 rather than quietly bending it, with this file
+rewritten around the surviving mechanism.
 
 ### Spike results
 
@@ -167,6 +171,8 @@ upper-only writes over an untouched lower, capture, exact rewind, whiteout recor
 0/0, cross-directory rename as copy-up plus whiteout, hard link resolving to one inode, and
 copy-fallback equivalence. The unprivileged-user-namespace item did not run: the host blocks
 unprivileged userns via `apparmor_restrict_unprivileged_userns=1` (section 3), so on that class of
-host the privileged mount or the copy fallback carries the mechanism. The overlay mechanism holds on
-x86-64; no supersede is warranted. ARM64 leg (Raspberry Pi): deferred, so the design layer does not
-freeze yet (issue #14); the same spike script settles it when the ARM64 leg runs.
+host the privileged mount or the copy fallback carries the mechanism; the skip is accepted as a
+host-class limitation, not a failure (ADR-0014). The overlay mechanism holds on x86-64; no
+supersede is warranted. The ARM64 leg was cancelled with the target deferral (ADR-0014, spec OQ-9);
+the same spike script runs unchanged if OQ-9 ever reopens the target. With the narrowed gate met,
+this file is settled.

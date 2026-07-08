@@ -1,6 +1,6 @@
 # Architecture
 
-- Status: draft, in review (slate 1)
+- Status: settled (design layer frozen 2026-07-08)
 - Governs: how the supervisor is structured and how it brings a run into being.
 - Cites: FR-1, FR-3, FR-8, FR-9, FR-14, FR-15; SR-1, SR-3; ADR-0002, ADR-0003, ADR-0006, ADR-0007, ADR-0011.
 

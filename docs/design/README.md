@@ -4,9 +4,10 @@
 commits to *how* before *what* builds the wrong thing precisely. Every design choice cites the spec
 requirement it satisfies and, where it is a hard-to-reverse trade-off, an ADR.
 
-Status: **drafted, in review.** All seven files exist and are in slate review. The layer freezes when
-the M0 spike (issue #13) passes on both reference targets; `snapshot.md` stays provisional until then,
-and if the spike fails on a target ADR-0009 is superseded and `snapshot.md` is rewritten.
+Status: **frozen (2026-07-08).** All seven files are settled. The M0 spike's gate, narrowed to the
+x86-64 leg by ADR-0014 (the ARM64 target is deferred, spec OQ-9), passed on 2026-07-08, settling
+`snapshot.md` and freezing the layer. Changes from here follow change control; a frozen file is
+amended by a recorded decision, not edited casually.
 
 ## Reading order
 
@@ -24,39 +25,39 @@ and if the spike fails on a target ADR-0009 is superseded and `snapshot.md` is r
 
 | File | Covers | Status |
 |---|---|---|
-| `architecture.md` | model, invariants, modules, lifecycle | draft, in review (slate 1) |
-| `syscalls.md` | mediated-syscall enumeration (FR-4) | draft, in review (slate 2) |
-| `notify-loop.md` | notify protocol, fail-closed (FR-9) | draft, in review (slate 2) |
-| `policy.md` | policy schema, evaluation, Landlock derivation (FR-18) | draft, in review (slate 2) |
-| `trace.md` | run dir, event schema, report (FR-2, FR-16, FR-5) | draft, in review (slate 2) |
-| `snapshot.md` | step, snapshot, rewind, diff (FR-11-13, FR-17) | draft, provisional (slate 3); settles when the M0 spike passes |
-| `escapes.md` | escape traceability (SR-2, NFR-5) | draft, in review (slate 5) |
+| `architecture.md` | model, invariants, modules, lifecycle | settled |
+| `syscalls.md` | mediated-syscall enumeration (FR-4) | settled |
+| `notify-loop.md` | notify protocol, fail-closed (FR-9) | settled |
+| `policy.md` | policy schema, evaluation, Landlock derivation (FR-18) | settled |
+| `trace.md` | run dir, event schema, report (FR-2, FR-16, FR-5) | settled |
+| `snapshot.md` | step, snapshot, rewind, diff (FR-11-13, FR-17) | settled (M0 gate met per ADR-0014) |
+| `escapes.md` | escape traceability (SR-2, NFR-5) | settled |
 
 ## Open parameters
 
-Design parameters deliberately left unfixed, each with the review or event that closes it. This is
-the same discipline the spec uses for its open questions: a value is fixed at a review slate or
-deferred with a named trigger, never left implicit.
+Design parameters were deliberately left unfixed until a named review or event closed them, the
+same discipline the spec uses for its open questions. All but one were fixed at the closing slate
+of 2026-07-08; the coalescing window stays deferred with a named trigger, never left implicit.
 
-| Parameter | Where | Default / leaning | Closes at |
+| Parameter | Where | Resolution | Closed |
 |---|---|---|---|
-| Path/binary glob syntax and anchoring | `policy.md` | shell-style `**` | slate 2 |
-| Host matching (exact / suffix / IP / CIDR; DNS-name vs connected-IP) | `policy.md` | to decide | slate 2 |
-| `mode = ["execute"]` vs the `exec` table (one control or two) | `policy.md` | to decide | slate 2 |
-| Run-id format (sortable + unique + one path component) | `trace.md` | timestamp + short random suffix | slate 2 |
-| fsync granularity (step-boundary vs per-event option) | `trace.md` | fsync at step boundaries | slate 2 |
-| Event envelope field names, mapping to the agent-audit-trail draft | `trace.md` | align where practical | slate 2 |
-| `openat2` resolve-flag set, and admitting in-workspace symlinks | `syscalls.md` | `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS` | M0 spike / slate 2 |
-| Injected-socket fidelity for a host-enforced `connect` (socket options) | `syscalls.md` | accept loss, name residual | slate 2 |
-| Child memory-read cap (path / `sockaddr` length bound) | `notify-loop.md` | to set | slate 2 |
-| Ask timeout default (FR-10 timeout-to-deny) | `notify-loop.md` | to set | slate 2 |
-| Coalescing window for step detection (FR-17) | `snapshot.md` | to set from measurement | slate 3 / M1 |
-| Upperdir size limit (fork-bomb / fill-the-upper backstop) | `snapshot.md` | to set | slate 3 |
+| Path/binary glob syntax and anchoring | `policy.md` section 2.1 | gitignore-style `*` / `**` / `?`, anchored to the full resolved path | slate 2 |
+| Host matching | `policy.md` section 2.2 | exact hostname, `*.suffix`, IP, CIDR; hostname rules via supervisor-side resolution against the connected IP; residual named in `escapes.md` | slate 2 |
+| `mode = ["execute"]` vs the `exec` table | `policy.md` section 2.3 | one control: the `exec` table; no `execute` mode on `fs` | slate 2 |
+| Run-id format | `trace.md` sections 1, 5 | UTC timestamp + 6-char base32 suffix, e.g. `20260708T153012Z-7k3m9q` | slate 2 |
+| fsync granularity | `trace.md` sections 4, 5 | step-boundary default, per-event as an opt-in flag | slate 2 |
+| Event envelope field names | `trace.md` sections 2, 5 | fixed as documented; audit-trail draft alignment deferred to the M1 serializer, renames land as a `schema_version` bump | slate 2 |
+| `openat2` resolve-flag set, in-workspace symlinks | `syscalls.md` section 4 | `RESOLVE_BENEATH \| RESOLVE_NO_MAGICLINKS` beneath the workspace (in-tree symlinks work); `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS` for other roots | slate 2 |
+| Injected-socket fidelity for a host-enforced `connect` | `syscalls.md` section 3.5 | loss accepted, no options preserved in v1; residual named in `escapes.md`; tier:2 revisit on a real breakage | slate 2 |
+| Child memory-read cap | `notify-loop.md` section 2 | 4096 bytes (path), 128 bytes (`sockaddr`), kernel struct size (`clone_args`), one page absolute; over cap denies | slate 2 |
+| Ask timeout default | `notify-loop.md` section 5 | 60 seconds, operator-configurable; timeout denies (FR-10) | slate 2 |
+| Coalescing window for step detection (FR-17) | `snapshot.md` section 1 | **deferred**: set from M1 measurement (trigger: M1 overhead measurements, with OQ-5); 500 ms placeholder for pre-M1 testing, no claim | open, M1 |
+| Upperdir size limit | `snapshot.md` section 6 | 2 GiB default, operator-configurable; preflight warns when free disk is below the cap; hitting it fails closed | slate 3 |
 
 ## Governing decisions
 
 The design does not re-open settled decisions. The load-bearing ones it builds on are ADR-0002
 (supervisor/child separation), ADR-0003 as refined by ADR-0013 (defense in depth; kernel backstop per
 expressible dimension), ADR-0004 (declarative policy), ADR-0006 (mediate at the OS boundary), ADR-0009
-(snapshot mechanism, gated on the M0 spike), ADR-0010 (two modes), ADR-0011 (single-threaded notify
-loop), and ADR-0012 (kernel floor 5.19).
+as refined by ADR-0014 (snapshot mechanism, M0 gate met on x86-64), ADR-0010 (two modes), ADR-0011
+(single-threaded notify loop), ADR-0012 (kernel floor 5.19), and ADR-0014 (ARM64 target deferred).

@@ -1,6 +1,6 @@
 # Mediated syscalls
 
-- Status: draft, in review (slate 2)
+- Status: settled (slate 2 closed 2026-07-08)
 - Governs: which syscalls the seccomp filter mediates, denies, or passes through, and how each
   allowed one is realized safely.
 - Cites: FR-2, FR-4, FR-15; NFR-3; SR-2, SR-3, SR-4; ADR-0003, ADR-0006, ADR-0010, ADR-0011,
@@ -179,9 +179,11 @@ which makes the `sockaddr` TOCTOU real: with a bare `CONTINUE`, a second thread 
 address between the supervisor's read and the kernel's connect. The design closes it by realizing a
 host-enforced allow as a supervisor-side connect injected with `ADDFD` (the supervisor opens a
 socket, connects it to the validated address, and installs it over the child's fd number), never as
-`CONTINUE`. `CONTINUE` is used only where the policy imposes no host constraint. The fidelity cost of
-the injected socket (socket options the child set before `connect`) is an open parameter for slate 2
-and a line in [`escapes.md`](escapes.md).
+`CONTINUE`. `CONTINUE` is used only where the policy imposes no host constraint. The fidelity cost of the
+injected socket (socket options the child set before `connect`) is accepted as-is at slate 2: no
+options are carried onto the injected socket, the loss is a named residual in
+[`escapes.md`](escapes.md), and widening fidelity is a tier:2 change if a real workload breaks on
+it.
 
 ## 4. The allow-realization rule (normative)
 
@@ -201,16 +203,20 @@ One rule governs every "allow" response, and it is the load-bearing security dec
    the supervisor hands it back with `ADDFD` over the argument fd: for a host-enforced `connect` it
    opens a socket, connects it to the validated address, installs it over the child's socket fd
    (`ADDFD` with `SETFD`), and returns success. The fidelity limit of this, socket options the child
-   set before `connect`, is the open parameter noted in section 3.5.
+   set before `connect`, is the accepted residual noted in section 3.5.
 4. `execve` and `execveat` are the one exception where an allow must use `CONTINUE`; enforcement is
    delegated to the Landlock `FS_EXECUTE` backstop (section 3.3), and the residual is recorded.
 
-Path resolution for cases 2 and 3 is done by the supervisor under a no-symlink, beneath-the-anchor
-constraint (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`; `NO_SYMLINKS` already implies
-`NO_MAGICLINKS`), resolved against a supervisor-held dirfd because `RESOLVE_BENEATH` rejects absolute
-paths. This is what defeats the symlink and `/proc` self-reference escapes (SR-2). The exact
-resolve-flag set (and how to admit legitimate in-workspace symlinks) is an open parameter pending the
-M0 spike and slate 2.
+Path resolution for cases 2 and 3 is done by the supervisor with `openat2` against a
+supervisor-held dirfd (`RESOLVE_BENEATH` rejects absolute paths, so the anchor is always explicit).
+The flag set, fixed at slate 2, differs by anchor. Resolution beneath the workspace uses
+`RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`: in-tree symlinks are followed, because real projects
+depend on them (pnpm's `node_modules`, virtualenvs), and the kernel still guarantees the final
+target stays beneath the workspace anchor, rejecting absolute symlinks and any `..` escape; magic
+links are refused explicitly. Resolution against any other allowed root uses
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` (which implies `NO_MAGICLINKS`): out-of-workspace allows
+are rare, explicit paths and get the strictest treatment. Policy is always evaluated against the
+final resolved path. This is what defeats the symlink and `/proc` self-reference escapes (SR-2).
 
 ## 5. The denied-and-recorded set
 
@@ -227,7 +233,7 @@ operator, especially in record-only, wants to see that the agent reached for the
   let the agent make the trace lie, so it does not contradict "record-only enforces nothing". Because
   the attempt is trapped rather than `RET_ERRNO`'d, the denied `io_uring_setup` is itself an event the
   operator sees. The cost, that an agent genuinely needing `io_uring` fails in record-only rather than
-  running with a partial trace, is the recommended trade for slate 2. Relaxing SR-4 for a path
+  running with a partial trace, is the accepted trade (slate 2). Relaxing SR-4 for a path
   requires a spec change adding equivalent mediation and its escape tests first.
 - Foreign-ABI entry. The filter pins the architecture (`AUDIT_ARCH_X86_64` or `AUDIT_ARCH_AARCH64`)
   and routes any mismatch to deny-and-record. Pinning the arch alone does **not** close the x32 ABI:

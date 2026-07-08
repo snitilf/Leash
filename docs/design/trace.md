@@ -1,6 +1,6 @@
 # Trace and session report
 
-- Status: draft, in review (slate 2)
+- Status: settled (slate 2 closed 2026-07-08)
 - Governs: the per-run directory layout, the JSONL event schema, durability, and the human-readable
   session report.
 - Cites: FR-2, FR-3, FR-5, FR-16, FR-19, FR-21; NFR-3; ADR-0002, ADR-0010, ADR-0011. Invariants I2,
@@ -31,8 +31,9 @@ access to it by both layers: no policy rule grants it, and the derived Landlock 
 include it (FR-21, FR-3). An escape test confirms the child cannot open `trace.jsonl` under any path,
 including `/proc` self-reference ([`escapes.md`](escapes.md), I2).
 
-The `<run-id>` format is an open parameter (section 5). The requirement on it is fixed: sortable by
-start time, unique without coordination, and safe as a single path component.
+The `<run-id>` is a UTC timestamp plus a short random suffix, `20260708T153012Z-7k3m9q`: a compact
+ISO-style timestamp, a hyphen, six characters of lowercase base32 (section 5). It sorts by start
+time in a directory listing, is unique without coordination, and is a single safe path component.
 
 ## 2. Event schema
 
@@ -90,19 +91,21 @@ The design fsyncs at **step** boundaries and at run end, not per event. Within a
 the append buffer and the OS page cache. This protects the trace against a supervisor crash (the page
 cache outlives the process and the OS flushes it) at full speed, and bounds what a power-loss can lose
 to the events of the final, not-yet-quiesced step, which is acceptable because the same power loss
-also stopped the child, so no un-flushed event describes an action the machine outlived. Whether a
-stricter per-event or per-N-event fsync is offered for higher-assurance runs is an open parameter
+also stopped the child, so no un-flushed event describes an action the machine outlived. A stricter
+per-event fsync is offered as an opt-in flag for runs that value durability over overhead
 (section 5). This durability claim is one to test, not assume (NFR-5): the fault test kills the
 supervisor mid-step and confirms the flushed prefix of the trace is intact and consistent.
 
-## 5. Open parameters (resolved at slate 2)
+## 5. Parameters fixed at slate 2
 
-- `<run-id>` format: a sortable timestamp plus a short random suffix, or a ULID. The constraint in
-  section 1 is fixed; the spelling is not.
-- fsync granularity: step-boundary (the default above) versus an optional per-event mode for runs
-  that value durability over overhead.
-- Exact envelope field names and the mapping to the agent-audit-trail draft, pending a look at that
-  schema's current shape (FR-16 is a SHOULD-align, not a MUST-match).
+- `<run-id>` format: UTC timestamp plus six random base32 characters, e.g. `20260708T153012Z-7k3m9q`
+  (section 1). Chosen over a ULID because the timestamp is readable in a plain `ls`.
+- fsync granularity: step-boundary by default; per-event as an opt-in flag (section 4).
+- Envelope field names are fixed as documented in section 2 (`seq`, `ts`, `type`, `pid`, `syscall`,
+  `fact`, `decision`, `matched_rule`, `would_deny`). Mapping to the agent-audit-trail draft is a
+  deferred alignment pass (FR-16 is a SHOULD-align, not a MUST-match); trigger: when the M1
+  serializer is written, the draft's then-current shape is reviewed and any renames land as a
+  `schema_version` bump.
 
 ## 6. Session report
 
