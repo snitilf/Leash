@@ -28,11 +28,11 @@ pub struct Capabilities {
     /// this is the load-bearing 5.19 capability: without it a supervisor-executed allow can
     /// double-run on a signal (notify-loop.md section 4.1).
     pub wait_killable_recv: bool,
-    /// SECCOMP_ADDFD_FLAG_SEND (5.14) is present. derived, not separately probed: it was
-    /// added strictly before wait_killable_recv (5.19), so a kernel that directly proves
-    /// wait_killable_recv proves this too. the first live ADDFD in the spawn protocol (#17)
-    /// is the behavioral confirmation. this is a proof from a later-added capability, not an
-    /// assumption from the version string.
+    /// SECCOMP_ADDFD_FLAG_SEND (5.14) is present. derived, not separately probed (ADR-0015):
+    /// it was added strictly before wait_killable_recv (5.19), so a kernel that directly
+    /// proves wait_killable_recv proves this too. the first live ADDFD in the spawn protocol
+    /// (#17) is the behavioral confirmation. this is a proof from a later-added capability,
+    /// not an assumption from the version string.
     pub addfd_send: bool,
     /// probed landlock abi version; 0 means landlock is unavailable
     pub landlock_abi: u32,
@@ -74,6 +74,8 @@ pub enum Outcome {
 /// the seccomp floor is required in both modes.
 pub fn evaluate(caps: &Capabilities, mode: Mode) -> Outcome {
     // the seccomp floor is non-negotiable in either mode: the whole boundary rests on it.
+    // the version check is a hard gate alongside the probes; a backported below-floor
+    // kernel is refused even with the capabilities present (ADR-0015).
     if caps.kernel_version < KERNEL_FLOOR {
         return refuse_floor(
             caps,
@@ -97,7 +99,8 @@ pub fn evaluate(caps: &Capabilities, mode: Mode) -> Outcome {
         return refuse_floor(caps, "SECCOMP_ADDFD_FLAG_SEND is unsupported");
     }
     // enforce needs the Landlock backstop; record-only applies no ruleset (ADR-0010), so a
-    // low ABI only bites an enforce run. the floor kernel guarantees ABI 2 regardless.
+    // low ABI only bites an enforce run (FR-14's mode split, recorded in spec v0.5). the
+    // floor kernel guarantees ABI 2 regardless.
     if mode == Mode::Enforce && caps.landlock_abi < LANDLOCK_ABI_FLOOR {
         return refuse_floor(
             caps,
@@ -202,13 +205,14 @@ mod linux {
 
     pub fn probe() -> Result<Capabilities, PreflightError> {
         let (kernel_release, kernel_version) = uname()?;
+        let wait_killable_recv = probe_wait_killable_recv();
         Ok(Capabilities {
             kernel_release,
             kernel_version,
             seccomp_unotify: probe_unotify(),
-            wait_killable_recv: probe_wait_killable_recv(),
-            // derived from wait_killable_recv (see the field doc): 5.14 < 5.19.
-            addfd_send: probe_wait_killable_recv(),
+            wait_killable_recv,
+            // derived from wait_killable_recv (field doc, ADR-0015): 5.14 < 5.19.
+            addfd_send: wait_killable_recv,
             landlock_abi: probe_landlock_abi(),
             overlay: probe_overlay(),
         })

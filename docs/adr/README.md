@@ -44,8 +44,10 @@ Numbering: scan this directory for the highest number, increment by one.
 | [0009](0009-snapshot-mechanism-overlayfs-with-copy-fallback.md) | Snapshot mechanism is overlayfs, with a plain-copy fallback | accepted (gate refined by ADR-0014) |
 | [0010](0010-two-explicit-modes-record-only-and-enforce.md) | Two explicit run modes, record-only and enforce | accepted |
 | [0011](0011-single-threaded-notify-decision-loop.md) | Single-threaded notify decision loop | accepted |
-| [0012](0012-kernel-floor-linux-5-19.md) | Raise the kernel floor to Linux 5.19 | accepted |
+| [0012](0012-kernel-floor-linux-5-19.md) | Raise the kernel floor to Linux 5.19 | accepted (probe clauses refined by ADR-0015) |
 | [0013](0013-kernel-backstop-per-expressible-dimension.md) | Kernel backstop per dimension the kernel can express, not absolutely | accepted |
 | [0014](0014-defer-arm64-reference-target.md) | Defer the ARM64 reference target; the M0 gate is x86-64 only | accepted |
+| [0015](0015-preflight-version-gate-and-derived-probes.md) | The version check is a hard gate, and ADDFD support is derived, not probed | accepted |
+| [0016](0016-raw-libc-for-the-seccomp-boundary.md) | Raw libc syscalls for the seccomp boundary | accepted |
 
 These encode the project's load-bearing decisions. They are the committed, authoritative source.

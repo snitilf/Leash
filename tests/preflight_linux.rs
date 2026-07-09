@@ -48,11 +48,19 @@ fn probes_report_a_capable_host_and_preflight_proceeds() {
 
 #[test]
 fn wait_killable_recv_probe_installs_no_filter() {
-    // the probe must be side-effect free: calling it twice, and then continuing to run
-    // ordinary syscalls, proves it did not install a seccomp filter on this process.
+    // the probe must be side-effect free. surviving the calls is not evidence (an allow-all
+    // filter would also survive); the kernel's own accounting is. Seccomp: 0 in
+    // /proc/self/status means no filter of any kind is attached to this thread.
     let _ = preflight::probe().unwrap();
     let _ = preflight::probe().unwrap();
-    // if a filter had been installed with a trap, this getpid path would misbehave; it does
-    // not, because the probe errors out before any filter is committed.
-    assert!(std::process::id() > 0);
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let seccomp_line = status
+        .lines()
+        .find(|l| l.starts_with("Seccomp:"))
+        .expect("Seccomp line present in /proc/self/status");
+    assert_eq!(
+        seccomp_line.split_whitespace().nth(1),
+        Some("0"),
+        "probe left a seccomp filter installed: {seccomp_line}"
+    );
 }
