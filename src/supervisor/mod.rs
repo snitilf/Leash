@@ -6,3 +6,5 @@
 //! bracketed by ID_VALID. every error path in this module resolves to deny (I3); there is
 //! no default-allow branch to fall into. record precedes respond: an action the recorder
 //! cannot write does not happen.
+
+pub mod preflight;

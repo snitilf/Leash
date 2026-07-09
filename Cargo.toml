@@ -14,6 +14,7 @@ repository = "https://github.com/snitilf/Leash"
 
 [dependencies]
 getrandom = "0.4.3"
+libc = "0.2.186"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
