@@ -47,6 +47,13 @@ fn cstr(s: &str) -> CString {
 
 #[test]
 fn agent_dispatch() {
+    // hold the spawn lock: the harness runs tests on parallel threads, and without it
+    // this test can race into another test's env-trigger window and run an agent branch
+    // in the harness process (observed in CI: the io_uring branch, unsandboxed, exited
+    // the whole binary with 14). in the re-exec'd child this lock is a fresh,
+    // uncontended static, so agent behavior is unchanged.
+    let _g = spawn_guard();
+
     // the open agent: one read-only open of /etc/hosts, then a create-for-write open of
     // the path in LEASH_TARGET. exits 0 when both succeed.
     if std::env::var_os("LEASH_NOTIFY_OPEN_AGENT").is_some() {

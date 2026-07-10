@@ -117,7 +117,8 @@ pub mod proc {
     use std::fs::File;
     use std::os::unix::fs::FileExt;
 
-    /// one child's memory, opened once per notification burst.
+    /// one child's memory. callers currently open it per read; reusing the fd across a
+    /// notification's reads is an optimization deferred until overhead is measured (OQ-5).
     pub struct ChildMem {
         mem: File,
     }

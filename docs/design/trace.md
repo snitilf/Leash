@@ -72,6 +72,11 @@ Two fact details fixed when the notify loop was built (#18):
   ([`notify-loop.md`](notify-loop.md) section 4). The envelope's `syscall` field still names the
   call, which is the recordable substance of those events.
 
+The first notify-loop slice (#18) records the filesystem families, `execve`/`execveat`, and the
+denied-and-recorded set; the remaining mediated families (process creation, network,
+cross-process) are allowed without events until their typed facts land, a named interim gap in
+FR-2 coverage tracked as its own work item.
+
 In a run with no policy, `matched_rule` carries a fixed base id naming what decided the event:
 `base:record_only` (the record-only base allow, [`policy.md`](policy.md) section 3),
 `sr4:io_uring` and `sr3:foreign_abi` (the denied-and-recorded set), and `failsafe:memory_read`
