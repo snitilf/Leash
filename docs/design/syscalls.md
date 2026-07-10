@@ -189,6 +189,11 @@ it.
 
 One rule governs every "allow" response, and it is the load-bearing security decision of this file
 (I4). It is stated once here and once in [`notify-loop.md`](notify-loop.md); the two must agree.
+The rule binds decisions that constrain, which in practice means **enforce**-mode allows: in
+**record-only**, where every decision is allow and there is no anchor set to resolve beneath,
+allows are realized with `CONTINUE` and the trace-fidelity residual is named in
+[`escapes.md`](escapes.md) section 4 (ADR-0017). The denied-and-recorded set (section 5) and the
+case-C deny are unaffected; they deny in both modes.
 
 1. If the decision reads only the syscall number or scalar/flag register arguments, the allow is
    realized with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`. The kernel re-executes the same syscall; there

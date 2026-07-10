@@ -62,13 +62,35 @@ A `syscall` event, the common case, adds:
 | `matched_rule` | the id of the policy rule that decided it, or the base rule ([`policy.md`](policy.md)) |
 | `would_deny` | present in record-only when a present policy would have denied (ADR-0010) |
 
+Two fact details fixed when the notify loop was built (#18):
+
+- A two-path filesystem fact (`rename`, `link`, `symlink` families) carries the second path in an
+  optional `dest` field alongside `path`; single-path facts omit it.
+- An event whose decision was made without a trusted typed fact carries the `raw` fact family with
+  no fields: the denied-and-recorded set ([`syscalls.md`](syscalls.md) section 5), and a case-C
+  deny where the pointer argument could not be read within its cap
+  ([`notify-loop.md`](notify-loop.md) section 4). The envelope's `syscall` field still names the
+  call, which is the recordable substance of those events.
+
+In a run with no policy, `matched_rule` carries a fixed base id naming what decided the event:
+`base:record_only` (the record-only base allow, [`policy.md`](policy.md) section 3),
+`sr4:io_uring` and `sr3:foreign_abi` (the denied-and-recorded set), and `failsafe:memory_read`
+(a case-C deny). These are trace vocabulary, not policy rules; a loaded policy's rule ids never
+collide with them because they carry a `:` and rule ids are plain names.
+
 `run_start` carries the same facts as `meta.json` so the stream is self-contained. `step` marks a
 **step** boundary with the step index (FR-17, [`snapshot.md`](snapshot.md)). `run_end` carries the
 exit status of the child tree and the final step index.
 
 The `fact` is what the supervisor resolved, not what the child's memory said after the fact: the
 trace records the kernel-trusted value the decision used (I4), so the trace and the decision cannot
-disagree.
+disagree. What "resolved" means depends on the mode. In enforce mode it is the `openat2`
+anchor-based resolution of [`syscalls.md`](syscalls.md) section 4. In record-only, where allows are
+realized with `CONTINUE` (ADR-0017), the supervisor records the once-read path made absolute by
+prefixing the kernel-trusted `/proc/<pid>/cwd` (for `AT_FDCWD`-relative paths) or
+`/proc/<pid>/fd/<dirfd>` (for dirfd-relative paths); symlinks within the path are not chased and
+`..` components are not collapsed, so the recorded value is the argument as the child presented
+it, anchored.
 
 ## 3. Ordering and integrity
 
