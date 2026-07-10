@@ -194,13 +194,14 @@ pub fn parse_kernel_version(release: &str) -> Option<(u32, u32)> {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{Capabilities, OverlayProbe, PreflightError, parse_kernel_version};
+    use crate::supervisor::notify::{
+        SECCOMP_FILTER_FLAG_NEW_LISTENER, SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
+        SECCOMP_GET_NOTIF_SIZES, SECCOMP_SET_MODE_FILTER,
+    };
     use std::ffi::CStr;
 
-    // constants not always exposed by the libc crate; values are stable kernel ABI.
-    const SECCOMP_GET_NOTIF_SIZES: libc::c_uint = 3;
-    const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
-    const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
-    const SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: libc::c_ulong = 1 << 4;
+    // not exposed by the libc crate; stable kernel ABI. the seccomp counterparts live
+    // in supervisor::notify, shared with the spawn protocol.
     const LANDLOCK_CREATE_RULESET_VERSION: libc::c_ulong = 1 << 0;
 
     pub fn probe() -> Result<Capabilities, PreflightError> {
