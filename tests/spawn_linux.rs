@@ -51,6 +51,12 @@ const ADDFD_MARKER: &[u8] = b"injected-by-supervisor";
 
 #[test]
 fn agent_dispatch() {
+    // hold the spawn lock: without it this test can race into another test's
+    // env-trigger window on a parallel harness thread and run an agent branch in the
+    // harness process (observed in CI on notify_linux.rs's twin of this dispatch). in
+    // the re-exec'd child the lock is a fresh, uncontended static.
+    let _g = spawn_guard();
+
     // the addfd agent: open the sentinel (the supervisor injects a real fd via
     // ADDFD_FLAG_SEND), then write the marker to whatever fd came back.
     if std::env::var_os("LEASH_ADDFD_AGENT").is_some() {
