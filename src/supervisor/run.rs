@@ -159,9 +159,9 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
     }
 
     // the remaining mediated families (clone, network, cross-process) are allowed
-    // scalar-CONTINUE without events in this slice; their typed facts are the
-    // follow-up issue named in trace.md. nothing here reads child memory, so plain
-    // CONTINUE is rule 1 of the allow-realization rule.
+    // scalar-CONTINUE without events in this slice; the interim FR-2 gap is named in
+    // trace.md section 2 and tracked as its own issue. nothing here reads child
+    // memory, so plain CONTINUE is rule 1 of the allow-realization rule.
     tolerate_dead(kernel.send_continue(notif.id))?;
     Ok(Handled::Responded)
 }
@@ -466,8 +466,12 @@ mod linux {
                 }
                 continue;
             }
-            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                break; // every filter user has exited; nothing more can trap
+            // POLLHUP: every filter user has exited, nothing more can trap. POLLERR and
+            // POLLNVAL should be unreachable while we own the fd, but leaving them
+            // unhandled would spin this loop forever; a closed listener denies
+            // everything anyway (case G), so treating them as shutdown is fail-closed.
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                break;
             }
         }
 
