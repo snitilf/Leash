@@ -164,6 +164,9 @@ pub enum Fact {
         path: PathBuf,
         /// requested access, e.g. read, write, create, delete
         access: Vec<FsAccess>,
+        /// the second path of a two-path operation (rename, link, symlink); absent otherwise
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dest: Option<PathBuf>,
     },
     /// a network decision
     Net {
@@ -177,6 +180,10 @@ pub enum Fact {
         /// the resolved binary path
         binary: PathBuf,
     },
+    /// a decision made without a trusted typed fact: the denied-and-recorded set
+    /// (syscalls.md section 5) and a case-c deny where the pointer argument could not be
+    /// read within its cap. the envelope's syscall field names the call.
+    Raw {},
 }
 
 /// filesystem access kinds, matching the policy vocabulary (policy.md section 2).
@@ -458,6 +465,7 @@ mod tests {
                 fact: Fact::Fs {
                     path: "/home/op/project/src/main.rs".into(),
                     access: vec![FsAccess::Read],
+                    dest: None,
                 },
                 decision: Decision::Allow,
                 ask_resolution: None,
@@ -482,6 +490,56 @@ mod tests {
                 "matched_rule": "base:workspace"
             })
         );
+    }
+
+    #[test]
+    fn two_path_fact_carries_dest_and_single_path_omits_it() {
+        let event = Event {
+            seq: 4,
+            ts: 1_783_535_405_200,
+            body: EventBody::Syscall(SyscallEvent {
+                pid: 4242,
+                syscall: "rename".into(),
+                fact: Fact::Fs {
+                    path: "/home/op/project/a.txt".into(),
+                    access: vec![FsAccess::Write],
+                    dest: Some("/home/op/project/b.txt".into()),
+                },
+                decision: Decision::Allow,
+                ask_resolution: None,
+                matched_rule: "base:record_only".into(),
+                would_deny: None,
+            }),
+        };
+        assert_eq!(
+            as_value(&event)["fact"],
+            json!({
+                "family": "fs",
+                "path": "/home/op/project/a.txt",
+                "access": ["write"],
+                "dest": "/home/op/project/b.txt"
+            })
+        );
+    }
+
+    #[test]
+    fn raw_fact_serializes_to_family_only() {
+        let event = Event {
+            seq: 5,
+            ts: 1_783_535_405_300,
+            body: EventBody::Syscall(SyscallEvent {
+                pid: 4242,
+                syscall: "io_uring_setup".into(),
+                fact: Fact::Raw {},
+                decision: Decision::Deny,
+                ask_resolution: None,
+                matched_rule: "sr4:io_uring".into(),
+                would_deny: None,
+            }),
+        };
+        assert_eq!(as_value(&event)["fact"], json!({ "family": "raw" }));
+        assert_eq!(as_value(&event)["decision"], "deny");
+        assert_eq!(as_value(&event)["syscall"], "io_uring_setup");
     }
 
     #[test]

@@ -53,7 +53,8 @@ The child's pointer arguments are the whole TOCTOU problem (SR-2, I4). The rules
   child's death is discarded, and the id cannot have been silently reused underneath it.
 - Cap every read. The caps, fixed at slate 2, are the kernel's own limits: 4096 bytes for a path
   (`PATH_MAX`), 128 bytes for a `sockaddr` (`sizeof(struct sockaddr_storage)`), the current kernel
-  struct size for `clone_args`, and one page as the absolute ceiling for any read. An unbounded or
+  struct size for `clone_args` (and likewise for `openat2`'s `open_how`, read under the same
+  struct-size rule), and one page as the absolute ceiling for any read. An unbounded or
   attacker-chosen length is a denial-of-service on the single decision thread; over the cap
   resolves to deny (section 4, case C), because a value larger than the kernel itself would accept
   is hostile by definition.
@@ -68,7 +69,9 @@ The rule from [`syscalls.md`](syscalls.md) section 4, restated so this file is s
 `CONTINUE` only for a decision on the syscall number or scalar registers; `ADDFD` with a
 supervisor-opened fd for a pointer-argument allow that returns an fd; supervisor-executed with a
 spoofed return for a pointer-argument allow that returns no fd; `execve` alone allowed by `CONTINUE`
-under the Landlock `FS_EXECUTE` backstop.
+under the Landlock `FS_EXECUTE` backstop. The rule binds decisions that constrain: in
+**record-only** mode every allow is realized with `CONTINUE`, the event carrying the once-read
+value from step 3, and the residual is named in [`escapes.md`](escapes.md) section 4 (ADR-0017).
 
 Record precedes respond (step 5 before step 6) because the **trace** is the authority (FR-3, I2): the
 child must never take an action the supervisor could not record. If the recorder write fails, the

@@ -49,5 +49,6 @@ Numbering: scan this directory for the highest number, increment by one.
 | [0014](0014-defer-arm64-reference-target.md) | Defer the ARM64 reference target; the M0 gate is x86-64 only | accepted |
 | [0015](0015-preflight-version-gate-and-derived-probes.md) | The version check is a hard gate, and ADDFD support is derived, not probed | accepted |
 | [0016](0016-raw-libc-for-the-seccomp-boundary.md) | Raw libc syscalls for the seccomp boundary | accepted |
+| [0017](0017-record-only-allows-use-continue.md) | Record-only allows are realized with CONTINUE | accepted |
 
 These encode the project's load-bearing decisions. They are the committed, authoritative source.
