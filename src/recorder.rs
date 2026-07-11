@@ -13,6 +13,9 @@ use std::time::SystemTime;
 
 use serde::Serialize;
 
+// the human-readable session report, derived from the trace (trace.md section 6).
+pub mod report;
+
 /// the trace schema version, stamped into `run_start` and `meta.json` so a reader can
 /// decode without guessing (trace.md section 2). renames bump this.
 pub const TRACE_SCHEMA_VERSION: u32 = 1;
