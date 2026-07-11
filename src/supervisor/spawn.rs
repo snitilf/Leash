@@ -29,8 +29,8 @@ pub struct SpawnSpec {
     pub argv: Vec<String>,
     /// an fd to redirect the child's stdout and stderr onto, if any.
     pub stdout: Option<OwnedFd>,
-    /// record-only or enforce. taken now for api stability; the enforce-mode Landlock
-    /// step (5) slots into the child sequence at #18. #17 installs the same filter in
+    /// record-only or enforce. the enforce-mode Landlock step (5) slots into the
+    /// child sequence when enforce mode lands (#25); the same filter is installed in
     /// both modes (architecture.md section 5.1).
     pub mode: Mode,
 }

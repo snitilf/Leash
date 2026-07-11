@@ -239,8 +239,8 @@ fn spawned_childs_execve_is_the_first_mediated_event() {
 }
 
 /// acceptance 2 (I1): a grandchild spawned via sh -c is mediated exactly as the agent is.
-/// partial evidence for the escapes.md laundering row; the forbidden-and-denied half and
-/// the un-enumerated clone variant complete at #18 when policy exists.
+/// partial evidence for the escapes.md laundering row; the forbidden-and-denied half
+/// completes when enforce mode and the policy engine land (#25).
 #[test]
 fn grandchild_via_sh_dash_c_traps_identically() {
     let _g = spawn_guard();
@@ -323,9 +323,10 @@ fn live_addfd_injects_a_supervisor_opened_fd() {
     );
 }
 
-/// io_uring_setup arrives as a user notification (observation only; the unconditional
-/// deny is #18). also exercises the stdout redirect: the agent's marker, written to fd 1,
-/// must land in the redirected file.
+/// io_uring_setup arrives as a user notification (observation only at this layer; the
+/// unconditional deny is implemented in the notify loop and tested in notify_linux.rs).
+/// also exercises the stdout redirect: the agent's marker, written to fd 1, must land
+/// in the redirected file.
 #[test]
 fn io_uring_setup_arrives_as_user_notif() {
     let _g = spawn_guard();

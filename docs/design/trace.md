@@ -95,7 +95,11 @@ realized with `CONTINUE` (ADR-0017), the supervisor records the once-read path m
 prefixing the kernel-trusted `/proc/<pid>/cwd` (for `AT_FDCWD`-relative paths) or
 `/proc/<pid>/fd/<dirfd>` (for dirfd-relative paths); symlinks within the path are not chased and
 `..` components are not collapsed, so the recorded value is the argument as the child presented
-it, anchored.
+it, anchored. If that `/proc` anchor cannot be read, the path is recorded relative, as the child
+gave it, and the syscall is still allowed: the anchor is a supervisor-side convenience for the
+trace, not child memory, and record-only enforces nothing (ADR-0010), so a failure to anchor never
+denies. This is distinct from a failure to read the path pointer itself, which is untrusted child
+memory and denies as a case-C event ([`notify-loop.md`](notify-loop.md) section 4).
 
 ## 3. Ordering and integrity
 
@@ -139,7 +143,11 @@ supervisor mid-step and confirms the flushed prefix of the trace is intact and c
 At run end the supervisor writes `report.txt`, the human-readable summary FR-5 requires, derived
 entirely from the trace (never from a second source that could disagree). It lists the files touched,
 the processes spawned, and the network connections attempted, each with its **decision**, grouped for
-a human to skim. It names the active **mode** (FR-19); a record-only report says so in as many words
+a human to skim. It also lists the denied attempts that carry no typed fact (the denied-and-recorded
+set and the case-C denies of section 2), so a refused action is visible even without a fact to name
+it. The report's section coverage matches the mediated-set event coverage of the slice that wrote the
+trace: families not yet producing events (section 2) are named as unobserved, never counted as absent,
+so a reader never mistakes an interim gap for a run in which nothing of that kind happened. It names the active **mode** (FR-19); a record-only report says so in as many words
 and never uses enforcement language for a run that enforced nothing (ADR-0010). Because it is derived
 from the trace, the report is regenerable after the fact from `trace.jsonl` alone, so a run can be
 re-summarized without re-running the agent (which Leash never does anyway).

@@ -36,6 +36,6 @@ Each layer references the ones above it by **stable ID** (requirement IDs like `
 
 ## Status
 
-- **Design frozen, pre-implementation.** The spec is settled at v0.4 (see [`spec/SPEC.md`](spec/SPEC.md)); the design layer in [`design/`](design/) is frozen as of 2026-07-08, the M0 overlay spike having met its gate on x86-64 (ADR-0009 as refined by ADR-0014). Implementation has not started.
+- **Implementation in progress.** The spec is settled at v0.6 (see [`spec/SPEC.md`](spec/SPEC.md)); the design layer in [`design/`](design/) is frozen as of 2026-07-08, the M0 overlay spike having met its gate on x86-64 (ADR-0009 as refined by ADR-0014). The M1 recorder milestone is being built: the crate skeleton, the trace recorder, the preflight host probes, the spawn protocol, and the record-only notify loop for the filesystem family have landed, with behavioral tests running in CI on ubuntu-24.04.
 - Two spec items remain deferred on purpose: OQ-5 (the overhead budget) closing on M1 measurements, and OQ-9 (the ARM64 target) closing on a real ARM64 need.
 - One design parameter remains deferred with the same discipline: the step-coalescing window, set from M1 measurement (see the design README's open-parameters table).
