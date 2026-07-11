@@ -305,9 +305,15 @@ fn handle_exec<N: Notifier, S: TraceSink>(
 
 /// read one path argument and anchor it per the record-only resolution rule
 /// (trace.md section 2): absolute values stand, relative values are prefixed with the
-/// kernel-trusted /proc cwd or fd link; a symlink target is recorded verbatim. an anchor
-/// that cannot be read is the same failure class as the memory read itself (case C:
-/// the documented fact cannot be built, so the action cannot be allowed).
+/// kernel-trusted /proc cwd or fd link; a symlink target is recorded verbatim.
+///
+/// the two failures here are not the same class. a failed read of the path pointer is
+/// untrusted child memory (case C): the fact cannot be built, so the caller denies. a
+/// failed read of the /proc anchor is a supervisor-side fidelity gap, not child memory;
+/// under ADR-0010 record-only enforces nothing, so it must not deny. the path is recorded
+/// as the child gave it, relative, rather than guessing an anchor (the child may have
+/// chdir'd, which is pass-through and unobserved, so the supervisor's own cwd could be
+/// wrong) or refusing the syscall.
 fn read_anchored<N: Notifier>(
     kernel: &N,
     notif: &SeccompNotif,
@@ -324,8 +330,10 @@ fn read_anchored<N: Notifier>(
         }
         _ => DirAnchor::Cwd,
     };
-    let prefix = kernel.dir_prefix(notif.pid, anchor)?;
-    Ok(prefix.join(path))
+    match kernel.dir_prefix(notif.pid, anchor) {
+        Ok(prefix) => Ok(prefix.join(path)),
+        Err(_) => Ok(path),
+    }
 }
 
 #[cfg(unix)]
@@ -689,6 +697,32 @@ mod tests {
         let evs = events(w);
         assert_eq!(evs[0]["fact"]["path"], "/work/notes.txt");
         assert_eq!(evs[1]["fact"]["path"], "/data/cache/blob");
+    }
+
+    #[test]
+    fn an_unreadable_anchor_records_the_relative_path_and_still_allows() {
+        // ADR-0010: record-only enforces nothing. a /proc anchor that cannot be read is
+        // a supervisor-side fidelity gap (the real one that surfaced on the CI kernel),
+        // not untrusted child memory, so the open is allowed with the path as the child
+        // gave it, not denied. fd 9 is not in fd_dirs, so dir_prefix fails for it.
+        let kernel = FakeNotifier::default().with_cstr(0x1000, "out.txt");
+        let mut w = writer();
+        let handled = handle_notification(
+            &kernel,
+            &notif(
+                nr::OPENAT,
+                [9, 0x1000, flags::O_WRONLY | flags::O_CREAT, 0, 0, 0],
+            ),
+            &mut w,
+            1_000,
+        )
+        .unwrap();
+
+        assert_eq!(handled, Handled::Responded);
+        assert_eq!(kernel.sent(), vec!["continue:7"]);
+        let ev = &events(w)[0];
+        assert_eq!(ev["fact"]["path"], "out.txt", "recorded unanchored");
+        assert_eq!(ev["decision"], "allow");
     }
 
     #[test]

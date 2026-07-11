@@ -95,7 +95,11 @@ realized with `CONTINUE` (ADR-0017), the supervisor records the once-read path m
 prefixing the kernel-trusted `/proc/<pid>/cwd` (for `AT_FDCWD`-relative paths) or
 `/proc/<pid>/fd/<dirfd>` (for dirfd-relative paths); symlinks within the path are not chased and
 `..` components are not collapsed, so the recorded value is the argument as the child presented
-it, anchored.
+it, anchored. If that `/proc` anchor cannot be read, the path is recorded relative, as the child
+gave it, and the syscall is still allowed: the anchor is a supervisor-side convenience for the
+trace, not child memory, and record-only enforces nothing (ADR-0010), so a failure to anchor never
+denies. This is distinct from a failure to read the path pointer itself, which is untrusted child
+memory and denies as a case-C event ([`notify-loop.md`](notify-loop.md) section 4).
 
 ## 3. Ordering and integrity
 
