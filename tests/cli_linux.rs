@@ -136,10 +136,17 @@ fn report_regenerates_from_trace_alone() {
         ],
         ws.path(),
     );
-    assert_eq!(out.status.code(), Some(0));
-
+    // gather the evidence before asserting, so a failure names its cause: the child's
+    // exit is mirrored, and a denied syscall shows up in the trace, not in the code
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let run_dir = only_run_dir(state.path());
-    let trace = std::fs::read_to_string(run_dir.join("trace.jsonl")).unwrap();
+    let trace = std::fs::read_to_string(run_dir.join("trace.jsonl")).unwrap_or_default();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "leash stderr:\n{stderr}\ntrace:\n{trace}"
+    );
+
     let on_disk = std::fs::read_to_string(run_dir.join("report.txt")).unwrap();
     let regenerated = leash::recorder::report::render_report(&trace).expect("render");
     let again = leash::recorder::report::render_report(&trace).expect("render");
