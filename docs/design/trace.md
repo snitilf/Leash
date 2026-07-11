@@ -139,7 +139,11 @@ supervisor mid-step and confirms the flushed prefix of the trace is intact and c
 At run end the supervisor writes `report.txt`, the human-readable summary FR-5 requires, derived
 entirely from the trace (never from a second source that could disagree). It lists the files touched,
 the processes spawned, and the network connections attempted, each with its **decision**, grouped for
-a human to skim. It names the active **mode** (FR-19); a record-only report says so in as many words
+a human to skim. It also lists the denied attempts that carry no typed fact (the denied-and-recorded
+set and the case-C denies of section 2), so a refused action is visible even without a fact to name
+it. The report's section coverage matches the mediated-set event coverage of the slice that wrote the
+trace: families not yet producing events (section 2) are named as unobserved, never counted as absent,
+so a reader never mistakes an interim gap for a run in which nothing of that kind happened. It names the active **mode** (FR-19); a record-only report says so in as many words
 and never uses enforcement language for a run that enforced nothing (ADR-0010). Because it is derived
 from the trace, the report is regenerable after the fact from `trace.jsonl` alone, so a run can be
 re-summarized without re-running the agent (which Leash never does anyway).

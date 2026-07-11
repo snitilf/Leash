@@ -1,7 +1,7 @@
 # Leash — Software Specification
 
-- Status: **v0.5, settled** (section 11 holds two explicitly deferred items, OQ-5 and OQ-9, each with a named closing trigger)
-- Date: 2026-07-09 (v0.5 recorded FR-14's mode split for the Landlock leg per ADR-0015; v0.4 deferred the ARM64 target per ADR-0014; v0.3 revised FR-14's kernel floor to 5.19 per ADR-0012; v0.2 dated 2026-07-07)
+- Status: **v0.6, settled** (section 11 holds two explicitly deferred items, OQ-5 and OQ-9, each with a named closing trigger)
+- Date: 2026-07-11 (v0.6 added FR-22's exit-code contract; v0.5 recorded FR-14's mode split for the Landlock leg per ADR-0015; v0.4 deferred the ARM64 target per ADR-0014; v0.3 revised FR-14's kernel floor to 5.19 per ADR-0012; v0.2 dated 2026-07-07)
 - Governs: what Leash must do and why. *How* it is built is the design (`docs/design/`).
 
 Key words **MUST**, **MUST NOT**, **SHOULD**, **MAY** per RFC 2119. IDs are stable and cited by other documents, tests, and code: `F-n` features, `FR-n` functional requirements, `NFR-n` non-functional requirements, `SR-n` security requirements, `OQ-n` open questions. Terms in **bold** are defined in [`CONTEXT.md`](../CONTEXT.md) and used exactly as defined there.
@@ -33,7 +33,7 @@ Leash is a command-line tool that supervises an AI coding **agent** at the opera
 
 | ID | Feature | Requirements |
 |---|---|---|
-| F-1 | Supervised run (`leash run`) | FR-1, FR-2, FR-4, FR-14, FR-15 |
+| F-1 | Supervised run (`leash run`) | FR-1, FR-2, FR-4, FR-14, FR-15, FR-22 |
 | F-2 | Ground-truth trace and session report | FR-2, FR-3, FR-5, FR-16, FR-21 |
 | F-3 | Policy enforcement | FR-6..FR-9, FR-18, FR-19, SR-1..SR-4 |
 | F-4 | Interactive approval (**ask**) | FR-10, FR-20 |
@@ -59,6 +59,7 @@ These carry no requirements yet and nothing in this table is promised; promoting
 - **FR-3** — The **trace** MUST be authored solely by the **supervisor**; the **child** MUST NOT be able to read, modify, delay, or suppress it (ADR-0002).
 - **FR-4** — The mediated set MUST cover at minimum: filesystem access (opening a path, with read and write access decided at that point, plus create, delete, and rename), process creation and program execution, and network connection establishment. The exact syscall list is enumerated in the design.
 - **FR-5** — Leash MUST produce, at the end of a run, a human-readable **session report**: files touched, processes spawned, network connections attempted, each with its decision.
+- **FR-22** — `leash run` MUST exit with the supervised command's exit status (128 plus the signal number when the command was killed by a signal). A failure of Leash itself MUST exit with a code distinct from ordinary agent outcomes (125) so a wrapper can distinguish agent failure from supervisor failure; the **trace** remains the authority (a missing `run_end` means the supervisor failed). Usage errors exit 2.
 
 ### 6.2 Policy & enforcement
 - **FR-6** — Leash MUST evaluate each mediated syscall against a declarative **policy** (ADR-0004) and resolve a **decision** of allow, deny, or **ask**.
@@ -141,6 +142,7 @@ OQ-1..OQ-4 and OQ-6..OQ-8 were resolved on 2026-07-07 into FR-17..FR-21, SR-4, A
 | FR-19 (run modes) | ADR-0010 | mode-stamping and would-deny tests |
 | FR-20 (approval UX) | ADR-0010 | attended/unattended ask tests |
 | FR-21 (trace persistence) | ADR-0002 | state-dir isolation escape tests |
+| FR-22 (exit-code contract) | design (cli.md section 6) | exit-code contract tests |
 | SR-4 (io_uring denial) | design (syscalls.md section 5) | io_uring escape tests |
 | FR-1/FR-4 (agent-agnostic coverage) | ADR-0006 | inheritance + coverage tests |
 | NFR-4 (footprint), FR-15 | ADR-0007, ADR-0014 | build/run on the VPS reference target |

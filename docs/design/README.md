@@ -4,10 +4,11 @@
 commits to *how* before *what* builds the wrong thing precisely. Every design choice cites the spec
 requirement it satisfies and, where it is a hard-to-reverse trade-off, an ADR.
 
-Status: **frozen (2026-07-08).** All seven files are settled. The M0 spike's gate, narrowed to the
+Status: **frozen (2026-07-08).** All eight files are settled. The M0 spike's gate, narrowed to the
 x86-64 leg by ADR-0014 (the ARM64 target is deferred, spec OQ-9), passed on 2026-07-08, settling
-`snapshot.md` and freezing the layer. Changes from here follow change control; a frozen file is
-amended by a recorded decision, not edited casually.
+`snapshot.md` and freezing the layer; `cli.md` was added by the recorded decisions of 2026-07-11
+(FR-22). Changes from here follow change control; a frozen file is amended by a recorded decision,
+not edited casually.
 
 ## Reading order
 
@@ -20,6 +21,8 @@ amended by a recorded decision, not edited casually.
 5. [`trace.md`](trace.md) - run directory, event schema, session report (FR-2, FR-16, FR-5).
 6. [`snapshot.md`](snapshot.md) - step detection, overlay and copy fallback, rewind, diff (FR-11-13).
 7. [`escapes.md`](escapes.md) - escape-vector-to-mechanism traceability (SR-2, NFR-5).
+8. [`cli.md`](cli.md) - command surface, run lifecycle announcements, exit codes (FR-5, FR-19,
+   FR-20, FR-21, FR-22).
 
 ## Files and status
 
@@ -32,6 +35,7 @@ amended by a recorded decision, not edited casually.
 | `trace.md` | run dir, event schema, report (FR-2, FR-16, FR-5) | settled |
 | `snapshot.md` | step, snapshot, rewind, diff (FR-11-13, FR-17) | settled (M0 gate met per ADR-0014) |
 | `escapes.md` | escape traceability (SR-2, NFR-5) | settled |
+| `cli.md` | command surface, lifecycle, exit codes (FR-22) | settled |
 
 ## Open parameters
 
