@@ -21,10 +21,12 @@ integration, nothing the supervised process can reason around.
 
 ## Status
 
-Design stage. The specification is settled (v0.3) and the design layer is drafted and in review.
-There is no implementation code yet. The next gate is the M0 overlay spike on the reference
-targets; once it passes, the design freezes and work on the M1 recorder begins. Leash targets
-Linux 5.19 or later and runs on x86-64 and ARM64.
+Implementation in progress. The specification is settled (v0.6) and the design layer is frozen
+(2026-07-08). The M0 overlay spike passed on x86-64 and the M1 recorder milestone is being
+built: the crate skeleton, the trace recorder, the preflight host probes, the spawn protocol,
+and the record-only notify loop for the filesystem family have landed, with behavioral tests
+running in CI on ubuntu-24.04. Requires Linux 5.19 or later on x86-64 (ARM64 is deferred,
+ADR-0014).
 
 ## Documentation
 
