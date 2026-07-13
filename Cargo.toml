@@ -31,3 +31,9 @@ missing_docs = "warn"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# the NFR-2 overhead harness (docs/measurements/0001-m1-overhead.md); custom main, no
+# criterion. linux-only body, no-op elsewhere. ci does not run benches.
+[[bench]]
+name = "overhead"
+harness = false

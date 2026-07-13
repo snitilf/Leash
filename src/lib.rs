@@ -4,6 +4,7 @@
 //! and by integration tests. modules follow docs/design/architecture.md section 4.
 
 pub mod cli;
+pub mod measure;
 pub mod policy;
 pub mod recorder;
 pub mod sandbox;
