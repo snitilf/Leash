@@ -57,7 +57,9 @@ mod linux {
     const MACRO_REPS: usize = 5;
 
     pub fn main() {
-        let args: Vec<String> = std::env::args().collect();
+        // cargo bench passes a --bench flag to harness = false targets; drop it so
+        // positional parsing sees only our own arguments.
+        let args: Vec<String> = std::env::args().filter(|a| a != "--bench").collect();
         match args.get(1).map(String::as_str) {
             Some("--child") => run_child(&args),
             Some("micro") => run_micro(args.get(2).map(String::as_str)),
