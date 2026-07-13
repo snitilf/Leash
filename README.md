@@ -21,7 +21,7 @@ integration, nothing the supervised process can reason around.
 
 ## Status
 
-Implementation in progress. The specification is settled (v0.6) and the design layer is frozen
+Implementation in progress. The specification is settled (v0.7) and the design layer is frozen
 (2026-07-08). The M0 overlay spike passed on x86-64 and the M1 recorder milestone is being
 built: the crate skeleton, the trace recorder, the preflight host probes, the spawn protocol,
 and the record-only notify loop for the filesystem family have landed, with behavioral tests

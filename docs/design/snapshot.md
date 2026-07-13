@@ -36,9 +36,13 @@ every process in the tree is mediated (I1), the step clock sees a grandchild's w
 the agent's; a subshell writing files is not a blind spot.
 
 The boundary falls when mutating-event activity quiesces for longer than a coalescing window. The
-window's value is an open parameter (the [`README.md`](README.md) table), to be set from real
-measurement with M1 as the closing trigger, not guessed; 500 ms is the placeholder for pre-M1
-testing and carries no claim. Two properties are fixed
+window is **250 ms**, set from the M1 measurements
+([`../measurements/0001-m1-overhead.md`](../measurements/0001-m1-overhead.md) section 4.3): on a
+continuous write burst the inter-mutating-event gaps topped out at 10 ms (p99 3 ms) on the loaded
+reference box, so 250 ms carries a 25x margin against splitting a burst while sitting well below
+agent think time between tool calls, which model inference bounds at hundreds of milliseconds. One
+confirming input stays named: the first real agent-session trace validates the value; until then
+it is measured-and-chosen, not confirmed against a live agent. Two properties are fixed
 regardless of the value: the boundary MUST NOT fall inside a burst, and run start and run end are
 always step boundaries, so every run has at least the initial and final snapshots even if the agent
 never writes. Each boundary emits a `step` event into the trace ([`trace.md`](trace.md) section 2)

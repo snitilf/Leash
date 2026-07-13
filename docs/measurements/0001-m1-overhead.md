@@ -1,6 +1,7 @@
 # Measurement 0001: M1 record-only overhead (NFR-2) and step-gap data (FR-17)
 
-- Status: method settled, results pending (droplet run outstanding)
+- Status: measured 2026-07-13 on the reference box; one supplementary input (a real
+  agent-session gap trace) remains pending and is named in section 4.3
 - Governs: the evidence base for closing OQ-5 (the NFR-2 overhead budget) and for fixing the
   step-coalescing window (the last open design parameter, `design/README.md` table).
 - Cites: NFR-2, FR-17; SPEC.md section 10 item 4, section 11 OQ-5; ADR-0006, ADR-0011.
@@ -81,35 +82,83 @@ resolution bump be considered, as its own change-controlled item, not preemptive
 
 ## 3. Environment
 
-A number without its environment is meaningless. Every result table below carries:
+A number without its environment is meaningless. All results in section 4 come from:
 
-- Box: (pending: the KVM reference VPS; a macOS laptop cannot produce these numbers)
-- Kernel: `uname -a` (pending)
-- CPU: model and core count (pending)
-- Leash commit: (pending)
-- Rust toolchain: (pending)
-
-Exact reproduction commands are recorded with the results.
+- Box: DigitalOcean KVM droplet "leash" (the reference VPS), 2 vCPU DO-Premium-Intel @ 2.0 GHz,
+  3.8 GiB RAM, x86-64
+- OS / kernel: Ubuntu 24.04.4 LTS, Linux 6.8.0-124-generic
+- Leash commit: 3503baf, plus one harness-only fix (drop the `--bench` flag cargo passes to
+  custom-main bench targets before positional arg parsing; no effect on what is measured)
+- Rust toolchain: rustc 1.97.0, bench profile (optimized)
+- Reproduction: `cargo bench --bench overhead -- micro`, `cargo bench --bench overhead -- macro
+  benches/workloads/macro.sh`, and for gaps a traced run
+  (`leash run --unattended --state-dir <dir> -- sh benches/workloads/macro.sh <work>`) followed
+  by `cargo bench --bench overhead -- gaps <trace.jsonl>`
+- Measured 2026-07-13. The box is a shared-tenancy 2 vCPU cloud instance: the bare-vs-bare
+  self-check delta was -154 ns p50 (noise floor), small against every leash delta below.
 
 ## 4. Results
 
-Pending the droplet run.
-
 ### 4.1 Micro: per-class latency (bare vs leash), ns
 
-(pending)
+3 reps per cell, medians of per-rep quantiles; warmup discarded; every leash rep passed the
+trap-completeness gate (zero voids).
+
+| class | bare p50 | leash p50 | added p50 | bare p99 | leash p99 | added p99 |
+|---|---|---|---|---|---|---|
+| open_read | 1596 | 35144 | 33548 | 3113 | 63183 | 60070 |
+| open_write | 1832 | 32555 | 30723 | 3321 | 59280 | 55959 |
+| mutate (2 renames) | 11416 | 86209 | 74793 | 23540 | 139641 | 116101 |
+| exec (/bin/true) | 639287 | 1148502 | 509215 | 885874 | 1660894 | 775020 |
+
+Read: record-only supervision adds roughly 31-34 us p50 per trapped filesystem syscall
+(56-60 us p99), about 37 us per rename, and about 0.5 ms p50 per exec (an exec traps several
+syscalls: the execve itself plus the new image's opens).
 
 ### 4.2 Macro: wall-clock delta
 
-(pending)
+`benches/workloads/macro.sh` (materialize the tracked tree, recursive read pass, 200
+create/append/rename triplets, git init + add + commit), 5 alternating reps, fresh workdir
+each:
+
+- bare: median 429 ms, spread 77 ms (404-481)
+- leash: median 1054 ms, spread 326 ms (955-1281)
+- delta: +625 ms at the median, a 2.46x factor
+
+This workload is deliberately syscall-dense (about 10800 mediated events in about one second
+of bare runtime); it is the worst case, not the typical agent profile, where wall-clock is
+dominated by model inference and the same per-syscall cost amortizes to noise. The factor is
+reported as measured; no claim is made that typical sessions see it.
 
 ### 4.3 Gap distributions
 
-(pending)
+From the traced macro run (10771 events, 1981 mutating events, 1980 consecutive gaps):
+
+- gap ms: min 0, p50 0, p90 2, p99 3, max 10
+- histogram (inclusive upper bound in ms -> count): <=0: 1556, <=1: 214, <=2: 134, <=5: 74,
+  <=10: 2
+
+The intra-burst cluster on a continuous write workload sits entirely at or below 10 ms even on
+a loaded 2 vCPU box, comfortably resolvable at the trace's ms timestamp resolution; no schema
+resolution bump is needed. The inter-burst side (agent think time between tool calls) is not in
+this trace: no agent CLI exists on the reference box yet. That input is named pending; model
+inference latency bounds it below at hundreds of milliseconds in practice, so the clusters
+cannot overlap unless a window is chosen inside 10-100 ms.
 
 ## 5. Candidate ranges and decision handoff
 
-Filled after section 4: candidate NFR-2 budget ranges and candidate coalescing-window values the
-data supports, with the trade-offs stated. The choices themselves are made by the operator and
-recorded in SPEC.md (closing OQ-5 into a concrete NFR-2 budget) and in snapshot.md section 1 and
-the design README parameter table (fixing the window), each citing this document.
+What the data supports, for the operator to choose from (recorded in SPEC.md closing OQ-5, and
+in snapshot.md section 1 plus the design README table for the window, citing this document):
+
+- **NFR-2 per-syscall budget:** measured 31-37 us p50 added per mediated fs syscall. A budget of
+  **at most 50 us p50 / 200 us p99 added per mediated filesystem syscall** on the reference
+  environment holds today with headroom for the enforce-mode policy engine; exec at
+  **at most 2 ms p50** likewise.
+- **NFR-2 end-to-end:** the honest worst-case factor is about 2.5x on a syscall-dense scripted
+  workload. A budget of **at most 3x wall-clock on the syscall-dense worst case** is defensible
+  now; a typical-agent-session target should wait for a real agent trace rather than be guessed.
+- **Coalescing window:** intra-burst gaps max out at 10 ms; anything at or above 100 ms cannot
+  split a burst of this shape. Candidates: 100 ms (finest useful step granularity), 250 ms
+  (5x margin over the observed max plus scheduler headroom), 500 ms (the current placeholder,
+  most conservative). The pending real-agent trace is the named confirming input for whichever
+  value is chosen.

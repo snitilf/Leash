@@ -41,7 +41,8 @@ not edited casually.
 
 Design parameters were deliberately left unfixed until a named review or event closed them, the
 same discipline the spec uses for its open questions. All but one were fixed at the closing slate
-of 2026-07-08; the coalescing window stays deferred with a named trigger, never left implicit.
+of 2026-07-08; the coalescing window closed last, on 2026-07-13, from the M1 overhead
+measurements (`../measurements/0001-m1-overhead.md`, with OQ-5).
 
 | Parameter | Where | Resolution | Closed |
 |---|---|---|---|
@@ -55,7 +56,7 @@ of 2026-07-08; the coalescing window stays deferred with a named trigger, never 
 | Injected-socket fidelity for a host-enforced `connect` | `syscalls.md` section 3.5 | loss accepted, no options preserved in v1; residual named in `escapes.md`; tier:2 revisit on a real breakage | slate 2 |
 | Child memory-read cap | `notify-loop.md` section 2 | 4096 bytes (path), 128 bytes (`sockaddr`), kernel struct size (`clone_args`), one page absolute; over cap denies | slate 2 |
 | Ask timeout default | `notify-loop.md` section 5 | 60 seconds, operator-configurable; timeout denies (FR-10) | slate 2 |
-| Coalescing window for step detection (FR-17) | `snapshot.md` section 1 | **deferred**: set from M1 measurement (trigger: M1 overhead measurements, with OQ-5); 500 ms placeholder for pre-M1 testing, no claim | open, M1 |
+| Coalescing window for step detection (FR-17) | `snapshot.md` section 1 | 250 ms, set from the M1 gap measurements (`measurements/0001` section 4.3: intra-burst gaps max 10 ms, 25x margin); first real agent-session trace named as the confirming input | 2026-07-13, with OQ-5 |
 | Upperdir size limit | `snapshot.md` section 6 | 2 GiB default, operator-configurable; preflight warns when free disk is below the cap; hitting it fails closed | slate 3 |
 
 ## Governing decisions

@@ -1,7 +1,7 @@
 # Leash — Software Specification
 
-- Status: **v0.6, settled** (section 11 holds two explicitly deferred items, OQ-5 and OQ-9, each with a named closing trigger)
-- Date: 2026-07-11 (v0.6 added FR-22's exit-code contract; v0.5 recorded FR-14's mode split for the Landlock leg per ADR-0015; v0.4 deferred the ARM64 target per ADR-0014; v0.3 revised FR-14's kernel floor to 5.19 per ADR-0012; v0.2 dated 2026-07-07)
+- Status: **v0.7, settled** (section 11 holds one explicitly deferred item, OQ-9, with a named closing trigger)
+- Date: 2026-07-13 (v0.7 closed OQ-5 into NFR-2's concrete budget from the M1 measurements; v0.6 added FR-22's exit-code contract; v0.5 recorded FR-14's mode split for the Landlock leg per ADR-0015; v0.4 deferred the ARM64 target per ADR-0014; v0.3 revised FR-14's kernel floor to 5.19 per ADR-0012; v0.2 dated 2026-07-07)
 - Governs: what Leash must do and why. *How* it is built is the design (`docs/design/`).
 
 Key words **MUST**, **MUST NOT**, **SHOULD**, **MAY** per RFC 2119. IDs are stable and cited by other documents, tests, and code: `F-n` features, `FR-n` functional requirements, `NFR-n` non-functional requirements, `SR-n` security requirements, `OQ-n` open questions. Terms in **bold** are defined in [`CONTEXT.md`](../CONTEXT.md) and used exactly as defined there.
@@ -86,7 +86,7 @@ These carry no requirements yet and nothing in this table is promised; promoting
 ## 7. Non-functional requirements
 
 - **NFR-1 — Fail-closed integrity.** The system MUST never fail open. Where any requirement conflicts with this, fail-closed wins.
-- **NFR-2 — Overhead.** Added latency per mediated syscall and end-to-end wall-clock overhead on a representative agent task MUST be measured and reported (section 10). Leash SHOULD keep overhead low enough to run always-on. The concrete budget is deferred (section 11, OQ-5).
+- **NFR-2 — Overhead.** Added latency per mediated syscall and end-to-end wall-clock overhead on a representative agent task MUST be measured and reported (section 10). Leash SHOULD keep overhead low enough to run always-on. On the reference environment (x86-64 KVM, `docs/measurements/0001-m1-overhead.md` section 3), added latency per mediated filesystem syscall MUST NOT exceed 50 microseconds at p50 and 200 microseconds at p99, added latency per exec MUST NOT exceed 2 milliseconds at p50, and end-to-end wall-clock MUST NOT exceed 3x even on a syscall-dense worst-case workload (budget set from the M1 measurements, measurement 0001 section 5; measured 2026-07-13: 31-37 us p50, 2.46x worst case). A typical-agent-session wall-clock target is deferred until a real agent session is measured on the reference environment; that measurement is the trigger to add it.
 - **NFR-3 — Auditability.** Policy MUST be human-readable and diffable; the trace MUST suffice to reconstruct what the agent did without the agent's cooperation.
 - **NFR-4 — Portability & footprint.** MUST NOT require significant ongoing cloud/compute spend; SHOULD stay light enough for modest hardware. The Raspberry Pi 4 class target is deferred with ARM64 (OQ-9).
 - **NFR-5 — Defensibility.** Every control described as *enforced* MUST have passing **escape**-attempt tests. No claim without a test.
@@ -122,9 +122,9 @@ The certified/golden test inventory is maintained alongside the test suite.
 
 ## 11. Open questions
 
-OQ-1..OQ-4 and OQ-6..OQ-8 were resolved on 2026-07-07 into FR-17..FR-21, SR-4, ADR-0009, and ADR-0010. Two items remain, deferred on purpose:
+OQ-1..OQ-4 and OQ-6..OQ-8 were resolved on 2026-07-07 into FR-17..FR-21, SR-4, ADR-0009, and ADR-0010; OQ-5 closed on 2026-07-13 (below). One item remains, deferred on purpose:
 
-- **OQ-5 — Overhead budget (deferred).** The concrete NFR-2 target is set from real measurements once the M1 recorder exists on the reference target; a number chosen earlier would be a guess. *Trigger to close:* M1 measurements per section 10, item 4.
+- **OQ-5 — Overhead budget (closed 2026-07-13).** Resolved into NFR-2's concrete budget from the M1 measurements (`docs/measurements/0001-m1-overhead.md`): 50 us p50 / 200 us p99 per mediated filesystem syscall, 2 ms p50 per exec, 3x wall-clock on the syscall-dense worst case. The same measurements fixed the FR-17 coalescing window at 250 ms (design, snapshot.md section 1). One follow-on input stays named: a real agent-session measurement adds the typical-session wall-clock target and confirms the window.
 - **OQ-9 — ARM64 target (deferred).** FR-15 and NFR-4 originally named ARM64 and a Raspberry Pi 4 class device; the ARM64 leg of the M0 spike was cancelled and the MVP targets x86-64 only (ADR-0014). *Trigger to reopen:* a real need for an ARM64 host. Before any support claim, the M0 spike's ARM64 leg must pass on hardware and the syscall table's ARM64 column (design, syscalls.md section 3) must be validated there.
 
 ## 12. Traceability
@@ -138,6 +138,7 @@ OQ-1..OQ-4 and OQ-6..OQ-8 were resolved on 2026-07-07 into FR-17..FR-21, SR-4, A
 | FR-11..13 (time travel) | ADR-0005, ADR-0009 | overlay-semantics tests, mechanism-equivalence tests |
 | FR-14 (kernel floor) | ADR-0012, ADR-0015 | preflight capability probes on 5.19+ |
 | FR-17 (step semantics) | ADR-0006, ADR-0009 | step-boundary tests |
+| NFR-2 (overhead budget) | OQ-5 closure, measurement 0001 | `benches/overhead.rs` on the reference environment |
 | FR-18 (policy format) | ADR-0004 | policy schema/rejection tests |
 | FR-19 (run modes) | ADR-0010 | mode-stamping and would-deny tests |
 | FR-20 (approval UX) | ADR-0010 | attended/unattended ask tests |
