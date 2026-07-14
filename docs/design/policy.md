@@ -47,10 +47,14 @@ binary = "/usr/bin/git"
 action = "allow"
 ```
 
-`{workspace}` expands to the run's **workspace** root. The workspace is granted read and write as a
-built-in base allow before any rule is read, so a policy that lists nothing still lets the agent work
-in its project; rules extend access beyond the workspace or carve restrictions inside it (a `deny`
-for `{workspace}/.git/**` placed above the base allow). This base allow is a deliberate, documented
+`{workspace}` expands to the run's **workspace** root. The workspace is granted all four fs modes
+(read, write, create, delete) as a built-in base allow before any rule is read, so a policy that
+lists nothing still lets the agent work in its project; an agent editing a project creates and
+deletes files constantly, and a stingier base would train operators to write broad allows. Rules
+extend access beyond the workspace or carve restrictions inside it (a `deny` for
+`{workspace}/.git/**` placed above the base allow). This section originally said "read and write";
+the recorded decision of 2026-07-14 (slice 2 of #25 surfaced the conflict with section 3) pinned
+the base allow to all four modes. This base allow is a deliberate, documented
 part of the effective ruleset, not a hidden exception to deny-by-default: it is echoed in the
 **session report** so the operator sees the full effective policy (FR-5, NFR-3), and a policy may
 override it with an earlier `deny`.
@@ -77,6 +81,19 @@ components, `?` matches a single character. A glob is anchored: after `{workspac
 expansion it must match the entire resolved absolute path, never a substring. Schema version 1 has
 no brace expansion and no character classes; a fuller matcher would be a new schema version.
 
+Pinned by the recorded decisions of 2026-07-13 (slice 1 of #25 surfaced them; ADR-0018 governs the
+matcher being hand-rolled):
+
+- `?` matches a single character within a component; it never matches `/`.
+- `**` is well-formed only as a whole path component (bounded by `/` or the ends of the pattern);
+  `a**`, `**b`, `a**b`, and `***` are load-time rejections, per the strict gitignore rule.
+- The characters `[`, `]`, `{`, `}`, and a leading `!` are load-time rejections, not literals.
+  Version 1 has no classes, braces, or negation, and a rule written with that syntax in mind would
+  otherwise silently under-match, which in a `deny` rule is a boundary the operator believes
+  exists and does not. Accepting them later (as real classes, in a new schema version) stays
+  backward compatible; the reverse would not.
+- An empty glob is a load-time rejection.
+
 ### 2.2 Host matching (fixed at slate 2)
 
 A `net` rule's `host` is one of: an exact hostname, a `*.suffix` wildcard, an exact IP address, or
@@ -86,6 +103,15 @@ A hostname rule is enforced by the supervisor resolving the rule's name itself a
 child's own resolver is never consulted, so a lying DNS answer inside the child cannot widen the
 allowlist. The residual this leaves (CDN address rotation, one IP serving several hosts) is named
 in [`escapes.md`](escapes.md).
+
+Pinned by the recorded decisions of 2026-07-13:
+
+- The bare wildcard `host = "*"` is a fifth valid shape, the catch-all (the section 1 example
+  already used it); it matches any destination.
+- `*.suffix` matches strict subdomains only, the TLS-wildcard-certificate convention:
+  `*.example.com` matches `api.example.com` and never `example.com`. Covering the apex takes one
+  additional exact rule.
+- Hostname matching is case-insensitive. Port 0 is a load-time rejection.
 
 ### 2.3 One execution control (fixed at slate 2)
 

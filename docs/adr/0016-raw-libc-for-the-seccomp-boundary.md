@@ -1,6 +1,6 @@
 # ADR-0016: Raw libc syscalls for the seccomp boundary
 
-- Status: accepted
+- Status: accepted (the deferred Landlock question is closed by ADR-0018)
 - Date: 2026-07-09
 
 ## Context
