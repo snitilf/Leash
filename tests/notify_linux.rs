@@ -255,6 +255,7 @@ fn agent_spec() -> SpawnSpec {
         ],
         stdout: None,
         mode: Mode::RecordOnly,
+        landlock_ruleset: None,
     }
 }
 
@@ -308,6 +309,7 @@ fn run_loop_serves_a_trivial_agent_to_exit() {
         argv: vec!["/bin/true".into()],
         stdout: None,
         mode: Mode::RecordOnly,
+        landlock_ruleset: None,
     })
     .expect("spawn");
     let _watchdog = Watchdog::arm(child.pid);
@@ -546,6 +548,7 @@ fn enforce_mode_is_refused_until_the_policy_engine_exists() {
         argv: vec!["/bin/true".into()],
         stdout: None,
         mode: Mode::RecordOnly,
+        landlock_ruleset: None,
     })
     .expect("spawn");
     let pid = child.pid;

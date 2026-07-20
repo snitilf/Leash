@@ -104,6 +104,7 @@ fn spec(argv: &[&str]) -> SpawnSpec {
         argv: argv.iter().map(|s| s.to_string()).collect(),
         stdout: None,
         mode: Mode::RecordOnly,
+        landlock_ruleset: None,
     }
 }
 

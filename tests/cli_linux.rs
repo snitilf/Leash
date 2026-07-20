@@ -101,6 +101,9 @@ fn run_produces_run_dir_and_mirrors_the_exit_code() {
         serde_json::from_str(&std::fs::read_to_string(run_dir.join("meta.json")).unwrap()).unwrap();
     assert_eq!(meta["mode"], "record_only");
     assert_eq!(meta["attendance"], "unattended");
+    assert_eq!(meta["policy_digest"], serde_json::Value::Null);
+    assert_eq!(meta["landlock_abi"], serde_json::Value::Null);
+    assert_eq!(meta["landlock_residuals"], serde_json::Value::Null);
 
     let events = trace_events(&run_dir);
     assert_eq!(events.first().unwrap()["type"], "run_start");
@@ -225,6 +228,12 @@ fn usage_and_reserved_subcommands_exit_2() {
         (vec![], "no subcommand"),
         (vec!["run"], "--"),
         (vec!["run", "--"], "command"),
+        (vec!["run", "--policy", "--", "echo"], "policy"),
+        (vec!["run", "--policy=", "--", "echo"], "policy"),
+        (
+            vec!["run", "--policy", "a", "--policy=b", "--", "echo"],
+            "given twice",
+        ),
         (vec!["frobnicate"], "unknown"),
         (
             vec!["rewind"],
@@ -243,6 +252,93 @@ fn usage_and_reserved_subcommands_exit_2() {
             "args {args:?}: stderr {stderr:?} must contain {needle:?}"
         );
     }
+}
+
+/// cli.md section 2: `--policy` selects enforce mode, loads the policy before spawn,
+/// and stamps the Landlock metadata. The enforce notify loop itself is still slice 4,
+/// so this run exits as a supervisor failure after the durable run_start.
+#[test]
+fn policy_selects_enforce_and_stamps_landlock_metadata() {
+    let ws = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let policy_path = state.path().join("policy.toml");
+    let policy_text = "schema_version = 1\n\
+        [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+        [[exec]]\nbinary=\"/bin/true\"\naction=\"allow\"\n";
+    std::fs::write(&policy_path, policy_text).unwrap();
+
+    let out = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--",
+            "/bin/true",
+        ],
+        ws.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "slice 3 applies Landlock but the enforce notify loop is slice 4; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let run_dir = only_run_dir(state.path());
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.join("meta.json")).unwrap()).unwrap();
+    let expected = leash::policy::Policy::load_with_digest(
+        &policy_path,
+        &leash::policy::ExpandContext {
+            workspace: ws.path().to_str().unwrap(),
+            home: &std::env::var("HOME").unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(meta["mode"], "enforce");
+    assert_eq!(meta["policy_digest"], expected.digest);
+    assert!(
+        meta["landlock_abi"].as_u64().unwrap() >= 2,
+        "preflight guarantees the ABI-2 floor"
+    );
+    let residuals = meta["landlock_residuals"].as_array().unwrap();
+    assert!(
+        residuals
+            .iter()
+            .any(|r| r == leash::sandbox::landlock::RESIDUAL_TCP_HOST),
+        "host-level TCP residual is always stamped in enforce"
+    );
+}
+
+/// policy load errors are supervisor failures and happen before the run directory exists.
+#[test]
+fn invalid_policy_exits_125_before_artifacts() {
+    let ws = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let policy_path = state.path().join("bad-policy.toml");
+    std::fs::write(&policy_path, "schema_version = 2\n").unwrap();
+
+    let out = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--",
+            "/bin/true",
+        ],
+        ws.path(),
+    );
+    assert_eq!(out.status.code(), Some(125));
+    assert!(
+        !state.path().join("runs").exists(),
+        "policy errors fail before creating a run directory"
+    );
 }
 
 /// cli.md sections 5-6: a spawn failure exits 125 and leaves durable evidence - a synced
@@ -328,6 +424,7 @@ fn trace_failure_mid_run_aborts_without_run_end_or_report() {
         policy_digest: None,
         kernel: "test".into(),
         landlock_abi: None,
+        landlock_residuals: None,
         snapshot_mechanism: SnapshotMechanism::Copy,
         snapshot_reason: "test fixture".into(),
         argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
@@ -341,6 +438,7 @@ fn trace_failure_mid_run_aborts_without_run_end_or_report() {
         attendance: Attendance::Unattended,
         state_root: state.path().to_path_buf(),
         workspace: ws.path().to_path_buf(),
+        policy_path: None,
     };
     // run_start is write 1 and succeeds; the child's execve event is write 2 and dies
     let mut writer = TraceWriter::new(FailingSink {

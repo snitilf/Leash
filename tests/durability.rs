@@ -25,6 +25,7 @@ fn sample_meta() -> RunMeta {
         policy_digest: None,
         kernel: "test".into(),
         landlock_abi: None,
+        landlock_residuals: None,
         snapshot_mechanism: SnapshotMechanism::Copy,
         snapshot_reason: "durability test".into(),
         argv: vec!["torture".into()],
