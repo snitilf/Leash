@@ -51,7 +51,8 @@ fn landlock_agent_dispatch() {
 fn landlock_denies_write_outside_hull_even_when_seccomp_continues() {
     let _g = spawn_guard();
     let workspace = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap().path().join("blocked");
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path().join("blocked");
 
     let policy_text = "schema_version = 1\n\
         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
