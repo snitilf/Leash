@@ -20,7 +20,7 @@ Each **run** owns one directory under an operator-configurable state directory, 
 ```
 $XDG_STATE_HOME/leash/runs/<run-id>/
   meta.json         run-start facts: mode, attendance, policy digest, kernel + Landlock ABI +
-                    snapshot mechanism stamps, argv, workspace path, start time
+                    Landlock residuals, snapshot mechanism stamps, argv, workspace path, start time
   trace.jsonl       the ordered, append-only event stream
   report.txt        the human-readable session report, written at run end
   snapshots/        per-step snapshot state (see snapshot.md)

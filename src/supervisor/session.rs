@@ -80,6 +80,8 @@ pub struct SessionSpec {
     pub state_root: PathBuf,
     /// the canonicalized workspace the run supervises.
     pub workspace: PathBuf,
+    /// optional policy path; present means enforce mode and is loaded during preflight.
+    pub policy_path: Option<PathBuf>,
 }
 
 /// how a completed run ended.
@@ -103,6 +105,18 @@ pub enum SessionError {
     /// preflight could not probe the host at all.
     #[error("preflight probe failed: {0}")]
     Preflight(#[from] crate::supervisor::preflight::PreflightError),
+    /// the policy file was missing or invalid.
+    #[error("policy failed to load: {0}")]
+    Policy(#[from] crate::policy::PolicyError),
+    /// the policy load path needs HOME to expand `~`.
+    #[error("policy expansion needs HOME to be set")]
+    PolicyHome,
+    /// an enforce session must name the policy that selected enforce mode.
+    #[error("enforce mode requires a policy path")]
+    MissingPolicy,
+    /// the Landlock ruleset could not be constructed.
+    #[error("Landlock setup failed: {0}")]
+    Landlock(#[from] crate::sandbox::landlock::LandlockError),
     /// the recorder could not create the run directory or write to the trace.
     #[error("recorder failed: {0}")]
     Recorder(#[from] crate::recorder::RecorderError),
@@ -136,11 +150,20 @@ mod linux {
         EventBody, Mode, RecorderError, RunDir, RunMeta, TRACE_SCHEMA_VERSION, TraceSink,
         TraceWriter,
     };
+    use crate::sandbox::landlock::{self, LandlockHull};
     use crate::supervisor::preflight::{self, Outcome};
     use crate::supervisor::run::run_loop;
     use crate::supervisor::spawn::{SpawnSpec, spawn_supervised};
     use std::io::Write;
+    use std::os::fd::{AsRawFd, OwnedFd, RawFd};
     use std::time::SystemTime;
+
+    struct EnforcementSetup {
+        policy_digest: Option<String>,
+        landlock_abi: Option<u32>,
+        landlock_residuals: Option<Vec<String>>,
+        ruleset: Option<OwnedFd>,
+    }
 
     /// drive one run start to finish: preflight, run directory, lifecycle events, spawn,
     /// the notify loop, and the report, in the fixed order of cli.md section 5. every
@@ -156,14 +179,16 @@ mod linux {
             Outcome::Refuse(message) => return Err(SessionError::Refused(message)),
         };
 
+        let enforcement = prepare_enforcement(&spec, caps.landlock_abi)?;
+
         let meta = RunMeta {
             schema_version: TRACE_SCHEMA_VERSION,
             mode: spec.mode,
             attendance: spec.attendance,
-            policy_digest: None,
+            policy_digest: enforcement.policy_digest,
             kernel: caps.kernel_release,
-            // record-only applies no landlock ruleset (FR-8, FR-19), so no abi is stamped
-            landlock_abi: None,
+            landlock_abi: enforcement.landlock_abi,
+            landlock_residuals: enforcement.landlock_residuals,
             snapshot_mechanism: mechanism,
             snapshot_reason: mechanism_reason,
             argv: spec.argv.clone(),
@@ -172,7 +197,49 @@ mod linux {
         };
         let run_dir = RunDir::create(&spec.state_root, &meta, SystemTime::now())?;
         let mut writer = run_dir.trace_writer()?;
-        run_session_with_writer(&spec, meta, &run_dir, &mut writer)
+        run_session_with_writer_and_ruleset(
+            &spec,
+            meta,
+            &run_dir,
+            &mut writer,
+            enforcement.ruleset.as_ref().map(AsRawFd::as_raw_fd),
+        )
+    }
+
+    fn prepare_enforcement(
+        spec: &SessionSpec,
+        landlock_abi: u32,
+    ) -> Result<EnforcementSetup, SessionError> {
+        if spec.mode == Mode::RecordOnly {
+            return Ok(EnforcementSetup {
+                policy_digest: None,
+                landlock_abi: None,
+                landlock_residuals: None,
+                ruleset: None,
+            });
+        }
+
+        let Some(path) = &spec.policy_path else {
+            return Err(SessionError::MissingPolicy);
+        };
+        let home = std::env::var("HOME").map_err(|_| SessionError::PolicyHome)?;
+        let workspace = spec.workspace.to_string_lossy();
+        let loaded = crate::policy::Policy::load_with_digest(
+            path,
+            &crate::policy::ExpandContext {
+                workspace: &workspace,
+                home: &home,
+            },
+        )?;
+        let hull: LandlockHull = landlock::derive_hull(&loaded.policy, landlock_abi);
+        let ruleset = landlock::build_ruleset(&hull)?;
+
+        Ok(EnforcementSetup {
+            policy_digest: Some(loaded.digest),
+            landlock_abi: Some(landlock_abi),
+            landlock_residuals: Some(hull.residuals),
+            ruleset: Some(ruleset),
+        })
     }
 
     /// the body of `run_session` with the trace writer injected: the seam the fail-closed
@@ -185,6 +252,16 @@ mod linux {
         meta: RunMeta,
         run_dir: &RunDir,
         writer: &mut TraceWriter<S>,
+    ) -> Result<SessionOutcome, SessionError> {
+        run_session_with_writer_and_ruleset(spec, meta, run_dir, writer, None)
+    }
+
+    fn run_session_with_writer_and_ruleset<S: TraceSink>(
+        spec: &SessionSpec,
+        meta: RunMeta,
+        run_dir: &RunDir,
+        writer: &mut TraceWriter<S>,
+        landlock_ruleset: Option<RawFd>,
     ) -> Result<SessionOutcome, SessionError> {
         // step 3: announce the mode on stderr; stdout belongs to the child (FR-19)
         match meta.mode {
@@ -205,6 +282,7 @@ mod linux {
             argv: spec.argv.clone(),
             stdout: None,
             mode,
+            landlock_ruleset,
         })?;
         let outcome = run_loop(child, mode, writer)?;
 

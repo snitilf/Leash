@@ -17,13 +17,14 @@ is announced and torn down, and what the shell sees when it finishes. Terms in *
 The one implemented subcommand is `run`:
 
 ```
-leash run [--unattended] [--state-dir <dir>] -- <command...>
+leash run [--unattended] [--state-dir <dir>] [--policy <path>] -- <command...>
 ```
 
 The `--` separator is required. Everything after it is the child command and passes to the child
 verbatim, including arguments that look like flags: `leash run -- rm -rf ./build` runs `rm` with
 `-rf ./build`, and the `-rf` is never parsed by Leash. Both `--state-dir <dir>` and
-`--state-dir=<dir>` forms are accepted. `--unattended` takes no value.
+`--state-dir=<dir>` forms are accepted. Both `--policy <path>` and `--policy=<path>` forms are
+accepted. `--unattended` takes no value.
 
 Every usage error exits 2 (section 6) and prints a message to stderr naming the mistake. The
 normative set:
@@ -34,8 +35,9 @@ normative set:
 | unknown subcommand or flag | a subcommand that is not `run` (and not a reserved name below), or a flag `run` does not accept |
 | `run` without `--` | `run` invoked with no `--` separator |
 | empty command after `--` | `--` present but nothing follows it |
-| a flag given twice | `--unattended` or `--state-dir` repeated |
+| a flag given twice | `--unattended`, `--state-dir`, or `--policy` repeated |
 | `--state-dir` missing its value | `--state-dir` is the last token before `--`, or is immediately followed by `--` |
+| `--policy` missing its value | `--policy` is the last token before `--`, is immediately followed by `--`, or is given as `--policy=` |
 
 Reserved subcommands parse but are not implemented in this slice. `diff` and `rewind` are the M3
 time-travel milestone (FR-12, FR-13); `runs` is the FR-21 listing and pruning subcommand. Each exits
@@ -46,10 +48,9 @@ milestone or requirement, never a fabricated issue number.
 
 ## 2. Mode selection
 
-A run with no policy file is **record-only** (FR-19). This slice has no `--policy` flag on purpose:
-**enforce** mode does not exist until the policy engine lands, and offering a flag whose only outcome
-is failure would suggest an enforcement path that is not there. When enforce mode arrives the flag
-arrives with it.
+A run with no policy file is **record-only** (FR-19). A run with `--policy <path>` is **enforce**
+mode. The policy is loaded and validated before the child exists and before a run directory is
+created; a load or validation error is a supervisor failure, not a mid-run decision.
 
 The mode is decided once, before the child exists, and MUST NOT change mid-run. It is announced on
 stderr at run start, stamped into `meta.json` and the `run_start` event, and named in the **session
@@ -94,7 +95,8 @@ goes to stderr.
 
 1. Preflight: probe the host and evaluate the result ([`architecture.md`](architecture.md)
    section 5.1). A refusal is a supervisor failure, with the message on stderr and no run directory
-   created.
+   created. In enforce mode, policy load and validation also happen here, before any artifact is
+   created or child is spawned.
 2. Create the run directory and write `meta.json`.
 3. Announce the mode on stderr.
 4. Append the `run_start` event and sync it, before the child is spawned.

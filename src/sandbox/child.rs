@@ -61,6 +61,8 @@ pub struct ChildSetup {
     pub redirect: Option<RawFd>,
     /// the seccomp program header (points into the caller's filter buffer).
     pub prog: SockFprog,
+    /// a parent-built Landlock ruleset fd to apply after the notify ack, if any.
+    pub landlock_ruleset: Option<RawFd>,
     /// the resolved executable path (a nul-terminated C string owned by the caller).
     pub exec_path: *const libc::c_char,
     /// the argv array, nul-terminated (owned by the caller).
@@ -117,6 +119,14 @@ pub unsafe fn enter(setup: &ChildSetup) -> ! {
     // SAFETY: notify_fd was just returned by the kernel and not closed yet.
     unsafe { libc::close(notify_fd) };
     if !recv_ack(setup.child_sock) {
+        die();
+    }
+
+    // step 5: apply the parent-built Landlock ruleset in the child. a process can only
+    // restrict itself, and no allocation is permitted in this post-fork path.
+    if let Some(fd) = setup.landlock_ruleset
+        && !unsafe { super::landlock::restrict_self(fd) }
+    {
         die();
     }
 

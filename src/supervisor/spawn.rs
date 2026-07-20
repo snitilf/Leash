@@ -29,10 +29,10 @@ pub struct SpawnSpec {
     pub argv: Vec<String>,
     /// an fd to redirect the child's stdout and stderr onto, if any.
     pub stdout: Option<OwnedFd>,
-    /// record-only or enforce. the enforce-mode Landlock step (5) slots into the
-    /// child sequence when enforce mode lands (#25); the same filter is installed in
-    /// both modes (architecture.md section 5.1).
+    /// record-only or enforce; the same seccomp filter is installed in both modes.
     pub mode: Mode,
+    /// parent-built Landlock ruleset fd to apply in the child, enforce mode only.
+    pub landlock_ruleset: Option<RawFd>,
 }
 
 /// a launched, supervised child with its boundary established.
@@ -116,6 +116,7 @@ pub fn spawn_with_filter(
         child_sock: child_sock.as_raw_fd(),
         redirect: spec.stdout.as_ref().map(AsRawFd::as_raw_fd),
         prog: SockFprog::new(filter),
+        landlock_ruleset: spec.landlock_ruleset,
         exec_path: exec_path.as_ptr(),
         argv: argv_ptrs.as_ptr(),
     };

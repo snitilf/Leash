@@ -9,6 +9,7 @@
 //! restrict itself; failure to establish any part of the boundary aborts before exec (I3).
 
 pub mod filter;
+pub mod landlock;
 
 #[cfg(target_os = "linux")]
 pub mod child;

@@ -20,6 +20,8 @@ pub struct RunArgs {
     pub unattended: bool,
     /// overrides the default state root; relative paths resolve against cwd
     pub state_dir: Option<PathBuf>,
+    /// path to the policy file; present means enforce mode
+    pub policy_path: Option<PathBuf>,
 }
 
 /// the parsed command line: either the one implemented subcommand, or a reserved name that
@@ -57,12 +59,15 @@ pub enum UsageError {
     /// `--` present but nothing follows it
     #[error("leash: empty command after '--'")]
     EmptyCommand,
-    /// `--unattended` or `--state-dir` repeated
+    /// `--unattended`, `--state-dir`, or `--policy` repeated
     #[error("leash: flag '{0}' given twice")]
     DuplicateFlag(&'static str),
     /// `--state-dir` is the last token before `--`, or immediately followed by `--`
     #[error("leash: '--state-dir' is missing its value")]
     MissingStateDirValue,
+    /// `--policy` is the last token before `--`, immediately followed by `--`, or empty
+    #[error("leash: '--policy' is missing its value")]
+    MissingPolicyValue,
 }
 
 /// parse argv (excluding argv\[0\]) into a [`Command`] per docs/design/cli.md section 1.
@@ -101,6 +106,7 @@ fn parse_run(rest: &[String]) -> Result<RunArgs, UsageError> {
 
     let mut unattended = false;
     let mut state_dir: Option<PathBuf> = None;
+    let mut policy_path: Option<PathBuf> = None;
     let mut i = 0;
 
     let separator = loop {
@@ -136,6 +142,28 @@ fn parse_run(rest: &[String]) -> Result<RunArgs, UsageError> {
                 state_dir = Some(PathBuf::from(value));
                 i += 1;
             }
+            Some(tok) if tok == "--policy" => {
+                if policy_path.is_some() {
+                    return Err(UsageError::DuplicateFlag("--policy"));
+                }
+                let value = rest.get(i + 1).ok_or(UsageError::MissingPolicyValue)?;
+                if value == "--" {
+                    return Err(UsageError::MissingPolicyValue);
+                }
+                policy_path = Some(PathBuf::from(value));
+                i += 2;
+            }
+            Some(tok) if tok.starts_with("--policy=") => {
+                if policy_path.is_some() {
+                    return Err(UsageError::DuplicateFlag("--policy"));
+                }
+                let value = &tok["--policy=".len()..];
+                if value.is_empty() {
+                    return Err(UsageError::MissingPolicyValue);
+                }
+                policy_path = Some(PathBuf::from(value));
+                i += 1;
+            }
             Some(tok) => return Err(UsageError::UnknownFlag(tok.clone())),
         }
     };
@@ -149,6 +177,7 @@ fn parse_run(rest: &[String]) -> Result<RunArgs, UsageError> {
         command,
         unattended,
         state_dir,
+        policy_path,
     })
 }
 
@@ -315,12 +344,19 @@ pub fn run() -> ExitCode {
     let (stdin_tty, stderr_tty) = unsafe { (libc::isatty(0) == 1, libc::isatty(2) == 1) };
     let attendance = attendance(stdin_tty, stderr_tty, run_args.unattended);
 
+    let mode = if run_args.policy_path.is_some() {
+        crate::recorder::Mode::Enforce
+    } else {
+        crate::recorder::Mode::RecordOnly
+    };
+
     dispatch_run(crate::supervisor::session::SessionSpec {
         argv: run_args.command,
-        mode: crate::recorder::Mode::RecordOnly,
+        mode,
         attendance,
         state_root,
         workspace,
+        policy_path: run_args.policy_path,
     })
 }
 
@@ -370,6 +406,7 @@ mod tests {
                 command: vec!["echo".into(), "hi".into()],
                 unattended: false,
                 state_dir: None,
+                policy_path: None,
             })
         );
     }
@@ -392,6 +429,7 @@ mod tests {
                 command: vec!["claude".into(), "--dangerously-skip-permissions".into()],
                 unattended: true,
                 state_dir: Some(PathBuf::from("/tmp/state")),
+                policy_path: None,
             })
         );
     }
@@ -412,6 +450,39 @@ mod tests {
                 command: vec!["echo".into()],
                 unattended: true,
                 state_dir: Some(PathBuf::from("/tmp/state")),
+                policy_path: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_run_accepts_policy_space_and_equals_forms() {
+        let space = parse(&args(&[
+            "run",
+            "--policy",
+            "/tmp/policy.toml",
+            "--",
+            "echo",
+        ]))
+        .unwrap();
+        assert_eq!(
+            space,
+            Command::Run(RunArgs {
+                command: vec!["echo".into()],
+                unattended: false,
+                state_dir: None,
+                policy_path: Some(PathBuf::from("/tmp/policy.toml")),
+            })
+        );
+
+        let equals = parse(&args(&["run", "--policy=/tmp/policy.toml", "--", "echo"])).unwrap();
+        assert_eq!(
+            equals,
+            Command::Run(RunArgs {
+                command: vec!["echo".into()],
+                unattended: false,
+                state_dir: None,
+                policy_path: Some(PathBuf::from("/tmp/policy.toml")),
             })
         );
     }
@@ -425,6 +496,8 @@ mod tests {
             "-rf",
             "./build",
             "--unattended",
+            "--policy",
+            "child-policy.toml",
         ]))
         .unwrap();
         assert_eq!(
@@ -435,9 +508,12 @@ mod tests {
                     "-rf".into(),
                     "./build".into(),
                     "--unattended".into(),
+                    "--policy".into(),
+                    "child-policy.toml".into(),
                 ],
                 unattended: false,
                 state_dir: None,
+                policy_path: None,
             })
         );
     }
@@ -517,6 +593,34 @@ mod tests {
             ]))
             .unwrap_err(),
             UsageError::DuplicateFlag("--unattended")
+        );
+    }
+
+    #[test]
+    fn parse_duplicate_policy() {
+        assert_eq!(
+            parse(&args(&[
+                "run",
+                "--policy",
+                "a.toml",
+                "--policy=b.toml",
+                "--",
+                "echo"
+            ]))
+            .unwrap_err(),
+            UsageError::DuplicateFlag("--policy")
+        );
+    }
+
+    #[test]
+    fn parse_policy_missing_value() {
+        assert_eq!(
+            parse(&args(&["run", "--policy", "--", "echo"])).unwrap_err(),
+            UsageError::MissingPolicyValue
+        );
+        assert_eq!(
+            parse(&args(&["run", "--policy=", "--", "echo"])).unwrap_err(),
+            UsageError::MissingPolicyValue
         );
     }
 

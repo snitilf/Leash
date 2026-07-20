@@ -14,6 +14,7 @@ use std::io;
 use std::path::Path;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 pub mod engine;
 pub mod glob;
@@ -43,6 +44,15 @@ pub struct Policy {
     pub net: Vec<NetRule>,
     /// executable rules, in file order
     pub exec: Vec<ExecRule>,
+}
+
+/// a policy loaded from disk plus the digest of the exact file bytes that were validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedPolicy {
+    /// the typed, fully validated policy
+    pub policy: Policy,
+    /// lowercase hex SHA-256 digest of the loaded TOML bytes
+    pub digest: String,
 }
 
 /// the substitutions applied to a glob before it is compiled (policy.md section 2.1).
@@ -278,12 +288,32 @@ impl Policy {
     /// read a policy file and parse it. a read failure and a parse failure are both total
     /// rejections; the caller aborts the run either way (policy.md section 4).
     pub fn load(path: &Path, ctx: &ExpandContext) -> Result<Policy, PolicyError> {
+        Self::load_with_digest(path, ctx).map(|loaded| loaded.policy)
+    }
+
+    /// read a policy file, parse it, and return the exact-byte digest stamped into run
+    /// metadata. the digest is computed before parsing but returned only for a valid policy,
+    /// so metadata never describes a partially loaded file.
+    pub fn load_with_digest(path: &Path, ctx: &ExpandContext) -> Result<LoadedPolicy, PolicyError> {
         let text = std::fs::read_to_string(path).map_err(|source| PolicyError::Read {
             path: path.display().to_string(),
             source,
         })?;
-        Policy::parse(&text, ctx)
+        let digest = hex_sha256(text.as_bytes());
+        let policy = Policy::parse(&text, ctx)?;
+        Ok(LoadedPolicy { policy, digest })
     }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// expand a glob's `{workspace}` / `~` tokens, then compile it, tagging any error with the
@@ -394,6 +424,10 @@ mod tests {
         Policy::parse(text, &ctx())
     }
 
+    fn digest_of(text: &str) -> String {
+        hex_sha256(text.as_bytes())
+    }
+
     // the full example from policy.md section 1, which must load clean and produce the
     // documented structure once its tokens are expanded.
     const VALID: &str = r#"
@@ -460,6 +494,16 @@ action = "allow"
         // work in its workspace (policy.md section 1). all tables default to empty.
         let p = parse("schema_version = 1\n").unwrap();
         assert!(p.fs.is_empty() && p.net.is_empty() && p.exec.is_empty());
+    }
+
+    #[test]
+    fn load_with_digest_returns_the_validated_file_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.toml");
+        std::fs::write(&path, VALID).unwrap();
+        let loaded = Policy::load_with_digest(&path, &ctx()).unwrap();
+        assert_eq!(loaded.digest, digest_of(VALID));
+        assert_eq!(loaded.policy.schema_version, 1);
     }
 
     #[test]

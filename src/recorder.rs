@@ -87,6 +87,8 @@ pub struct RunMeta {
     pub kernel: String,
     /// probed landlock abi, absent in record-only (no ruleset applied)
     pub landlock_abi: Option<u32>,
+    /// named Landlock degrade residuals, absent in record-only (no ruleset applied)
+    pub landlock_residuals: Option<Vec<String>>,
     /// mechanism preflight selected
     pub snapshot_mechanism: SnapshotMechanism,
     /// why preflight selected it (e.g. host restricts unprivileged userns)
@@ -445,6 +447,7 @@ mod tests {
             policy_digest: None,
             kernel: "6.8.0-124-generic".into(),
             landlock_abi: None,
+            landlock_residuals: None,
             snapshot_mechanism: SnapshotMechanism::Overlay,
             snapshot_reason: "privileged overlay mount available".into(),
             argv: vec!["claude".into(), "--dangerously-skip-permissions".into()],
