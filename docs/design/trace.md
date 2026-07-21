@@ -75,7 +75,8 @@ Fact details fixed by the notify loop:
 - A process-creation fact carries optional `flags`.
   `clone` and `clone3` fill it from the kernel-trusted scalar or bounded `clone_args` read; `fork` and `vfork` omit it.
 - A cross-process fact carries `target_pid` when the syscall exposes one as a scalar register argument.
-  `pidfd_getfd` is always denied in v1 and carries no target pid, because its pidfd argument cannot be safely resolved under `CONTINUE`.
+  `pidfd_getfd` carries no target pid, because its pidfd argument cannot be safely resolved under `CONTINUE`.
+  In record-only it records and continues; in enforce mode it denies fail-closed until safe pidfd resolution exists.
 - A network fact carries the destination `host` string and `port` parsed from the trapped `sockaddr`.
   If the `sockaddr` cannot be read or parsed within its bound, the event is recorded as `raw`.
   In record-only that raw network event is allowed, because record-only enforces nothing outside the denied-and-recorded set.
