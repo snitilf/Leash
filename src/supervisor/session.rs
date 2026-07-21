@@ -265,7 +265,7 @@ mod linux {
         meta: RunMeta,
         run_dir: &RunDir,
         writer: &mut TraceWriter<S>,
-        policy: Option<&crate::policy::Policy>,
+        _policy: Option<&crate::policy::Policy>,
         landlock_ruleset: Option<RawFd>,
     ) -> Result<SessionOutcome, SessionError> {
         // step 3: announce the mode on stderr; stdout belongs to the child (FR-19)
@@ -282,6 +282,12 @@ mod linux {
         writer.append(meta.start_ts, EventBody::RunStart(meta))?;
         writer.sync()?;
 
+        if mode == Mode::Enforce {
+            return Err(SessionError::Run(
+                crate::supervisor::run::RunError::UnsupportedMode,
+            ));
+        }
+
         // steps 5-6: spawn and serve until the tree exits
         let child = spawn_supervised(&SpawnSpec {
             argv: spec.argv.clone(),
@@ -293,18 +299,7 @@ mod linux {
             Mode::RecordOnly => {
                 crate::supervisor::run::RunConfig::record_only(child.pid as u32, spec.attendance)
             }
-            Mode::Enforce => {
-                let Some(policy) = policy else {
-                    return Err(SessionError::Run(
-                        crate::supervisor::run::RunError::EnforceWithoutPolicy,
-                    ));
-                };
-                crate::supervisor::run::RunConfig::enforce(
-                    child.pid as u32,
-                    spec.attendance,
-                    policy,
-                )
-            }
+            Mode::Enforce => unreachable!("enforce refused before spawn"),
         };
         let outcome = run_loop(child, config, writer)?;
 

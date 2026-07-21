@@ -77,7 +77,9 @@ Fact details fixed by the notify loop:
 - A cross-process fact carries `target_pid` when the syscall exposes one as a scalar register argument.
   `pidfd_getfd` is always denied in v1 and carries no target pid, because its pidfd argument cannot be safely resolved under `CONTINUE`.
 - A network fact carries the destination `host` string and `port` parsed from the trapped `sockaddr`.
-  If the `sockaddr` cannot be read or parsed within its bound, the event is recorded as `raw` and denied.
+  If the `sockaddr` cannot be read or parsed within its bound, the event is recorded as `raw`.
+  In record-only that raw network event is allowed, because record-only enforces nothing outside the denied-and-recorded set.
+  In enforce mode the same untrusted network fact denies fail-closed.
 
 In a run with no policy, `matched_rule` carries a fixed base id naming what decided the event:
 `base:record_only` (the record-only base allow, [`policy.md`](policy.md) section 3),

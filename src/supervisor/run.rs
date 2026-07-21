@@ -16,10 +16,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-#[cfg(target_os = "linux")]
-use std::os::fd::AsFd;
-use std::os::fd::BorrowedFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::policy::{Evaluation, Policy, Request};
@@ -30,8 +27,6 @@ use crate::recorder::{
 use crate::sandbox::filter::{AUDIT_ARCH_X86_64, DENIED_RECORDED, X32_SYSCALL_BIT, nr};
 use crate::supervisor::fact::{AccessSpec, FsShape, PathArg, flags, fs_shape, syscall_name};
 use crate::supervisor::mem::MemReadError;
-#[cfg(target_os = "linux")]
-use crate::supervisor::notify::SECCOMP_ADDFD_FLAG_SEND;
 use crate::supervisor::notify::SeccompNotif;
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -46,6 +41,14 @@ pub mod rule {
     pub const FOREIGN_ABI: &str = "sr3:foreign_abi";
     /// a pointer argument could not be read within its cap (case C)
     pub const MEMORY_READ: &str = "failsafe:memory_read";
+    /// process creation has no policy predicate in schema version 1
+    pub const PROCESS_CREATION: &str = "base:process_creation";
+    /// in-tree cross-process control
+    pub const PROCESS_TREE: &str = "base:process_tree";
+    /// cross-process control attempted outside the supervised tree
+    pub const PROCESS_TREE_DENY: &str = "failsafe:process_tree";
+    /// pidfd_getfd is not safely resolvable in enforce mode v1
+    pub const PIDFD_GETFD: &str = "failsafe:pidfd_getfd";
 }
 
 /// how the run ended.
@@ -66,6 +69,9 @@ pub enum RunError {
     /// the notify fd itself failed outside the per-notification arcs.
     #[error("notify fd failed: {0}")]
     Notify(#[source] io::Error),
+    /// enforce mode is not yet safe to serve; refusing is the fail-closed answer.
+    #[error("enforce mode is not implemented (needs safe allow realization)")]
+    UnsupportedMode,
     /// enforce mode reached the loop without a loaded policy.
     #[error("enforce mode requires a loaded policy")]
     EnforceWithoutPolicy,
@@ -113,6 +119,9 @@ impl<'a> RunConfig<'a> {
         if self.mode == crate::recorder::Mode::Enforce && self.policy.is_none() {
             return Err(RunError::EnforceWithoutPolicy);
         }
+        if self.mode == crate::recorder::Mode::Enforce {
+            return Err(RunError::UnsupportedMode);
+        }
         Ok(self)
     }
 }
@@ -127,10 +136,6 @@ pub(crate) trait Notifier {
     fn send_continue(&self, id: u64) -> io::Result<()>;
     /// fail the trapped syscall with an errno.
     fn send_error(&self, id: u64, errno: i32) -> io::Result<()>;
-    /// complete the trapped syscall with a successful scalar return value.
-    fn send_success(&self, id: u64, value: i64) -> io::Result<()>;
-    /// complete an fd-returning syscall by injecting a supervisor-owned fd.
-    fn send_addfd(&self, id: u64, srcfd: BorrowedFd<'_>, flags: u32) -> io::Result<i32>;
     /// bounded nul-terminated read from child memory (mem.rs caps).
     fn read_path(&self, pid: u32, addr: u64) -> Result<Vec<u8>, MemReadError>;
     /// bounded fixed-size read from child memory.
@@ -282,7 +287,7 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
 
     // the filesystem families (syscalls.md sections 3.1-3.2): the recorded slice.
     if let Some(shape) = fs_shape(sys_nr) {
-        return handle_fs(kernel, notif, writer, config, ts, &shape, sys_nr);
+        return handle_fs(kernel, notif, writer, config, ts, &shape);
     }
 
     // execve/execveat: recorded with the same bracketed path read (Fact::Exec); the
@@ -313,7 +318,6 @@ fn handle_fs<N: Notifier, S: TraceSink>(
     config: &RunConfig<'_>,
     ts: u64,
     shape: &FsShape,
-    sys_nr: u32,
 ) -> Result<Handled, RunError> {
     // bracket open (notify-loop.md section 2): a read against a dead or reused id
     // must never become a fact.
@@ -321,42 +325,25 @@ fn handle_fs<N: Notifier, S: TraceSink>(
         return Ok(Handled::Dropped);
     }
 
-    let gathered: Result<
-        (
-            PathBuf,
-            Option<PathBuf>,
-            Vec<crate::recorder::FsAccess>,
-            FsResponse,
-        ),
-        MemReadError,
-    > = (|| {
-        let path = read_anchored(kernel, notif, &shape.path)?;
-        let dest = match &shape.dest {
-            Some(arg) => Some(read_anchored(kernel, notif, arg)?),
-            None => None,
-        };
-        let (access, response) = match shape.access {
-            AccessSpec::Fixed(list) => (
-                list.to_vec(),
-                FsResponse::Mutation(mutation_call(sys_nr, notif)),
-            ),
-            AccessSpec::OpenFlags { arg } => {
-                let flags = notif.data.args[arg];
-                (
-                    crate::supervisor::fact::open_flags_access(flags),
-                    FsResponse::Open { flags },
-                )
-            }
-            AccessSpec::OpenHow { arg } => {
-                let raw_flags = kernel.read_u64(notif.pid, notif.data.args[arg])?;
-                (
-                    crate::supervisor::fact::open_flags_access(raw_flags),
-                    FsResponse::Open { flags: raw_flags },
-                )
-            }
-        };
-        Ok((path, dest, access, response))
-    })();
+    let gathered: Result<(PathBuf, Option<PathBuf>, Vec<crate::recorder::FsAccess>), MemReadError> =
+        (|| {
+            let path = read_anchored(kernel, notif, &shape.path)?;
+            let dest = match &shape.dest {
+                Some(arg) => Some(read_anchored(kernel, notif, arg)?),
+                None => None,
+            };
+            let access = match shape.access {
+                AccessSpec::Fixed(list) => list.to_vec(),
+                AccessSpec::OpenFlags { arg } => {
+                    crate::supervisor::fact::open_flags_access(notif.data.args[arg])
+                }
+                AccessSpec::OpenHow { arg } => {
+                    let raw_flags = kernel.read_u64(notif.pid, notif.data.args[arg])?;
+                    crate::supervisor::fact::open_flags_access(raw_flags)
+                }
+            };
+            Ok((path, dest, access))
+        })();
 
     // bracket close: a read spanning the child's death is discarded (case B).
     if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
@@ -364,7 +351,7 @@ fn handle_fs<N: Notifier, S: TraceSink>(
     }
 
     match gathered {
-        Ok((path, dest, access, response)) => {
+        Ok((path, dest, access)) => {
             let path_text = path.to_string_lossy();
             let decision = resolve_decision(
                 config,
@@ -379,7 +366,7 @@ fn handle_fs<N: Notifier, S: TraceSink>(
                 dest: dest.clone(),
             };
             record(writer, ts, notif, shape.name, fact, &decision)?;
-            respond_fs(kernel, notif, response, &path, dest.as_deref(), &decision)?;
+            respond_continue_or_deny(kernel, notif.id, &decision)?;
             Ok(Handled::Responded)
         }
         // case C: a fact that cannot be trusted cannot be allowed (I4).
@@ -467,7 +454,7 @@ fn handle_process<N: Notifier, S: TraceSink>(
     kernel: &N,
     notif: &SeccompNotif,
     writer: &mut TraceWriter<S>,
-    _config: &RunConfig<'_>,
+    config: &RunConfig<'_>,
     ts: u64,
     sys_nr: u32,
 ) -> Result<Handled, RunError> {
@@ -507,7 +494,14 @@ fn handle_process<N: Notifier, S: TraceSink>(
         notif,
         name,
         Fact::Process { flags },
-        &fixed_decision(Decision::Allow, rule::RECORD_ONLY),
+        &fixed_decision(
+            Decision::Allow,
+            if config.mode == crate::recorder::Mode::RecordOnly {
+                rule::RECORD_ONLY
+            } else {
+                rule::PROCESS_CREATION
+            },
+        ),
     )?;
     tolerate_dead(kernel.send_continue(notif.id))?;
     Ok(Handled::Responded)
@@ -523,15 +517,20 @@ fn handle_cross_process<N: Notifier, S: TraceSink>(
 ) -> Result<Handled, RunError> {
     let name = syscall_name(sys_nr).unwrap_or("unknown");
     if sys_nr == nr::PIDFD_GETFD {
+        let decision = if config.mode == crate::recorder::Mode::RecordOnly {
+            fixed_decision(Decision::Allow, rule::RECORD_ONLY)
+        } else {
+            fixed_decision(Decision::Deny, rule::PIDFD_GETFD)
+        };
         record(
             writer,
             ts,
             notif,
             name,
             Fact::CrossProcess { target_pid: None },
-            &fixed_decision(Decision::Deny, "sr2:pidfd_getfd"),
+            &decision,
         )?;
-        tolerate_dead(kernel.send_error(notif.id, libc::EPERM))?;
+        respond_continue_or_deny(kernel, notif.id, &decision)?;
         return Ok(Handled::Responded);
     }
 
@@ -545,10 +544,12 @@ fn handle_cross_process<N: Notifier, S: TraceSink>(
         || kernel
             .process_in_tree(config.root_pid, target_pid)
             .unwrap_or(false);
-    let decision = if in_tree {
-        fixed_decision(Decision::Allow, "base:process_tree")
+    let decision = if config.mode == crate::recorder::Mode::RecordOnly {
+        fixed_decision(Decision::Allow, rule::RECORD_ONLY)
+    } else if in_tree {
+        fixed_decision(Decision::Allow, rule::PROCESS_TREE)
     } else {
-        fixed_decision(Decision::Deny, "sr2:process_tree")
+        fixed_decision(Decision::Deny, rule::PROCESS_TREE_DENY)
     };
     record(
         writer,
@@ -587,15 +588,7 @@ fn handle_network<N: Notifier, S: TraceSink>(
     let len = match usize::try_from(notif.data.args[len_arg]) {
         Ok(len) if len <= 128 => len,
         _ => {
-            record(
-                writer,
-                ts,
-                notif,
-                name,
-                Fact::Raw {},
-                &fixed_decision(Decision::Deny, rule::MEMORY_READ),
-            )?;
-            tolerate_dead(kernel.send_error(notif.id, libc::EACCES))?;
+            record_network_read_failure(kernel, notif, writer, config, ts, name)?;
             return Ok(Handled::Responded);
         }
     };
@@ -610,15 +603,7 @@ fn handle_network<N: Notifier, S: TraceSink>(
     let (ip, port) = match sockaddr.and_then(parse_sockaddr) {
         Ok(dest) => dest,
         Err(_) => {
-            record(
-                writer,
-                ts,
-                notif,
-                name,
-                Fact::Raw {},
-                &fixed_decision(Decision::Deny, rule::MEMORY_READ),
-            )?;
-            tolerate_dead(kernel.send_error(notif.id, libc::EACCES))?;
+            record_network_read_failure(kernel, notif, writer, config, ts, name)?;
             return Ok(Handled::Responded);
         }
     };
@@ -632,8 +617,25 @@ fn handle_network<N: Notifier, S: TraceSink>(
         },
     );
     record(writer, ts, notif, name, Fact::Net { host, port }, &decision)?;
-    respond_network(kernel, notif, sys_nr, ip, port, &decision)?;
+    respond_continue_or_deny(kernel, notif.id, &decision)?;
     Ok(Handled::Responded)
+}
+
+fn record_network_read_failure<N: Notifier, S: TraceSink>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    writer: &mut TraceWriter<S>,
+    config: &RunConfig<'_>,
+    ts: u64,
+    name: &str,
+) -> Result<(), RunError> {
+    let decision = if config.mode == crate::recorder::Mode::RecordOnly {
+        fixed_decision(Decision::Allow, rule::RECORD_ONLY)
+    } else {
+        fixed_decision(Decision::Deny, rule::MEMORY_READ)
+    };
+    record(writer, ts, notif, name, Fact::Raw {}, &decision)?;
+    respond_continue_or_deny(kernel, notif.id, &decision)
 }
 
 fn respond_continue_or_deny<N: Notifier>(
@@ -645,157 +647,6 @@ fn respond_continue_or_deny<N: Notifier>(
         Decision::Allow => tolerate_dead(kernel.send_continue(id)),
         Decision::Deny | Decision::Ask => tolerate_dead(kernel.send_error(id, libc::EACCES)),
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FsResponse {
-    Open { flags: u64 },
-    Mutation(MutationCall),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MutationCall {
-    Truncate { len: i64 },
-    Rename,
-    RenameAt2 { flags: u64 },
-    Mkdir { mode: u32 },
-    Rmdir,
-    Unlink,
-    UnlinkAt { flags: u64 },
-    Link,
-    LinkAt { flags: u64 },
-    Symlink,
-    Chmod { mode: u32 },
-    Chown { uid: u32, gid: u32 },
-    FchownAt { uid: u32, gid: u32, flags: u64 },
-    None,
-}
-
-fn mutation_call(sys_nr: u32, notif: &SeccompNotif) -> MutationCall {
-    match sys_nr {
-        nr::TRUNCATE => MutationCall::Truncate {
-            len: notif.data.args[1] as i64,
-        },
-        nr::RENAME | nr::RENAMEAT => MutationCall::Rename,
-        nr::RENAMEAT2 => MutationCall::RenameAt2 {
-            flags: notif.data.args[4],
-        },
-        nr::MKDIR => MutationCall::Mkdir {
-            mode: notif.data.args[1] as u32,
-        },
-        nr::MKDIRAT => MutationCall::Mkdir {
-            mode: notif.data.args[2] as u32,
-        },
-        nr::RMDIR => MutationCall::Rmdir,
-        nr::UNLINK => MutationCall::Unlink,
-        nr::UNLINKAT => MutationCall::UnlinkAt {
-            flags: notif.data.args[2],
-        },
-        nr::LINK => MutationCall::Link,
-        nr::LINKAT => MutationCall::LinkAt {
-            flags: notif.data.args[4],
-        },
-        nr::SYMLINK | nr::SYMLINKAT => MutationCall::Symlink,
-        nr::CHMOD => MutationCall::Chmod {
-            mode: notif.data.args[1] as u32,
-        },
-        nr::FCHMODAT => MutationCall::Chmod {
-            mode: notif.data.args[2] as u32,
-        },
-        nr::CHOWN => MutationCall::Chown {
-            uid: notif.data.args[1] as u32,
-            gid: notif.data.args[2] as u32,
-        },
-        nr::FCHOWNAT => MutationCall::FchownAt {
-            uid: notif.data.args[2] as u32,
-            gid: notif.data.args[3] as u32,
-            flags: notif.data.args[4],
-        },
-        _ => MutationCall::None,
-    }
-}
-
-fn respond_fs<N: Notifier>(
-    kernel: &N,
-    notif: &SeccompNotif,
-    response: FsResponse,
-    path: &Path,
-    dest: Option<&Path>,
-    decision: &ResolvedDecision,
-) -> Result<(), RunError> {
-    if decision.response_decision != Decision::Allow {
-        return tolerate_dead(kernel.send_error(notif.id, libc::EACCES));
-    }
-    match response {
-        FsResponse::Open { flags } => respond_open(kernel, notif, path, flags),
-        FsResponse::Mutation(call) => respond_mutation(kernel, notif, call, path, dest),
-    }
-}
-
-fn respond_open<N: Notifier>(
-    kernel: &N,
-    notif: &SeccompNotif,
-    path: &Path,
-    flags: u64,
-) -> Result<(), RunError> {
-    #[cfg(target_os = "linux")]
-    {
-        match open_for_addfd(path, flags) {
-            Ok(fd) => {
-                let addfd_flags = SECCOMP_ADDFD_FLAG_SEND;
-                match kernel.send_addfd(notif.id, fd.as_fd(), addfd_flags) {
-                    Ok(_) => Ok(()),
-                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-                    Err(e) => Err(RunError::Notify(e)),
-                }
-            }
-            Err(errno) => tolerate_dead(kernel.send_error(notif.id, errno)),
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (path, flags);
-        tolerate_dead(kernel.send_continue(notif.id))
-    }
-}
-
-fn respond_mutation<N: Notifier>(
-    kernel: &N,
-    notif: &SeccompNotif,
-    call: MutationCall,
-    path: &Path,
-    dest: Option<&Path>,
-) -> Result<(), RunError> {
-    #[cfg(target_os = "linux")]
-    {
-        let result = perform_mutation(call, path, dest);
-        match result {
-            Ok(value) => tolerate_dead(kernel.send_success(notif.id, value)),
-            Err(errno) => tolerate_dead(kernel.send_error(notif.id, errno)),
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (call, path, dest);
-        tolerate_dead(kernel.send_continue(notif.id))
-    }
-}
-
-fn respond_network<N: Notifier>(
-    kernel: &N,
-    notif: &SeccompNotif,
-    sys_nr: u32,
-    _ip: IpAddr,
-    _port: u16,
-    decision: &ResolvedDecision,
-) -> Result<(), RunError> {
-    if decision.response_decision != Decision::Allow {
-        return tolerate_dead(kernel.send_error(notif.id, libc::EACCES));
-    }
-    if sys_nr == nr::CONNECT || sys_nr == nr::BIND || sys_nr == nr::SENDTO {
-        return tolerate_dead(kernel.send_continue(notif.id));
-    }
-    tolerate_dead(kernel.send_error(notif.id, libc::EACCES))
 }
 
 fn parse_sockaddr(bytes: Vec<u8>) -> Result<(IpAddr, u16), MemReadError> {
@@ -917,9 +768,9 @@ fn record<S: TraceSink>(
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::run_loop;
+use linux::prompt_for_ask;
 #[cfg(target_os = "linux")]
-use linux::{open_for_addfd, perform_mutation, prompt_for_ask};
+pub use linux::run_loop;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -927,7 +778,7 @@ mod linux {
     use crate::supervisor::mem::proc::ChildMem;
     use crate::supervisor::notify::NotifyFd;
     use crate::supervisor::spawn::SupervisedChild;
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::AsRawFd;
     use std::time::SystemTime;
 
     /// the real kernel side: the notify fd plus per-notification /proc reads.
@@ -944,12 +795,6 @@ mod linux {
         }
         fn send_error(&self, id: u64, errno: i32) -> io::Result<()> {
             self.notify.send_error(id, errno)
-        }
-        fn send_success(&self, id: u64, value: i64) -> io::Result<()> {
-            self.notify.send_success(id, value)
-        }
-        fn send_addfd(&self, id: u64, srcfd: BorrowedFd<'_>, flags: u32) -> io::Result<i32> {
-            self.notify.send_addfd(id, srcfd, flags)
         }
         fn read_path(&self, pid: u32, addr: u64) -> Result<Vec<u8>, MemReadError> {
             ChildMem::open(pid)?.read_path(addr)
@@ -1054,174 +899,6 @@ mod linux {
         // SAFETY: the pid is our forked child, still unreaped; SIGKILL then reap.
         unsafe { libc::kill(child.pid, libc::SIGKILL) };
         let _ = child.wait();
-    }
-
-    pub(super) fn open_for_addfd(path: &Path, flags: u64) -> Result<std::fs::File, i32> {
-        let c_path = path_cstr(path)?;
-        let mut open_flags = (flags as i32) & !libc::O_CLOEXEC;
-        open_flags |= libc::O_CLOEXEC;
-        // SAFETY: open reads a nul-terminated path and returns a new fd or -1.
-        let fd = unsafe { libc::open(c_path.as_ptr(), open_flags, 0o666) };
-        if fd < 0 {
-            return Err(errno());
-        }
-        // SAFETY: fd was returned by open and is owned by this process.
-        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-    }
-
-    pub(super) fn perform_mutation(
-        call: MutationCall,
-        path: &Path,
-        dest: Option<&Path>,
-    ) -> Result<i64, i32> {
-        match call {
-            MutationCall::Truncate { len } => call_truncate(path, len as libc::off_t),
-            MutationCall::Rename => call_rename(path, dest),
-            MutationCall::RenameAt2 { flags } => call_renameat2(path, dest, flags),
-            MutationCall::Mkdir { mode } => call_mkdir(path, mode as libc::mode_t),
-            MutationCall::Rmdir => call_rmdir(path),
-            MutationCall::Unlink => call_unlink(path),
-            MutationCall::UnlinkAt { flags } => call_unlinkat(path, flags),
-            MutationCall::Link => call_link(path, dest),
-            MutationCall::LinkAt { flags } => call_linkat(path, dest, flags),
-            MutationCall::Symlink => call_symlink(path, dest),
-            MutationCall::Chmod { mode } => call_chmod(path, mode as libc::mode_t),
-            MutationCall::Chown { uid, gid } => {
-                call_chown(path, uid as libc::uid_t, gid as libc::gid_t)
-            }
-            MutationCall::FchownAt { uid, gid, flags } => {
-                call_fchownat(path, uid as libc::uid_t, gid as libc::gid_t, flags)
-            }
-            MutationCall::None => Ok(0),
-        }
-    }
-
-    fn call_truncate(path: &Path, len: libc::off_t) -> Result<i64, i32> {
-        let path = path_cstr(path)?;
-        // SAFETY: truncate reads a nul-terminated path.
-        rc_unit(unsafe { libc::truncate(path.as_ptr(), len) })
-    }
-
-    fn call_rename(path: &Path, dest: Option<&Path>) -> Result<i64, i32> {
-        let old = path_cstr(path)?;
-        let new = path_cstr(dest.ok_or(libc::EINVAL)?)?;
-        // SAFETY: rename reads two nul-terminated paths.
-        rc_unit(unsafe { libc::rename(old.as_ptr(), new.as_ptr()) })
-    }
-
-    fn call_renameat2(path: &Path, dest: Option<&Path>, flags: u64) -> Result<i64, i32> {
-        let old = path_cstr(path)?;
-        let new = path_cstr(dest.ok_or(libc::EINVAL)?)?;
-        // SAFETY: renameat2 reads two nul-terminated paths. Absolute paths ignore AT_FDCWD.
-        rc_unit(unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                libc::AT_FDCWD,
-                old.as_ptr(),
-                libc::AT_FDCWD,
-                new.as_ptr(),
-                flags as libc::c_uint,
-            ) as libc::c_int
-        })
-    }
-
-    fn call_mkdir(path: &Path, mode: libc::mode_t) -> Result<i64, i32> {
-        let path = path_cstr(path)?;
-        // SAFETY: mkdir reads a nul-terminated path.
-        rc_unit(unsafe { libc::mkdir(path.as_ptr(), mode) })
-    }
-
-    fn call_rmdir(path: &Path) -> Result<i64, i32> {
-        let path = path_cstr(path)?;
-        // SAFETY: rmdir reads a nul-terminated path.
-        rc_unit(unsafe { libc::rmdir(path.as_ptr()) })
-    }
-
-    fn call_unlink(path: &Path) -> Result<i64, i32> {
-        let path = path_cstr(path)?;
-        // SAFETY: unlink reads a nul-terminated path.
-        rc_unit(unsafe { libc::unlink(path.as_ptr()) })
-    }
-
-    fn call_unlinkat(path: &Path, flags: u64) -> Result<i64, i32> {
-        let path = path_cstr(path)?;
-        // SAFETY: unlinkat reads a nul-terminated path. Absolute paths ignore AT_FDCWD.
-        rc_unit(unsafe { libc::unlinkat(libc::AT_FDCWD, path.as_ptr(), flags as libc::c_int) })
-    }
-
-    fn call_link(path: &Path, dest: Option<&Path>) -> Result<i64, i32> {
-        let old = path_cstr(path)?;
-        let new = path_cstr(dest.ok_or(libc::EINVAL)?)?;
-        // SAFETY: link reads two nul-terminated paths.
-        rc_unit(unsafe { libc::link(old.as_ptr(), new.as_ptr()) })
-    }
-
-    fn call_linkat(path: &Path, dest: Option<&Path>, flags: u64) -> Result<i64, i32> {
-        let old = path_cstr(path)?;
-        let new = path_cstr(dest.ok_or(libc::EINVAL)?)?;
-        // SAFETY: linkat reads two nul-terminated paths. Absolute paths ignore AT_FDCWD.
-        rc_unit(unsafe {
-            libc::linkat(
-                libc::AT_FDCWD,
-                old.as_ptr(),
-                libc::AT_FDCWD,
-                new.as_ptr(),
-                flags as libc::c_int,
-            )
-        })
-    }
-
-    fn call_symlink(path: &Path, dest: Option<&Path>) -> Result<i64, i32> {
-        let target = path_cstr(path)?;
-        let link = path_cstr(dest.ok_or(libc::EINVAL)?)?;
-        // SAFETY: symlink reads two nul-terminated paths.
-        rc_unit(unsafe { libc::symlink(target.as_ptr(), link.as_ptr()) })
-    }
-
-    fn call_chmod(path: &Path, mode: libc::mode_t) -> Result<i64, i32> {
-        let path = path_cstr(path)?;
-        // SAFETY: chmod reads a nul-terminated path.
-        rc_unit(unsafe { libc::chmod(path.as_ptr(), mode) })
-    }
-
-    fn call_chown(path: &Path, uid: libc::uid_t, gid: libc::gid_t) -> Result<i64, i32> {
-        let path = path_cstr(path)?;
-        // SAFETY: chown reads a nul-terminated path.
-        rc_unit(unsafe { libc::chown(path.as_ptr(), uid, gid) })
-    }
-
-    fn call_fchownat(
-        path: &Path,
-        uid: libc::uid_t,
-        gid: libc::gid_t,
-        flags: u64,
-    ) -> Result<i64, i32> {
-        let path = path_cstr(path)?;
-        // SAFETY: fchownat reads a nul-terminated path. Absolute paths ignore AT_FDCWD.
-        rc_unit(unsafe {
-            libc::fchownat(
-                libc::AT_FDCWD,
-                path.as_ptr(),
-                uid,
-                gid,
-                flags as libc::c_int,
-            )
-        })
-    }
-
-    fn rc_unit(rc: libc::c_int) -> Result<i64, i32> {
-        if rc == 0 { Ok(0) } else { Err(errno()) }
-    }
-
-    fn path_cstr(path: &Path) -> Result<std::ffi::CString, i32> {
-        use std::os::unix::ffi::OsStrExt;
-        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)
-    }
-
-    fn errno() -> i32 {
-        io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO)
     }
 
     fn process_in_tree(root: u32, target: u32) -> io::Result<bool> {
@@ -1358,20 +1035,6 @@ mod tests {
             }
             self.sent.borrow_mut().push(format!("error:{id}:{errno}"));
             Ok(())
-        }
-        fn send_success(&self, id: u64, value: i64) -> io::Result<()> {
-            if let Some(e) = self.send_errno {
-                return Err(io::Error::from_raw_os_error(e));
-            }
-            self.sent.borrow_mut().push(format!("success:{id}:{value}"));
-            Ok(())
-        }
-        fn send_addfd(&self, id: u64, _srcfd: BorrowedFd<'_>, flags: u32) -> io::Result<i32> {
-            if let Some(e) = self.send_errno {
-                return Err(io::Error::from_raw_os_error(e));
-            }
-            self.sent.borrow_mut().push(format!("addfd:{id}:{flags}"));
-            Ok(3)
         }
         fn read_path(&self, _pid: u32, addr: u64) -> Result<Vec<u8>, MemReadError> {
             match self.mem.get(&addr) {
@@ -1771,20 +1434,24 @@ mod tests {
     fn process_and_cross_process_syscalls_record_typed_facts() {
         let kernel = FakeNotifier::default();
         let mut w = writer();
-        for n in [nr::CLONE, nr::PTRACE] {
+        for n in [nr::CLONE, nr::PTRACE, nr::PIDFD_GETFD] {
             handle_notification(&kernel, &notif(n, [0; 6]), &mut w, 1_000).unwrap();
         }
-        assert_eq!(kernel.sent().len(), 2);
+        assert_eq!(kernel.sent().len(), 3);
         assert!(kernel.sent().iter().all(|s| s.starts_with("continue:")));
         let evs = events(w);
         assert_eq!(evs[0]["fact"]["family"], "process");
         assert_eq!(evs[0]["fact"]["flags"], 0);
         assert_eq!(evs[1]["fact"]["family"], "cross_process");
         assert_eq!(evs[1]["fact"]["target_pid"], 0);
+        assert_eq!(evs[2]["fact"]["family"], "cross_process");
+        assert!(evs[2]["fact"]["target_pid"].is_null());
+        assert_eq!(evs[2]["decision"], "allow");
+        assert_eq!(evs[2]["matched_rule"], rule::RECORD_ONLY);
     }
 
     #[test]
-    fn network_unreadable_sockaddr_denies_as_case_c() {
+    fn network_unreadable_sockaddr_records_raw_and_allows_in_record_only() {
         let kernel = FakeNotifier::default();
         let mut w = writer();
         handle_notification(
@@ -1794,76 +1461,12 @@ mod tests {
             1_000,
         )
         .unwrap();
-        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        assert_eq!(kernel.sent(), vec!["continue:7"]);
         let ev = &events(w)[0];
         assert_eq!(ev["syscall"], "connect");
         assert_eq!(ev["fact"]["family"], "raw");
-        assert_eq!(ev["decision"], "deny");
-        assert_eq!(ev["matched_rule"], rule::MEMORY_READ);
-    }
-
-    #[test]
-    fn mutation_replay_arguments_follow_linux_syscall_signatures() {
-        assert_eq!(
-            mutation_call(nr::TRUNCATE, &notif(nr::TRUNCATE, [0x1000, 99, 0, 0, 0, 0])),
-            MutationCall::Truncate { len: 99 }
-        );
-        assert_eq!(
-            mutation_call(nr::MKDIR, &notif(nr::MKDIR, [0x1000, 0o700, 0, 0, 0, 0])),
-            MutationCall::Mkdir { mode: 0o700 }
-        );
-        assert_eq!(
-            mutation_call(
-                nr::MKDIRAT,
-                &notif(nr::MKDIRAT, [5, 0x1000, 0o755, 0, 0, 0])
-            ),
-            MutationCall::Mkdir { mode: 0o755 }
-        );
-        assert_eq!(
-            mutation_call(
-                nr::UNLINKAT,
-                &notif(nr::UNLINKAT, [5, 0x1000, flags::AT_REMOVEDIR, 0, 0, 0])
-            ),
-            MutationCall::UnlinkAt {
-                flags: flags::AT_REMOVEDIR
-            }
-        );
-        assert_eq!(
-            mutation_call(
-                nr::RENAMEAT2,
-                &notif(nr::RENAMEAT2, [5, 0x1000, 6, 0x2000, 1, 0])
-            ),
-            MutationCall::RenameAt2 { flags: 1 }
-        );
-        assert_eq!(
-            mutation_call(
-                nr::LINKAT,
-                &notif(nr::LINKAT, [5, 0x1000, 6, 0x2000, 0x400, 0])
-            ),
-            MutationCall::LinkAt { flags: 0x400 }
-        );
-        assert_eq!(
-            mutation_call(
-                nr::FCHMODAT,
-                &notif(nr::FCHMODAT, [5, 0x1000, 0o600, 0, 0, 0])
-            ),
-            MutationCall::Chmod { mode: 0o600 }
-        );
-        assert_eq!(
-            mutation_call(nr::CHOWN, &notif(nr::CHOWN, [0x1000, 501, 20, 0, 0, 0])),
-            MutationCall::Chown { uid: 501, gid: 20 }
-        );
-        assert_eq!(
-            mutation_call(
-                nr::FCHOWNAT,
-                &notif(nr::FCHOWNAT, [5, 0x1000, 501, 20, 0x100, 0])
-            ),
-            MutationCall::FchownAt {
-                uid: 501,
-                gid: 20,
-                flags: 0x100
-            }
-        );
+        assert_eq!(ev["decision"], "allow");
+        assert_eq!(ev["matched_rule"], rule::RECORD_ONLY);
     }
 
     #[test]
