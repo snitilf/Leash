@@ -299,7 +299,11 @@ mod linux {
             Mode::RecordOnly => {
                 crate::supervisor::run::RunConfig::record_only(child.pid as u32, spec.attendance)
             }
-            Mode::Enforce => unreachable!("enforce refused before spawn"),
+            Mode::Enforce => {
+                return Err(SessionError::Run(
+                    crate::supervisor::run::RunError::UnsupportedMode,
+                ));
+            }
         };
         let outcome = run_loop(child, config, writer)?;
 
