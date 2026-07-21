@@ -57,12 +57,13 @@ A `syscall` event, the common case, adds:
 |---|---|
 | `pid` | the child pid that trapped |
 | `syscall` | the syscall name |
-| `fact` | the typed fact the decision was made on: resolved path, host+port, or binary, plus access mode |
-| `decision` | `allow`, `deny`, or `ask` (with the ask's resolution: approved, denied, timed-out) |
+| `fact` | the typed fact the decision was made on: filesystem path plus access mode, network host plus port, process-creation flags, cross-process target pid, or binary |
+| `decision` | `allow`, `deny`, or `ask` |
+| `ask_resolution` | present only for an `ask`: `approved`, `denied`, `timed_out`, or `unattended` |
 | `matched_rule` | the id of the policy rule that decided it, or the base rule ([`policy.md`](policy.md)) |
 | `would_deny` | present in record-only when a present policy would have denied (ADR-0010) |
 
-Two fact details fixed when the notify loop was built (#18):
+Fact details fixed by the notify loop:
 
 - A two-path filesystem fact (`rename`, `link`, `symlink` families) carries the second path in an
   optional `dest` field alongside `path`; single-path facts omit it.
@@ -71,11 +72,12 @@ Two fact details fixed when the notify loop was built (#18):
   deny where the pointer argument could not be read within its cap
   ([`notify-loop.md`](notify-loop.md) section 4). The envelope's `syscall` field still names the
   call, which is the recordable substance of those events.
-
-The first notify-loop slice (#18) records the filesystem families, `execve`/`execveat`, and the
-denied-and-recorded set; the remaining mediated families (process creation, network,
-cross-process) are allowed without events until their typed facts land, a named interim gap in
-FR-2 coverage tracked as its own work item.
+- A process-creation fact carries optional `flags`.
+  `clone` and `clone3` fill it from the kernel-trusted scalar or bounded `clone_args` read; `fork` and `vfork` omit it.
+- A cross-process fact carries `target_pid` when the syscall exposes one as a scalar register argument.
+  `pidfd_getfd` is always denied in v1 and carries no target pid, because its pidfd argument cannot be safely resolved under `CONTINUE`.
+- A network fact carries the destination `host` string and `port` parsed from the trapped `sockaddr`.
+  If the `sockaddr` cannot be read or parsed within its bound, the event is recorded as `raw` and denied.
 
 In a run with no policy, `matched_rule` carries a fixed base id naming what decided the event:
 `base:record_only` (the record-only base allow, [`policy.md`](policy.md) section 3),
@@ -140,14 +142,8 @@ supervisor mid-step and confirms the flushed prefix of the trace is intact and c
 
 ## 6. Session report
 
-At run end the supervisor writes `report.txt`, the human-readable summary FR-5 requires, derived
-entirely from the trace (never from a second source that could disagree). It lists the files touched,
-the processes spawned, and the network connections attempted, each with its **decision**, grouped for
-a human to skim. It also lists the denied attempts that carry no typed fact (the denied-and-recorded
-set and the case-C denies of section 2), so a refused action is visible even without a fact to name
-it. The report's section coverage matches the mediated-set event coverage of the slice that wrote the
-trace: families not yet producing events (section 2) are named as unobserved, never counted as absent,
-so a reader never mistakes an interim gap for a run in which nothing of that kind happened. It names the active **mode** (FR-19); a record-only report says so in as many words
-and never uses enforcement language for a run that enforced nothing (ADR-0010). Because it is derived
-from the trace, the report is regenerable after the fact from `trace.jsonl` alone, so a run can be
-re-summarized without re-running the agent (which Leash never does anyway).
+At run end the supervisor writes `report.txt`, the human-readable summary FR-5 requires, derived entirely from the trace and never from a second source that could disagree.
+It lists the files touched, executed binaries, process-creation attempts, cross-process control attempts, and network connections attempted, each with its **decision**, grouped for a human to skim.
+It also lists the denied attempts that carry no typed fact, including the denied-and-recorded set and the case-C denies of section 2, so a refused action is visible even without a fact to name it.
+It names the active **mode** (FR-19); a record-only report says so in as many words and never uses enforcement language for a run that enforced nothing (ADR-0010).
+Because it is derived from the trace, the report is regenerable after the fact from `trace.jsonl` alone, so a run can be re-summarized without re-running the agent.

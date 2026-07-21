@@ -159,6 +159,7 @@ mod linux {
     use std::time::SystemTime;
 
     struct EnforcementSetup {
+        policy: Option<crate::policy::Policy>,
         policy_digest: Option<String>,
         landlock_abi: Option<u32>,
         landlock_residuals: Option<Vec<String>>,
@@ -202,6 +203,7 @@ mod linux {
             meta,
             &run_dir,
             &mut writer,
+            enforcement.policy.as_ref(),
             enforcement.ruleset.as_ref().map(AsRawFd::as_raw_fd),
         )
     }
@@ -212,6 +214,7 @@ mod linux {
     ) -> Result<EnforcementSetup, SessionError> {
         if spec.mode == Mode::RecordOnly {
             return Ok(EnforcementSetup {
+                policy: None,
                 policy_digest: None,
                 landlock_abi: None,
                 landlock_residuals: None,
@@ -235,6 +238,7 @@ mod linux {
         let ruleset = landlock::build_ruleset(&hull)?;
 
         Ok(EnforcementSetup {
+            policy: Some(loaded.policy),
             policy_digest: Some(loaded.digest),
             landlock_abi: Some(landlock_abi),
             landlock_residuals: Some(hull.residuals),
@@ -253,7 +257,7 @@ mod linux {
         run_dir: &RunDir,
         writer: &mut TraceWriter<S>,
     ) -> Result<SessionOutcome, SessionError> {
-        run_session_with_writer_and_ruleset(spec, meta, run_dir, writer, None)
+        run_session_with_writer_and_ruleset(spec, meta, run_dir, writer, None, None)
     }
 
     fn run_session_with_writer_and_ruleset<S: TraceSink>(
@@ -261,6 +265,7 @@ mod linux {
         meta: RunMeta,
         run_dir: &RunDir,
         writer: &mut TraceWriter<S>,
+        policy: Option<&crate::policy::Policy>,
         landlock_ruleset: Option<RawFd>,
     ) -> Result<SessionOutcome, SessionError> {
         // step 3: announce the mode on stderr; stdout belongs to the child (FR-19)
@@ -284,7 +289,24 @@ mod linux {
             mode,
             landlock_ruleset,
         })?;
-        let outcome = run_loop(child, mode, writer)?;
+        let config = match mode {
+            Mode::RecordOnly => {
+                crate::supervisor::run::RunConfig::record_only(child.pid as u32, spec.attendance)
+            }
+            Mode::Enforce => {
+                let Some(policy) = policy else {
+                    return Err(SessionError::Run(
+                        crate::supervisor::run::RunError::EnforceWithoutPolicy,
+                    ));
+                };
+                crate::supervisor::run::RunConfig::enforce(
+                    child.pid as u32,
+                    spec.attendance,
+                    policy,
+                )
+            }
+        };
+        let outcome = run_loop(child, config, writer)?;
 
         // step 7: an undecodable status stamps nothing (an untruthful exit is worse
         // than none, cli.md section 5)

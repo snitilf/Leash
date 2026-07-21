@@ -63,11 +63,8 @@ nothing (ADR-0010).
 A run is attended if and only if both stdin and stderr are terminals, tested with `isatty` on file
 descriptors 0 and 2. `--unattended` forces unattended regardless of the terminal state (FR-20).
 Attendance is stamped into the trace and `meta.json`.
-
-In this slice no **ask** exists, so attendance only stamps: nothing yet reads it to decide whether an
-ask queues or denies. The rule is fixed now, before asks land, so the stamp's meaning does not drift
-later. A trace recorded today records the same attended or unattended fact that FR-20 will act on
-when asks arrive.
+An unattended **ask** resolves to deny immediately and records `ask_resolution: "unattended"`.
+An attended **ask** prompts on the controlling terminal and resolves to deny if the operator rejects it or the timeout fires.
 
 ## 4. State directory
 

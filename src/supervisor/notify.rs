@@ -235,6 +235,16 @@ mod linux {
             })
         }
 
+        /// complete the trapped syscall with a successful scalar return value.
+        pub fn send_success(&self, id: u64, value: i64) -> io::Result<()> {
+            self.send(SeccompNotifResp {
+                id,
+                val: value,
+                error: 0,
+                flags: 0,
+            })
+        }
+
         fn send(&self, resp: SeccompNotifResp) -> io::Result<()> {
             // SAFETY: SEND reads exactly a seccomp_notif_resp from the pointed-to
             // struct, which we own and outlives the call.

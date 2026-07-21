@@ -255,8 +255,7 @@ fn usage_and_reserved_subcommands_exit_2() {
 }
 
 /// cli.md section 2: `--policy` selects enforce mode, loads the policy before spawn,
-/// and stamps the Landlock metadata. The enforce notify loop itself is still slice 4,
-/// so this run exits as a supervisor failure after the durable run_start.
+/// stamps the Landlock metadata, and serves an allowed workload to completion.
 #[test]
 fn policy_selects_enforce_and_stamps_landlock_metadata() {
     let ws = tempfile::tempdir().unwrap();
@@ -264,7 +263,7 @@ fn policy_selects_enforce_and_stamps_landlock_metadata() {
     let policy_path = state.path().join("policy.toml");
     let policy_text = "schema_version = 1\n\
         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
-        [[exec]]\nbinary=\"/bin/true\"\naction=\"allow\"\n";
+        [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n";
     std::fs::write(&policy_path, policy_text).unwrap();
 
     let out = run_leash(
@@ -282,8 +281,8 @@ fn policy_selects_enforce_and_stamps_landlock_metadata() {
     );
     assert_eq!(
         out.status.code(),
-        Some(125),
-        "slice 3 applies Landlock but the enforce notify loop is slice 4; stderr: {}",
+        Some(0),
+        "enforce mode should serve an allowed workload; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -310,6 +309,77 @@ fn policy_selects_enforce_and_stamps_landlock_metadata() {
             .iter()
             .any(|r| r == leash::sandbox::landlock::RESIDUAL_TCP_HOST),
         "host-level TCP residual is always stamped in enforce"
+    );
+}
+
+#[test]
+fn enforce_denies_unmatched_write_but_record_only_allows_it() {
+    let ws = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path().join("blocked.txt");
+    let policy_path = state.path().join("policy.toml");
+    let policy_text = "schema_version = 1\n\
+        [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+        [[fs]]\npath=\"{workspace}/**\"\nmode=[\"write\", \"create\", \"delete\"]\naction=\"allow\"\n\
+        [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n";
+    std::fs::write(&policy_path, policy_text).unwrap();
+
+    let record_state = tempfile::tempdir().unwrap();
+    let record_out = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            record_state.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!("echo ok > {}", outside.display()),
+        ],
+        ws.path(),
+    );
+    assert_eq!(
+        record_out.status.code(),
+        Some(0),
+        "record-only should allow the outside write"
+    );
+    assert!(outside.exists());
+    std::fs::remove_file(&outside).unwrap();
+
+    let enforce_out = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!("echo denied > {}", outside.display()),
+        ],
+        ws.path(),
+    );
+    assert_ne!(
+        enforce_out.status.code(),
+        Some(0),
+        "enforce should deny the unmatched outside write; stderr: {}",
+        String::from_utf8_lossy(&enforce_out.stderr)
+    );
+    assert!(!outside.exists());
+
+    let run_dir = only_run_dir(state.path());
+    let events = trace_events(&run_dir);
+    let outside_text = outside.to_string_lossy();
+    assert!(
+        events.iter().any(|e| e["type"] == "syscall"
+            && e["fact"]["family"] == "fs"
+            && e["fact"]["path"] == outside_text.as_ref()
+            && e["decision"] == "deny"
+            && e["matched_rule"] == "base:enforce"),
+        "the denied write must be traced: {events:#?}"
     );
 }
 

@@ -26,6 +26,8 @@ pub mod flags {
     pub const O_TRUNC: u64 = 0o1000;
     /// the dirfd value meaning "relative to the caller's cwd" (fcntl.h AT_FDCWD)
     pub const AT_FDCWD: u64 = -100i64 as u64;
+    /// unlinkat flag that removes a directory instead of a non-directory entry
+    pub const AT_REMOVEDIR: u64 = 0x200;
 }
 
 /// one path-pointer argument of a trapped syscall.
@@ -448,5 +450,6 @@ mod tests {
         assert_eq!(flags::O_CREAT, libc::O_CREAT as u64);
         assert_eq!(flags::O_TRUNC, libc::O_TRUNC as u64);
         assert_eq!(flags::AT_FDCWD, libc::AT_FDCWD as u64);
+        assert_eq!(flags::AT_REMOVEDIR, libc::AT_REMOVEDIR as u64);
     }
 }

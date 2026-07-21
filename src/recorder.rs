@@ -180,6 +180,18 @@ pub enum Fact {
         /// destination port
         port: u16,
     },
+    /// a process creation decision
+    Process {
+        /// clone flags for clone/clone3; absent for fork/vfork
+        #[serde(skip_serializing_if = "Option::is_none")]
+        flags: Option<u64>,
+    },
+    /// a cross-process control decision
+    CrossProcess {
+        /// target pid when the syscall exposes one as a scalar register argument
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_pid: Option<u32>,
+    },
     /// an execution decision
     Exec {
         /// the resolved binary path
@@ -227,6 +239,8 @@ pub enum AskResolution {
     Denied,
     /// the timeout fired; timeout-to-deny
     TimedOut,
+    /// no operator was available; unattended asks deny immediately
+    Unattended,
 }
 
 /// where trace bytes go. `File` is the real sink; tests substitute one that records.

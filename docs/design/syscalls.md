@@ -158,11 +158,11 @@ workload needs it.
 | `connect` | yes | `sockaddr` host + port (pointer) | supervisor connects a fresh socket, injects it with `ADDFD`; or `CONTINUE` for allow-all policies | `NET_CONNECT_TCP` (port only) |
 | `bind` | yes | `sockaddr` port (pointer) | supervisor-executed or `CONTINUE` per policy | `NET_BIND_TCP` (port only) |
 | `sendto` | yes | destination `sockaddr` on an unconnected socket (pointer) | as `connect` | `NET_CONNECT_TCP` (port only) |
-| `sendmsg` | yes | destination in `msghdr.msg_name` (pointer behind a pointer) | as `connect` | `NET_CONNECT_TCP` (port only) |
 
 Network is arch-uniform: `socket`, `connect`, and `bind` exist directly on both x86-64 and ARM64
 (the multiplexed `socketcall` is a 32-bit-x86 artifact and is denied as a foreign-ABI syscall,
-section 5). `socket` itself is traced but allowed; the boundary is enforced at `connect`/`bind`.
+section 5).
+`socket` itself is pass-through; the boundary is enforced and traced at `connect`, `bind`, and destination-bearing `sendto`.
 
 A filter subtlety splits `sendto` from `sendmsg`. The BPF filter sees only register arguments, so it
 can trap `sendto` selectively (its destination pointer is a register, testable for null, so only

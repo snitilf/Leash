@@ -74,6 +74,8 @@ pub fn render_report(trace_jsonl: &str) -> Result<String, ReportError> {
 
     let mut files: BTreeMap<String, FileActivity> = BTreeMap::new();
     let mut processes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut process_creations: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut cross_process: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut network: BTreeMap<(String, i64), BTreeSet<String>> = BTreeMap::new();
     let mut denied_raw: BTreeSet<(String, String)> = BTreeSet::new();
 
@@ -170,6 +172,22 @@ pub fn render_report(trace_jsonl: &str) -> Result<String, ReportError> {
                         )?;
                         network.entry((host, port)).or_default().insert(display);
                     }
+                    "process" => {
+                        process_creations
+                            .entry(syscall)
+                            .or_default()
+                            .insert(display);
+                    }
+                    "cross_process" => {
+                        let target = fact
+                            .get("target_pid")
+                            .and_then(Value::as_i64)
+                            .map_or_else(|| "unknown".to_string(), |pid| pid.to_string());
+                        cross_process
+                            .entry(format!("{syscall} target={target}"))
+                            .or_default()
+                            .insert(display);
+                    }
                     "raw" => {
                         if decision == "deny" {
                             denied_raw.insert((syscall, matched_rule));
@@ -222,6 +240,8 @@ pub fn render_report(trace_jsonl: &str) -> Result<String, ReportError> {
         have_run_end,
         &files,
         &processes,
+        &process_creations,
+        &cross_process,
         &network,
         &denied_raw,
     ))
@@ -237,6 +257,8 @@ fn format_report(
     have_run_end: bool,
     files: &BTreeMap<String, FileActivity>,
     processes: &BTreeMap<String, BTreeSet<String>>,
+    process_creations: &BTreeMap<String, BTreeSet<String>>,
+    cross_process: &BTreeMap<String, BTreeSet<String>>,
     network: &BTreeMap<(String, i64), BTreeSet<String>>,
     denied_raw: &BTreeSet<(String, String)>,
 ) -> String {
@@ -298,11 +320,31 @@ fn format_report(
     }
     out.push('\n');
 
+    out.push_str("process creation:\n");
+    if process_creations.is_empty() {
+        out.push_str("  none recorded\n");
+    } else {
+        for (syscall, decisions) in process_creations {
+            let decisions = decisions.iter().cloned().collect::<Vec<_>>().join(", ");
+            out.push_str(&format!("  {syscall}  {decisions}\n"));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("cross-process control:\n");
+    if cross_process.is_empty() {
+        out.push_str("  none recorded\n");
+    } else {
+        for (target, decisions) in cross_process {
+            let decisions = decisions.iter().cloned().collect::<Vec<_>>().join(", ");
+            out.push_str(&format!("  {target}  {decisions}\n"));
+        }
+    }
+    out.push('\n');
+
     out.push_str("network connections:\n");
     if network.is_empty() {
-        out.push_str(
-            "  network observation is not implemented in this slice; no network events were available\n",
-        );
+        out.push_str("  none recorded\n");
     } else {
         for ((host, port), decisions) in network {
             let decisions = decisions.iter().cloned().collect::<Vec<_>>().join(", ");
@@ -504,8 +546,14 @@ mod tests {
             "processes spawned (from observed execve and execveat events):",
             "  /usr/bin/node  allowed",
             "",
+            "process creation:",
+            "  none recorded",
+            "",
+            "cross-process control:",
+            "  none recorded",
+            "",
             "network connections:",
-            "  network observation is not implemented in this slice; no network events were available",
+            "  none recorded",
             "",
             "denied without a typed fact:",
             "  io_uring_setup  (sr4:io_uring)",
