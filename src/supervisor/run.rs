@@ -226,7 +226,7 @@ fn resolve_ask(config: &RunConfig<'_>) -> AskResolution {
 
     #[cfg(target_os = "linux")]
     {
-        return prompt_for_ask(config.ask_timeout);
+        prompt_for_ask(config.ask_timeout)
     }
     #[cfg(not(target_os = "linux"))]
     {
