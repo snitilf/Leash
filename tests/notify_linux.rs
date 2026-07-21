@@ -165,15 +165,17 @@ fn agent_dispatch() {
     }
 
     if std::env::var_os("LEASH_NOTIFY_PROCESS_AGENT").is_some() {
-        // SAFETY: fork and waitpid operate on this process and its direct child.
+        // SAFETY: the raw fork syscall and waitpid operate on this process and its direct
+        // child. `_exit` avoids running non-async-signal-safe cleanup in the forked child.
         unsafe {
-            let pid = libc::fork();
-            if pid == 0 {
-                std::process::exit(0);
+            let raw_pid = libc::syscall(libc::SYS_fork);
+            if raw_pid == 0 {
+                libc::_exit(0);
             }
-            if pid < 0 {
+            if raw_pid < 0 {
                 std::process::exit(15);
             }
+            let pid = raw_pid as libc::pid_t;
             let mut status = 0;
             let waited = libc::waitpid(pid, &mut status, 0);
             std::process::exit(if waited == pid && libc::WIFEXITED(status) {
