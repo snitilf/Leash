@@ -255,8 +255,8 @@ fn usage_and_reserved_subcommands_exit_2() {
 }
 
 /// cli.md section 2: `--policy` selects enforce mode, loads the policy before spawn,
-/// and stamps the Landlock metadata. The enforce notify loop itself is still slice 4,
-/// so this run exits as a supervisor failure after the durable run_start.
+/// and stamps the Landlock metadata. The enforce notify loop still refuses before
+/// spawning the agent until safe allow realization lands.
 #[test]
 fn policy_selects_enforce_and_stamps_landlock_metadata() {
     let ws = tempfile::tempdir().unwrap();
@@ -264,7 +264,7 @@ fn policy_selects_enforce_and_stamps_landlock_metadata() {
     let policy_path = state.path().join("policy.toml");
     let policy_text = "schema_version = 1\n\
         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
-        [[exec]]\nbinary=\"/bin/true\"\naction=\"allow\"\n";
+        [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n";
     std::fs::write(&policy_path, policy_text).unwrap();
 
     let out = run_leash(
@@ -283,7 +283,7 @@ fn policy_selects_enforce_and_stamps_landlock_metadata() {
     assert_eq!(
         out.status.code(),
         Some(125),
-        "slice 3 applies Landlock but the enforce notify loop is slice 4; stderr: {}",
+        "enforce mode is fail-closed until safe allow realization lands; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 

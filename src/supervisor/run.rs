@@ -15,15 +15,21 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
+use std::time::Duration;
 
+use crate::policy::{Evaluation, Policy, Request};
 use crate::recorder::{
-    Decision, EventBody, Fact, RecorderError, SyscallEvent, TraceSink, TraceWriter,
+    AskResolution, Attendance, Decision, EventBody, Fact, RecorderError, SyscallEvent, TraceSink,
+    TraceWriter,
 };
 use crate::sandbox::filter::{AUDIT_ARCH_X86_64, DENIED_RECORDED, X32_SYSCALL_BIT, nr};
 use crate::supervisor::fact::{AccessSpec, FsShape, PathArg, flags, fs_shape, syscall_name};
 use crate::supervisor::mem::MemReadError;
 use crate::supervisor::notify::SeccompNotif;
+
+const ASK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// matched-rule ids for a policy-less run (trace.md section 2).
 pub mod rule {
@@ -35,6 +41,14 @@ pub mod rule {
     pub const FOREIGN_ABI: &str = "sr3:foreign_abi";
     /// a pointer argument could not be read within its cap (case C)
     pub const MEMORY_READ: &str = "failsafe:memory_read";
+    /// process creation has no policy predicate in schema version 1
+    pub const PROCESS_CREATION: &str = "base:process_creation";
+    /// in-tree cross-process control
+    pub const PROCESS_TREE: &str = "base:process_tree";
+    /// cross-process control attempted outside the supervised tree
+    pub const PROCESS_TREE_DENY: &str = "failsafe:process_tree";
+    /// pidfd_getfd is not safely resolvable in enforce mode v1
+    pub const PIDFD_GETFD: &str = "failsafe:pidfd_getfd";
 }
 
 /// how the run ended.
@@ -55,9 +69,61 @@ pub enum RunError {
     /// the notify fd itself failed outside the per-notification arcs.
     #[error("notify fd failed: {0}")]
     Notify(#[source] io::Error),
-    /// enforce mode has no policy engine yet; refusing is the fail-closed answer.
-    #[error("enforce mode is not implemented (needs the policy engine)")]
+    /// enforce mode is not yet safe to serve; refusing is the fail-closed answer.
+    #[error("enforce mode is not implemented (needs safe allow realization)")]
     UnsupportedMode,
+    /// enforce mode reached the loop without a loaded policy.
+    #[error("enforce mode requires a loaded policy")]
+    EnforceWithoutPolicy,
+}
+
+/// immutable inputs for one notify-loop run.
+#[derive(Debug, Clone, Copy)]
+pub struct RunConfig<'a> {
+    /// record-only or enforce
+    pub mode: crate::recorder::Mode,
+    /// loaded policy; required in enforce mode and absent for current record-only CLI runs
+    pub policy: Option<&'a Policy>,
+    /// whether an operator is available for ask decisions
+    pub attendance: Attendance,
+    /// maximum wait for an attended ask
+    pub ask_timeout: Duration,
+    /// root of the supervised process tree
+    pub root_pid: u32,
+}
+
+impl<'a> RunConfig<'a> {
+    /// current policy-less record-only behavior.
+    pub fn record_only(root_pid: u32, attendance: Attendance) -> Self {
+        Self {
+            mode: crate::recorder::Mode::RecordOnly,
+            policy: None,
+            attendance,
+            ask_timeout: ASK_TIMEOUT,
+            root_pid,
+        }
+    }
+
+    /// enforce with a validated policy.
+    pub fn enforce(root_pid: u32, attendance: Attendance, policy: &'a Policy) -> Self {
+        Self {
+            mode: crate::recorder::Mode::Enforce,
+            policy: Some(policy),
+            attendance,
+            ask_timeout: ASK_TIMEOUT,
+            root_pid,
+        }
+    }
+
+    fn validate(self) -> Result<Self, RunError> {
+        if self.mode == crate::recorder::Mode::Enforce && self.policy.is_none() {
+            return Err(RunError::EnforceWithoutPolicy);
+        }
+        if self.mode == crate::recorder::Mode::Enforce {
+            return Err(RunError::UnsupportedMode);
+        }
+        Ok(self)
+    }
 }
 
 /// what one loop iteration needs from the kernel: the notify-fd operations plus the
@@ -72,10 +138,14 @@ pub(crate) trait Notifier {
     fn send_error(&self, id: u64, errno: i32) -> io::Result<()>;
     /// bounded nul-terminated read from child memory (mem.rs caps).
     fn read_path(&self, pid: u32, addr: u64) -> Result<Vec<u8>, MemReadError>;
+    /// bounded fixed-size read from child memory.
+    fn read_bytes(&self, pid: u32, addr: u64, len: usize) -> Result<Vec<u8>, MemReadError>;
     /// bounded fixed-size read of a leading u64 field (open_how flags).
     fn read_u64(&self, pid: u32, addr: u64) -> Result<u64, MemReadError>;
     /// the kernel's answer for a relative path's anchor: readlink of /proc cwd or fd/N.
     fn dir_prefix(&self, pid: u32, anchor: DirAnchor) -> io::Result<PathBuf>;
+    /// whether `target` is the supervised root or a descendant of it.
+    fn process_in_tree(&self, root: u32, target: u32) -> io::Result<bool>;
 }
 
 /// where a relative path is anchored.
@@ -96,6 +166,75 @@ pub(crate) enum Handled {
     Dropped,
 }
 
+struct ResolvedDecision {
+    event_decision: Decision,
+    response_decision: Decision,
+    ask_resolution: Option<AskResolution>,
+    matched_rule: String,
+    would_deny: Option<bool>,
+}
+
+fn fixed_decision(decision: Decision, matched_rule: &str) -> ResolvedDecision {
+    ResolvedDecision {
+        event_decision: decision,
+        response_decision: decision,
+        ask_resolution: None,
+        matched_rule: matched_rule.to_string(),
+        would_deny: None,
+    }
+}
+
+fn resolve_decision(config: &RunConfig<'_>, request: &Request<'_>) -> ResolvedDecision {
+    let eval = match config.policy {
+        Some(policy) => policy.evaluate(request, config.mode),
+        None => Evaluation {
+            decision: Decision::Allow,
+            matched: crate::policy::MatchId::BaseRecordOnly,
+            would_deny: None,
+        },
+    };
+    if eval.decision != Decision::Ask {
+        return ResolvedDecision {
+            event_decision: eval.decision,
+            response_decision: eval.decision,
+            ask_resolution: None,
+            matched_rule: eval.matched.to_string(),
+            would_deny: eval.would_deny,
+        };
+    }
+
+    let ask_resolution = resolve_ask(config);
+    let response_decision = match ask_resolution {
+        AskResolution::Approved => Decision::Allow,
+        AskResolution::Denied | AskResolution::TimedOut | AskResolution::Unattended => {
+            Decision::Deny
+        }
+    };
+    ResolvedDecision {
+        event_decision: Decision::Ask,
+        response_decision,
+        ask_resolution: Some(ask_resolution),
+        matched_rule: eval.matched.to_string(),
+        would_deny: eval.would_deny,
+    }
+}
+
+fn resolve_ask(config: &RunConfig<'_>) -> AskResolution {
+    if config.attendance == Attendance::Unattended {
+        return AskResolution::Unattended;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        prompt_for_ask(config.ask_timeout)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config.ask_timeout;
+        AskResolution::TimedOut
+    }
+}
+
 /// a `send` that tolerates the target dying first: ENOENT means the child is gone and
 /// its syscall never completes (case B); any other failure is fatal (fail closed).
 fn tolerate_dead(result: io::Result<()>) -> Result<(), RunError> {
@@ -112,6 +251,7 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
     kernel: &N,
     notif: &SeccompNotif,
     writer: &mut TraceWriter<S>,
+    config: &RunConfig<'_>,
     ts: u64,
 ) -> Result<Handled, RunError> {
     let sys_nr = notif.data.nr as u32;
@@ -126,8 +266,7 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
             notif,
             "foreign_abi",
             Fact::Raw {},
-            Decision::Deny,
-            rule::FOREIGN_ABI,
+            &fixed_decision(Decision::Deny, rule::FOREIGN_ABI),
         )?;
         tolerate_dead(kernel.send_error(notif.id, libc::ENOSYS))?;
         return Ok(Handled::Responded);
@@ -140,8 +279,7 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
             notif,
             name,
             Fact::Raw {},
-            Decision::Deny,
-            rule::IO_URING,
+            &fixed_decision(Decision::Deny, rule::IO_URING),
         )?;
         tolerate_dead(kernel.send_error(notif.id, libc::ENOSYS))?;
         return Ok(Handled::Responded);
@@ -149,19 +287,25 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
 
     // the filesystem families (syscalls.md sections 3.1-3.2): the recorded slice.
     if let Some(shape) = fs_shape(sys_nr) {
-        return handle_fs(kernel, notif, writer, ts, &shape);
+        return handle_fs(kernel, notif, writer, config, ts, &shape);
     }
 
     // execve/execveat: recorded with the same bracketed path read (Fact::Exec); the
     // allow is CONTINUE by rule 4 of syscalls.md section 4 in every mode.
     if sys_nr == nr::EXECVE || sys_nr == nr::EXECVEAT {
-        return handle_exec(kernel, notif, writer, ts, sys_nr);
+        return handle_exec(kernel, notif, writer, config, ts, sys_nr);
     }
 
-    // the remaining mediated families (clone, network, cross-process) are allowed
-    // scalar-CONTINUE without events in this slice; the interim FR-2 gap is named in
-    // trace.md section 2 and tracked as its own issue. nothing here reads child
-    // memory, so plain CONTINUE is rule 1 of the allow-realization rule.
+    if is_process_creation(sys_nr) {
+        return handle_process(kernel, notif, writer, config, ts, sys_nr);
+    }
+    if is_network(sys_nr) {
+        return handle_network(kernel, notif, writer, config, ts, sys_nr);
+    }
+    if is_cross_process(sys_nr) {
+        return handle_cross_process(kernel, notif, writer, config, ts, sys_nr);
+    }
+
     tolerate_dead(kernel.send_continue(notif.id))?;
     Ok(Handled::Responded)
 }
@@ -171,6 +315,7 @@ fn handle_fs<N: Notifier, S: TraceSink>(
     kernel: &N,
     notif: &SeccompNotif,
     writer: &mut TraceWriter<S>,
+    config: &RunConfig<'_>,
     ts: u64,
     shape: &FsShape,
 ) -> Result<Handled, RunError> {
@@ -207,17 +352,21 @@ fn handle_fs<N: Notifier, S: TraceSink>(
 
     match gathered {
         Ok((path, dest, access)) => {
-            let fact = Fact::Fs { path, access, dest };
-            record(
-                writer,
-                ts,
-                notif,
-                shape.name,
-                fact,
-                Decision::Allow,
-                rule::RECORD_ONLY,
-            )?;
-            tolerate_dead(kernel.send_continue(notif.id))?;
+            let path_text = path.to_string_lossy();
+            let decision = resolve_decision(
+                config,
+                &Request::Fs {
+                    path: &path_text,
+                    access: &access,
+                },
+            );
+            let fact = Fact::Fs {
+                path: path.clone(),
+                access: access.clone(),
+                dest: dest.clone(),
+            };
+            record(writer, ts, notif, shape.name, fact, &decision)?;
+            respond_continue_or_deny(kernel, notif.id, &decision)?;
             Ok(Handled::Responded)
         }
         // case C: a fact that cannot be trusted cannot be allowed (I4).
@@ -228,8 +377,7 @@ fn handle_fs<N: Notifier, S: TraceSink>(
                 notif,
                 shape.name,
                 Fact::Raw {},
-                Decision::Deny,
-                rule::MEMORY_READ,
+                &fixed_decision(Decision::Deny, rule::MEMORY_READ),
             )?;
             tolerate_dead(kernel.send_error(notif.id, libc::EACCES))?;
             Ok(Handled::Responded)
@@ -242,6 +390,7 @@ fn handle_exec<N: Notifier, S: TraceSink>(
     kernel: &N,
     notif: &SeccompNotif,
     writer: &mut TraceWriter<S>,
+    config: &RunConfig<'_>,
     ts: u64,
     sys_nr: u32,
 ) -> Result<Handled, RunError> {
@@ -275,16 +424,15 @@ fn handle_exec<N: Notifier, S: TraceSink>(
 
     match gathered {
         Ok(binary) => {
-            record(
-                writer,
-                ts,
-                notif,
-                name,
-                Fact::Exec { binary },
-                Decision::Allow,
-                rule::RECORD_ONLY,
-            )?;
-            tolerate_dead(kernel.send_continue(notif.id))?;
+            let binary_text = binary.to_string_lossy();
+            let decision = resolve_decision(
+                config,
+                &Request::Exec {
+                    binary: &binary_text,
+                },
+            );
+            record(writer, ts, notif, name, Fact::Exec { binary }, &decision)?;
+            respond_continue_or_deny(kernel, notif.id, &decision)?;
             Ok(Handled::Responded)
         }
         Err(_) => {
@@ -294,13 +442,265 @@ fn handle_exec<N: Notifier, S: TraceSink>(
                 notif,
                 name,
                 Fact::Raw {},
-                Decision::Deny,
-                rule::MEMORY_READ,
+                &fixed_decision(Decision::Deny, rule::MEMORY_READ),
             )?;
             tolerate_dead(kernel.send_error(notif.id, libc::EACCES))?;
             Ok(Handled::Responded)
         }
     }
+}
+
+fn handle_process<N: Notifier, S: TraceSink>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    writer: &mut TraceWriter<S>,
+    config: &RunConfig<'_>,
+    ts: u64,
+    sys_nr: u32,
+) -> Result<Handled, RunError> {
+    let name = syscall_name(sys_nr).unwrap_or("unknown");
+    let flags = if sys_nr == nr::CLONE {
+        Some(notif.data.args[0])
+    } else if sys_nr == nr::CLONE3 {
+        if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+            return Ok(Handled::Dropped);
+        }
+        let read = kernel.read_u64(notif.pid, notif.data.args[0]);
+        if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+            return Ok(Handled::Dropped);
+        }
+        match read {
+            Ok(flags) => Some(flags),
+            Err(_) => {
+                record(
+                    writer,
+                    ts,
+                    notif,
+                    name,
+                    Fact::Raw {},
+                    &fixed_decision(Decision::Deny, rule::MEMORY_READ),
+                )?;
+                tolerate_dead(kernel.send_error(notif.id, libc::EACCES))?;
+                return Ok(Handled::Responded);
+            }
+        }
+    } else {
+        None
+    };
+
+    record(
+        writer,
+        ts,
+        notif,
+        name,
+        Fact::Process { flags },
+        &fixed_decision(
+            Decision::Allow,
+            if config.mode == crate::recorder::Mode::RecordOnly {
+                rule::RECORD_ONLY
+            } else {
+                rule::PROCESS_CREATION
+            },
+        ),
+    )?;
+    tolerate_dead(kernel.send_continue(notif.id))?;
+    Ok(Handled::Responded)
+}
+
+fn handle_cross_process<N: Notifier, S: TraceSink>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    writer: &mut TraceWriter<S>,
+    config: &RunConfig<'_>,
+    ts: u64,
+    sys_nr: u32,
+) -> Result<Handled, RunError> {
+    let name = syscall_name(sys_nr).unwrap_or("unknown");
+    if sys_nr == nr::PIDFD_GETFD {
+        let decision = if config.mode == crate::recorder::Mode::RecordOnly {
+            fixed_decision(Decision::Allow, rule::RECORD_ONLY)
+        } else {
+            fixed_decision(Decision::Deny, rule::PIDFD_GETFD)
+        };
+        record(
+            writer,
+            ts,
+            notif,
+            name,
+            Fact::CrossProcess { target_pid: None },
+            &decision,
+        )?;
+        respond_continue_or_deny(kernel, notif.id, &decision)?;
+        return Ok(Handled::Responded);
+    }
+
+    let target_pid = match sys_nr {
+        nr::PTRACE => notif.data.args[1] as u32,
+        nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV => notif.data.args[0] as u32,
+        _ => 0,
+    };
+    let in_tree = target_pid == 0
+        || target_pid == notif.pid
+        || kernel
+            .process_in_tree(config.root_pid, target_pid)
+            .unwrap_or(false);
+    let decision = if config.mode == crate::recorder::Mode::RecordOnly {
+        fixed_decision(Decision::Allow, rule::RECORD_ONLY)
+    } else if in_tree {
+        fixed_decision(Decision::Allow, rule::PROCESS_TREE)
+    } else {
+        fixed_decision(Decision::Deny, rule::PROCESS_TREE_DENY)
+    };
+    record(
+        writer,
+        ts,
+        notif,
+        name,
+        Fact::CrossProcess {
+            target_pid: Some(target_pid),
+        },
+        &decision,
+    )?;
+    respond_continue_or_deny(kernel, notif.id, &decision)?;
+    Ok(Handled::Responded)
+}
+
+fn handle_network<N: Notifier, S: TraceSink>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    writer: &mut TraceWriter<S>,
+    config: &RunConfig<'_>,
+    ts: u64,
+    sys_nr: u32,
+) -> Result<Handled, RunError> {
+    let name = syscall_name(sys_nr).unwrap_or("unknown");
+    let (addr_arg, len_arg) = match sys_nr {
+        nr::CONNECT | nr::BIND => (1, 2),
+        nr::SENDTO => {
+            if notif.data.args[4] == 0 {
+                tolerate_dead(kernel.send_continue(notif.id))?;
+                return Ok(Handled::Responded);
+            }
+            (4, 5)
+        }
+        _ => unreachable!("network table checked before call"),
+    };
+    let len = match usize::try_from(notif.data.args[len_arg]) {
+        Ok(len) if len <= 128 => len,
+        _ => {
+            record_network_read_failure(kernel, notif, writer, config, ts, name)?;
+            return Ok(Handled::Responded);
+        }
+    };
+
+    if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+        return Ok(Handled::Dropped);
+    }
+    let sockaddr = kernel.read_bytes(notif.pid, notif.data.args[addr_arg], len);
+    if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+        return Ok(Handled::Dropped);
+    }
+    let (ip, port) = match sockaddr.and_then(parse_sockaddr) {
+        Ok(dest) => dest,
+        Err(_) => {
+            record_network_read_failure(kernel, notif, writer, config, ts, name)?;
+            return Ok(Handled::Responded);
+        }
+    };
+    let host = ip.to_string();
+    let decision = resolve_decision(
+        config,
+        &Request::Net {
+            ip,
+            hostname: None,
+            port,
+        },
+    );
+    record(writer, ts, notif, name, Fact::Net { host, port }, &decision)?;
+    respond_continue_or_deny(kernel, notif.id, &decision)?;
+    Ok(Handled::Responded)
+}
+
+fn record_network_read_failure<N: Notifier, S: TraceSink>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    writer: &mut TraceWriter<S>,
+    config: &RunConfig<'_>,
+    ts: u64,
+    name: &str,
+) -> Result<(), RunError> {
+    let decision = if config.mode == crate::recorder::Mode::RecordOnly {
+        fixed_decision(Decision::Allow, rule::RECORD_ONLY)
+    } else {
+        fixed_decision(Decision::Deny, rule::MEMORY_READ)
+    };
+    record(writer, ts, notif, name, Fact::Raw {}, &decision)?;
+    respond_continue_or_deny(kernel, notif.id, &decision)
+}
+
+fn respond_continue_or_deny<N: Notifier>(
+    kernel: &N,
+    id: u64,
+    decision: &ResolvedDecision,
+) -> Result<(), RunError> {
+    match decision.response_decision {
+        Decision::Allow => tolerate_dead(kernel.send_continue(id)),
+        Decision::Deny | Decision::Ask => tolerate_dead(kernel.send_error(id, libc::EACCES)),
+    }
+}
+
+fn parse_sockaddr(bytes: Vec<u8>) -> Result<(IpAddr, u16), MemReadError> {
+    if bytes.len() < 2 {
+        return Err(MemReadError::Short {
+            wanted: 2,
+            got: bytes.len(),
+        });
+    }
+    let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as i32;
+    match family {
+        libc::AF_INET => {
+            if bytes.len() < 8 {
+                return Err(MemReadError::Short {
+                    wanted: 8,
+                    got: bytes.len(),
+                });
+            }
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let ip = Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
+            Ok((IpAddr::V4(ip), port))
+        }
+        libc::AF_INET6 => {
+            if bytes.len() < 28 {
+                return Err(MemReadError::Short {
+                    wanted: 28,
+                    got: bytes.len(),
+                });
+            }
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let mut addr = [0u8; 16];
+            addr.copy_from_slice(&bytes[8..24]);
+            Ok((IpAddr::V6(Ipv6Addr::from(addr)), port))
+        }
+        _ => Err(MemReadError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported sockaddr family",
+        ))),
+    }
+}
+
+fn is_process_creation(sys_nr: u32) -> bool {
+    matches!(sys_nr, nr::CLONE | nr::FORK | nr::VFORK | nr::CLONE3)
+}
+
+fn is_network(sys_nr: u32) -> bool {
+    matches!(sys_nr, nr::CONNECT | nr::SENDTO | nr::BIND)
+}
+
+fn is_cross_process(sys_nr: u32) -> bool {
+    matches!(
+        sys_nr,
+        nr::PTRACE | nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV | nr::PIDFD_GETFD
+    )
 }
 
 /// read one path argument and anchor it per the record-only resolution rule
@@ -350,8 +750,7 @@ fn record<S: TraceSink>(
     notif: &SeccompNotif,
     name: &str,
     fact: Fact,
-    decision: Decision,
-    matched_rule: &str,
+    decision: &ResolvedDecision,
 ) -> Result<(), RunError> {
     writer.append(
         ts,
@@ -359,22 +758,23 @@ fn record<S: TraceSink>(
             pid: notif.pid,
             syscall: name.to_string(),
             fact,
-            decision,
-            ask_resolution: None,
-            matched_rule: matched_rule.to_string(),
-            would_deny: None,
+            decision: decision.event_decision,
+            ask_resolution: decision.ask_resolution,
+            matched_rule: decision.matched_rule.clone(),
+            would_deny: decision.would_deny,
         }),
     )?;
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
+use linux::prompt_for_ask;
+#[cfg(target_os = "linux")]
 pub use linux::run_loop;
 
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use crate::recorder::Mode;
     use crate::supervisor::mem::proc::ChildMem;
     use crate::supervisor::notify::NotifyFd;
     use crate::supervisor::spawn::SupervisedChild;
@@ -399,6 +799,9 @@ mod linux {
         fn read_path(&self, pid: u32, addr: u64) -> Result<Vec<u8>, MemReadError> {
             ChildMem::open(pid)?.read_path(addr)
         }
+        fn read_bytes(&self, pid: u32, addr: u64, len: usize) -> Result<Vec<u8>, MemReadError> {
+            ChildMem::open(pid)?.read_exact(addr, len)
+        }
         fn read_u64(&self, pid: u32, addr: u64) -> Result<u64, MemReadError> {
             let bytes = ChildMem::open(pid)?.read_exact(addr, 8)?;
             let mut raw = [0u8; 8];
@@ -412,6 +815,9 @@ mod linux {
             };
             std::fs::read_link(link)
         }
+        fn process_in_tree(&self, root: u32, target: u32) -> io::Result<bool> {
+            process_in_tree(root, target)
+        }
     }
 
     /// serve the notify fd until every process holding the filter has exited, then reap
@@ -420,15 +826,16 @@ mod linux {
     /// pending and future mediated syscall closed (case G).
     pub fn run_loop<S: TraceSink>(
         child: SupervisedChild,
-        mode: Mode,
+        config: RunConfig<'_>,
         writer: &mut TraceWriter<S>,
     ) -> Result<RunOutcome, RunError> {
-        if mode == Mode::Enforce {
-            // refusing to run is the fail-closed answer until the policy engine exists;
-            // the child is already spawned, so tear it down rather than leave it trapped
-            abort_run(&child);
-            return Err(RunError::UnsupportedMode);
-        }
+        let config = match config.validate() {
+            Ok(config) => config,
+            Err(e) => {
+                abort_run(&child);
+                return Err(e);
+            }
+        };
         let kernel = ProcNotifier {
             notify: &child.notify,
         };
@@ -462,7 +869,7 @@ mod linux {
                         return Err(RunError::Notify(e));
                     }
                 };
-                match handle_notification(&kernel, &notif, writer, now_ms()) {
+                match handle_notification(&kernel, &notif, writer, &config, now_ms()) {
                     Ok(_) => {}
                     Err(e) => {
                         // case E (or a dead fd): deny the pending action best-effort,
@@ -492,6 +899,74 @@ mod linux {
         // SAFETY: the pid is our forked child, still unreaped; SIGKILL then reap.
         unsafe { libc::kill(child.pid, libc::SIGKILL) };
         let _ = child.wait();
+    }
+
+    fn process_in_tree(root: u32, target: u32) -> io::Result<bool> {
+        let mut current = target;
+        for _ in 0..256 {
+            if current == root {
+                return Ok(true);
+            }
+            if current <= 1 {
+                return Ok(false);
+            }
+            current = parent_pid(current)?;
+        }
+        Ok(false)
+    }
+
+    fn parent_pid(pid: u32) -> io::Result<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+        for line in status.lines() {
+            if let Some(ppid) = line.strip_prefix("PPid:") {
+                return ppid
+                    .trim()
+                    .parse()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad PPid"));
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::InvalidData, "missing PPid"))
+    }
+
+    pub(super) fn prompt_for_ask(timeout: Duration) -> AskResolution {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+
+        let Ok(mut tty) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+        else {
+            return AskResolution::Denied;
+        };
+        if tty
+            .write_all(b"leash: allow requested action? [y/N] ")
+            .is_err()
+        {
+            return AskResolution::Denied;
+        }
+        let _ = tty.flush();
+
+        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let mut pfd = libc::pollfd {
+            fd: tty.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll reads and writes one pollfd we own.
+        let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+        if rc == 0 {
+            return AskResolution::TimedOut;
+        }
+        if rc < 0 {
+            return AskResolution::Denied;
+        }
+
+        let mut byte = [0u8; 1];
+        match tty.read(&mut byte) {
+            Ok(1) if byte[0] == b'y' || byte[0] == b'Y' => AskResolution::Approved,
+            Ok(_) | Err(_) => AskResolution::Denied,
+        }
     }
 
     /// wall-clock milliseconds for the event envelope; the clock going backwards past
@@ -573,6 +1048,19 @@ mod tests {
                 None => Err(MemReadError::Io(io::Error::other("unmapped"))),
             }
         }
+        fn read_bytes(&self, _pid: u32, addr: u64, len: usize) -> Result<Vec<u8>, MemReadError> {
+            let bytes = self
+                .mem
+                .get(&addr)
+                .ok_or_else(|| MemReadError::Io(io::Error::other("unmapped")))?;
+            if bytes.len() < len {
+                return Err(MemReadError::Short {
+                    wanted: len,
+                    got: bytes.len(),
+                });
+            }
+            Ok(bytes[..len].to_vec())
+        }
         fn read_u64(&self, _pid: u32, addr: u64) -> Result<u64, MemReadError> {
             let bytes = self
                 .mem
@@ -591,6 +1079,9 @@ mod tests {
                     .map(PathBuf::from)
                     .ok_or_else(|| io::Error::other("no such fd")),
             }
+        }
+        fn process_in_tree(&self, root: u32, target: u32) -> io::Result<bool> {
+            Ok(root == target || target == 4242)
         }
     }
 
@@ -640,6 +1131,27 @@ mod tests {
 
     fn writer() -> TraceWriter<ScriptedSink> {
         TraceWriter::new(ScriptedSink::default())
+    }
+
+    fn policy(text: &str) -> Policy {
+        Policy::parse(
+            text,
+            &crate::policy::ExpandContext {
+                workspace: "/work",
+                home: "/home/op",
+            },
+        )
+        .unwrap()
+    }
+
+    fn handle_notification<N: Notifier, S: TraceSink>(
+        kernel: &N,
+        notif: &SeccompNotif,
+        writer: &mut TraceWriter<S>,
+        ts: u64,
+    ) -> Result<Handled, RunError> {
+        let config = RunConfig::record_only(notif.pid, Attendance::Unattended);
+        super::handle_notification(kernel, notif, writer, &config, ts)
     }
 
     fn events(writer: TraceWriter<ScriptedSink>) -> Vec<Value> {
@@ -919,18 +1431,88 @@ mod tests {
     }
 
     #[test]
-    fn non_fs_mediated_syscalls_continue_silently_in_this_slice() {
+    fn process_and_cross_process_syscalls_record_typed_facts() {
         let kernel = FakeNotifier::default();
         let mut w = writer();
-        for n in [nr::CLONE, nr::CONNECT, nr::PTRACE] {
+        for n in [nr::CLONE, nr::PTRACE, nr::PIDFD_GETFD] {
             handle_notification(&kernel, &notif(n, [0; 6]), &mut w, 1_000).unwrap();
         }
         assert_eq!(kernel.sent().len(), 3);
         assert!(kernel.sent().iter().all(|s| s.starts_with("continue:")));
-        assert!(
-            events(w).is_empty(),
-            "their typed facts are the follow-up issue"
+        let evs = events(w);
+        assert_eq!(evs[0]["fact"]["family"], "process");
+        assert_eq!(evs[0]["fact"]["flags"], 0);
+        assert_eq!(evs[1]["fact"]["family"], "cross_process");
+        assert_eq!(evs[1]["fact"]["target_pid"], 0);
+        assert_eq!(evs[2]["fact"]["family"], "cross_process");
+        assert!(evs[2]["fact"]["target_pid"].is_null());
+        assert_eq!(evs[2]["decision"], "allow");
+        assert_eq!(evs[2]["matched_rule"], rule::RECORD_ONLY);
+    }
+
+    #[test]
+    fn network_unreadable_sockaddr_records_raw_and_allows_in_record_only() {
+        let kernel = FakeNotifier::default();
+        let mut w = writer();
+        handle_notification(
+            &kernel,
+            &notif(nr::CONNECT, [3, 0xdead, 16, 0, 0, 0]),
+            &mut w,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(kernel.sent(), vec!["continue:7"]);
+        let ev = &events(w)[0];
+        assert_eq!(ev["syscall"], "connect");
+        assert_eq!(ev["fact"]["family"], "raw");
+        assert_eq!(ev["decision"], "allow");
+        assert_eq!(ev["matched_rule"], rule::RECORD_ONLY);
+    }
+
+    #[test]
+    fn enforce_unmatched_outside_fs_denies_by_default() {
+        let kernel = FakeNotifier::default().with_cstr(0x1000, "/etc/hosts");
+        let p = policy("schema_version = 1\n");
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p);
+        let mut w = writer();
+        super::handle_notification(
+            &kernel,
+            &notif(nr::OPENAT, [flags::AT_FDCWD, 0x1000, 0, 0, 0, 0]),
+            &mut w,
+            &config,
+            1_000,
+        )
+        .unwrap();
+
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        let ev = &events(w)[0];
+        assert_eq!(ev["decision"], "deny");
+        assert_eq!(ev["matched_rule"], "base:enforce");
+    }
+
+    #[test]
+    fn unattended_ask_records_ask_and_denies() {
+        let kernel = FakeNotifier::default().with_cstr(0x1000, "/etc/hosts");
+        let p = policy(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/etc/**\"\nmode=[\"read\"]\naction=\"ask\"\n",
         );
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p);
+        let mut w = writer();
+        super::handle_notification(
+            &kernel,
+            &notif(nr::OPENAT, [flags::AT_FDCWD, 0x1000, 0, 0, 0, 0]),
+            &mut w,
+            &config,
+            1_000,
+        )
+        .unwrap();
+
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        let ev = &events(w)[0];
+        assert_eq!(ev["decision"], "ask");
+        assert_eq!(ev["ask_resolution"], "unattended");
+        assert_eq!(ev["matched_rule"], "fs.1");
     }
 
     #[test]

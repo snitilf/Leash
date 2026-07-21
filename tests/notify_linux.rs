@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use leash::recorder::{Mode, TraceSink, TraceWriter};
-use leash::supervisor::run::{RunError, run_loop};
+use leash::recorder::{Attendance, Mode, TraceSink, TraceWriter};
+use leash::supervisor::run::{RunConfig, RunError, run_loop};
 use leash::supervisor::spawn::{SpawnSpec, spawn_supervised};
 use serde_json::Value;
 
@@ -163,6 +163,58 @@ fn agent_dispatch() {
             });
         }
     }
+
+    if std::env::var_os("LEASH_NOTIFY_PROCESS_AGENT").is_some() {
+        // SAFETY: the raw fork syscall and waitpid operate on this process and its direct
+        // child. `_exit` avoids running non-async-signal-safe cleanup in the forked child.
+        unsafe {
+            let raw_pid = libc::syscall(libc::SYS_fork);
+            if raw_pid == 0 {
+                libc::_exit(0);
+            }
+            if raw_pid < 0 {
+                std::process::exit(15);
+            }
+            let pid = raw_pid as libc::pid_t;
+            let mut status = 0;
+            let waited = libc::waitpid(pid, &mut status, 0);
+            std::process::exit(if waited == pid && libc::WIFEXITED(status) {
+                0
+            } else {
+                16
+            });
+        }
+    }
+
+    if std::env::var_os("LEASH_NOTIFY_CONNECT_AGENT").is_some() {
+        // SAFETY: socket/connect/close use scalar arguments and a sockaddr we own.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            if fd < 0 {
+                std::process::exit(17);
+            }
+            let addr = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 9u16.to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                },
+                sin_zero: [0; 8],
+            };
+            let rc = libc::connect(
+                fd,
+                (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+                size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            let errno = io::Error::last_os_error().raw_os_error();
+            libc::close(fd);
+            std::process::exit(if rc == -1 && errno == Some(libc::ECONNREFUSED) {
+                0
+            } else {
+                18
+            });
+        }
+    }
     // no trigger: a normal test run, nothing to do.
 }
 
@@ -274,7 +326,8 @@ fn serve_agent(envs: &[(&str, &str)], sink: MemSink) -> (Result<i32, RunError>, 
 
     let _watchdog = Watchdog::arm(child.pid);
     let mut writer = TraceWriter::new(sink);
-    let result = run_loop(child, Mode::RecordOnly, &mut writer);
+    let config = RunConfig::record_only(child.pid as u32, Attendance::Unattended);
+    let result = run_loop(child, config, &mut writer);
 
     let events: Vec<Value> = String::from_utf8(writer.into_inner().bytes)
         .unwrap()
@@ -315,7 +368,8 @@ fn run_loop_serves_a_trivial_agent_to_exit() {
     let _watchdog = Watchdog::arm(child.pid);
 
     let mut writer = TraceWriter::new(MemSink::default());
-    let outcome = run_loop(child, Mode::RecordOnly, &mut writer).expect("loop must serve to exit");
+    let config = RunConfig::record_only(child.pid as u32, Attendance::Unattended);
+    let outcome = run_loop(child, config, &mut writer).expect("loop must serve to exit");
     assert_eq!(exited_with(outcome.wait_status), Some(0));
 
     let events: Vec<Value> = String::from_utf8(writer.into_inner().bytes)
@@ -539,10 +593,44 @@ fn io_uring_setup_is_denied_and_recorded_in_record_only() {
     assert_eq!(denies[0]["fact"]["family"], "raw");
 }
 
-/// enforce mode without a policy engine must refuse to run (fail closed), not fall
+#[test]
+fn process_creation_appears_as_typed_event() {
+    let _g = spawn_guard();
+    let (result, events) = serve_agent(&[("LEASH_NOTIFY_PROCESS_AGENT", "1")], MemSink::default());
+    assert_eq!(
+        exited_with(result.expect("loop must complete")),
+        Some(0),
+        "the agent must fork and wait successfully"
+    );
+
+    let forks = syscall_events(&events, "fork");
+    assert_eq!(forks.len(), 1, "{events:?}");
+    assert_eq!(forks[0]["fact"]["family"], "process");
+    assert_eq!(forks[0]["decision"], "allow");
+}
+
+#[test]
+fn connect_appears_as_typed_net_event() {
+    let _g = spawn_guard();
+    let (result, events) = serve_agent(&[("LEASH_NOTIFY_CONNECT_AGENT", "1")], MemSink::default());
+    assert_eq!(
+        exited_with(result.expect("loop must complete")),
+        Some(0),
+        "the agent must observe the kernel's loopback refusal after CONTINUE"
+    );
+
+    let connects = syscall_events(&events, "connect");
+    assert_eq!(connects.len(), 1, "{events:?}");
+    assert_eq!(connects[0]["fact"]["family"], "net");
+    assert_eq!(connects[0]["fact"]["host"], "127.0.0.1");
+    assert_eq!(connects[0]["fact"]["port"], 9);
+    assert_eq!(connects[0]["decision"], "allow");
+}
+
+/// enforce mode without a loaded policy must refuse to run (fail closed), not fall
 /// through to record-only behavior.
 #[test]
-fn enforce_mode_is_refused_until_the_policy_engine_exists() {
+fn enforce_mode_without_policy_is_refused() {
     let _g = spawn_guard();
     let child = spawn_supervised(&SpawnSpec {
         argv: vec!["/bin/true".into()],
@@ -555,8 +643,15 @@ fn enforce_mode_is_refused_until_the_policy_engine_exists() {
     let _watchdog = Watchdog::arm(pid);
 
     let mut writer = TraceWriter::new(MemSink::default());
-    let result = run_loop(child, Mode::Enforce, &mut writer);
-    assert!(matches!(result, Err(RunError::UnsupportedMode)));
+    let config = RunConfig {
+        mode: Mode::Enforce,
+        policy: None,
+        attendance: Attendance::Unattended,
+        ask_timeout: Duration::from_secs(60),
+        root_pid: pid as u32,
+    };
+    let result = run_loop(child, config, &mut writer);
+    assert!(matches!(result, Err(RunError::EnforceWithoutPolicy)));
     // the refused run must not leave the child running or unreaped
     // SAFETY: kill/waitpid on the child we spawned; ESRCH means it is already gone.
     unsafe {
