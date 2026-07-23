@@ -55,7 +55,8 @@ The child's pointer arguments are the whole TOCTOU problem (SR-2, I4). The rules
   The caps, fixed at slate 2, are the kernel's own limits: 4096 bytes for a path (`PATH_MAX`), 128 bytes for a `sockaddr` (`sizeof(struct sockaddr_storage)`), the current kernel struct size for `clone_args` (and likewise for `openat2`'s `open_how`, read under the same struct-size rule), and one page as the absolute ceiling for any read.
   An unbounded or attacker-chosen length is a denial-of-service on the single decision thread.
   A malformed or over-cap path or `clone_args` resolves to deny (section 4, case C), because the trusted fact cannot be built.
-  A malformed or over-cap network address is the mode-specific exception recorded in [`trace.md`](trace.md) section 2: record-only records a raw allow, while enforce records a raw fail-closed deny.
+  By the recorded decision of 2026-07-23 (the issue #26 hygiene pass), a malformed or over-cap network address is the one mode-specific arc in this enumeration, matching the network-fact rule already fixed in [`trace.md`](trace.md) section 2: record-only records a raw allow, while enforce records a raw fail-closed deny.
+  The asymmetry is ADR-0010, not a softening of I3: record-only enforces nothing outside the denied-and-recorded set, so denying there would deny an action the mode never claimed to constrain.
 - The value read is used once, to build the typed fact, and for a pointer-argument allow it is never
   handed back to the child as a re-editable argument. That is why the allow-realization rule
   (section 3) forbids `CONTINUE` for pointer-argument decisions: `CONTINUE` re-reads child memory at
@@ -89,7 +90,7 @@ syscall never took effect, so it records none.
 |---|---|---|---|
 | A | `NOTIF_RECV` returns `EINTR` | retry the receive | no notification was dequeued; nothing is pending release |
 | B | `ID_VALID` fails, or `RECV`/`SEND` reports the notification dead (the child exited, or a fatal signal is ending it) | drop the notification, continue | the child's syscall does not complete; there is nothing to release to a dead or dying process |
-| C | child-memory read fails, or exceeds the size cap | deny (`SEND` an errno, e.g. `EACCES`) | a fact that cannot be trusted cannot be allowed (I4) |
+| C | child-memory read fails, or exceeds the size cap | deny (`SEND` an errno, e.g. `EACCES`), except a network address in **record-only**, which records a `raw` allow (section 2, amended 2026-07-23 for #26) | a fact that cannot be trusted cannot be allowed (I4); in record-only nothing outside the denied-and-recorded set is enforced (ADR-0010), so the untrusted network fact is recorded raw rather than denied, and the arc is fail-closed wherever enforcement is claimed |
 | D | the `policy` engine cannot decide | impossible by construction: the engine is total and returns a decision for every fact; deny-by-default is the base rule in **enforce** mode (FR-19) | there is no undecided fact |
 | E | the recorder write fails | deny this action, then abort the run and tear down | no allow the supervisor cannot record (section 3, FR-3) |
 | F | an **ask** reaches its timeout (FR-10), or the run is unattended (FR-20) | deny | timeout-to-deny and unattended-to-deny are the specified behaviors |

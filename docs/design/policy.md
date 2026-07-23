@@ -112,8 +112,19 @@ Pinned by the recorded decisions of 2026-07-13:
   `*.example.com` matches `api.example.com` and never `example.com`. Covering the apex takes one
   additional exact rule.
 - Hostname matching is case-insensitive. Port 0 is a load-time rejection.
+
+Amended by the recorded decision of 2026-07-23 (the issue #26 hygiene pass surfaced the dual-stack
+gap):
+
 - An IPv4-mapped IPv6 destination (`::ffff:a.b.c.d`) is normalized to IPv4 before it is recorded or evaluated.
-  This makes an IPv4 literal or CIDR rule apply consistently to the same destination reached through an IPv4 or dual-stack socket; native IPv6 destinations remain IPv6.
+  This makes an IPv4 literal or CIDR rule apply consistently to the same destination reached through an IPv4 or a dual-stack socket; a native IPv6 destination stays IPv6.
+- A rule `host` written in mapped form is normalized at load time by the same rule, so both sides of the comparison are canonical.
+  `::ffff:1.2.3.4` loads as `1.2.3.4`, and a mapped CIDR of `/96` or longer loads as the IPv4 block it covers (`::ffff:0:0/96` as `0.0.0.0/0`, `::ffff:1.2.3.0/120` as `1.2.3.0/24`).
+  Normalizing the destination alone would leave a mapped-form rule that can never match, which in a `deny` rule is a boundary the operator believes exists and does not: the same silent under-match section 2.1 rejects brace and class syntax to avoid.
+- A mapped-form CIDR shorter than `/96` is a load-time rejection.
+  It spans addresses outside the mapped block, so no single normalized form carries its intent, and section 4 rejects rather than guesses.
+- Both normalizations are pinned here ahead of the code.
+  This is the first, documentation-only PR of the two-PR issue #26 sequence; the implementing seams (the `sockaddr` parse in the notify loop and `host` parsing in the policy loader) land in the subsequent issue #26 PR, and until they do a mapped destination is still recorded and evaluated as IPv6.
 
 ### 2.3 One execution control (fixed at slate 2)
 
@@ -205,6 +216,8 @@ only hard refusal is below the kernel floor (ADR-0012).
 - Host matching: exact hostname, `*.suffix` wildcard, IP, and CIDR; hostname rules enforced by
   supervisor-side resolution against the connected address (section 2.2), with the
   name-versus-address gap named as a residual in [`escapes.md`](escapes.md).
+  Amended by the recorded decision of 2026-07-23 for issue #26: IPv4-mapped IPv6 forms are
+  normalized to IPv4 on both the destination and the rule side (section 2.2).
 - Execution control has one spelling, the `exec` table (section 2.3).
 
 The [`README.md`](README.md) open-parameters table records these as closed.

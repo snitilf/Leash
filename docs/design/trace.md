@@ -69,8 +69,9 @@ Fact details fixed by the notify loop:
   optional `dest` field alongside `path`; single-path facts omit it.
 - An event whose decision was made without a trusted typed fact carries the `raw` fact family with
   no fields: the denied-and-recorded set ([`syscalls.md`](syscalls.md) section 5), and a case-C
-  deny where the pointer argument could not be read within its cap
-  ([`notify-loop.md`](notify-loop.md) section 4). The envelope's `syscall` field still names the
+  event where the pointer argument could not be read within its cap
+  ([`notify-loop.md`](notify-loop.md) section 4), which is a deny except for the record-only
+  network allow fixed below. The envelope's `syscall` field still names the
   call, which is the recordable substance of those events.
 - A process-creation fact carries optional `flags`.
   `clone` and `clone3` fill it from the kernel-trusted scalar or bounded `clone_args` read; `fork` and `vfork` omit it.
