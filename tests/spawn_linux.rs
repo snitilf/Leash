@@ -240,8 +240,8 @@ fn spawned_childs_execve_is_the_first_mediated_event() {
 }
 
 /// acceptance 2 (I1): a grandchild spawned via sh -c is mediated exactly as the agent is.
-/// partial evidence for the escapes.md laundering row; the forbidden-and-denied half
-/// completes when enforce mode and the policy engine land (#25).
+/// This is the process-inheritance half of the escapes.md laundering row; enforce-mode
+/// policy tests cover the forbidden-and-denied half.
 #[test]
 fn grandchild_via_sh_dash_c_traps_identically() {
     let _g = spawn_guard();
@@ -296,7 +296,7 @@ fn live_addfd_injects_a_supervisor_opened_fd() {
                 let file = std::fs::File::create(&target_path).unwrap();
                 let fd: OwnedFd = file.into();
                 notify
-                    .send_addfd(n.id, fd.as_fd(), SECCOMP_ADDFD_FLAG_SEND)
+                    .send_addfd(n.id, fd.as_fd(), SECCOMP_ADDFD_FLAG_SEND, 0)
                     .expect("live addfd with ADDFD_FLAG_SEND must succeed");
                 injected_fds.push(fd);
                 injected = true;
@@ -408,6 +408,24 @@ fn setup_failure_aborts_nonzero_before_the_agent_runs() {
                 Some(0),
                 "the child must abort non-zero"
             );
+        }
+        other => panic!("expected ChildSetup, got {other:?}"),
+    }
+}
+
+#[test]
+fn invalid_landlock_ruleset_aborts_before_agent_exec() {
+    let _g = spawn_guard();
+    let spec = SpawnSpec {
+        argv: vec!["/bin/true".into()],
+        stdout: None,
+        mode: Mode::Enforce,
+        landlock_ruleset: Some(-1),
+    };
+    let err = spawn_supervised(&spec).expect_err("invalid Landlock fd must abort setup");
+    match err {
+        SpawnError::ChildSetup { status } => {
+            assert_ne!(exited_with(status), Some(0));
         }
         other => panic!("expected ChildSetup, got {other:?}"),
     }

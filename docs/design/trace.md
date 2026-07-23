@@ -62,11 +62,16 @@ A `syscall` event, the common case, adds:
 | `ask_resolution` | present only for an `ask`: `approved`, `denied`, `timed_out`, or `unattended` |
 | `matched_rule` | the id of the policy rule that decided it, or the base rule ([`policy.md`](policy.md)) |
 | `would_deny` | present in record-only when a present policy would have denied (ADR-0010) |
+| `operand_decisions` | present for enforce-mode two-path filesystem operations; one independent `path`/`dest` decision and matched-rule id per required access mode |
 
 Fact details fixed by the notify loop:
 
 - A two-path filesystem fact (`rename`, `link`, `symlink` families) carries the second path in an
   optional `dest` field alongside `path`; single-path facts omit it.
+  In enforce mode `operand_decisions` records the independent evidence for each operand that is
+  actually authorized.
+  For symlink creation only `dest` appears because `path` is stored link text, not a resource
+  Leash accesses.
 - An event whose decision was made without a trusted typed fact carries the `raw` fact family with
   no fields: the denied-and-recorded set ([`syscalls.md`](syscalls.md) section 5), and a case-C
   event where the pointer argument could not be read within its cap

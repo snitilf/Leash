@@ -12,8 +12,10 @@ use std::io;
 
 /// cap for a path read: PATH_MAX (notify-loop.md section 2).
 pub const PATH_READ_CAP: usize = 4096;
-/// the absolute ceiling for any single child-memory read: one page.
-pub const ABSOLUTE_READ_CAP: usize = 4096;
+/// maximum destination-bearing send payload copied for broker realization (ADR-0020).
+pub const NETWORK_PAYLOAD_CAP: usize = 65_535;
+/// absolute ceiling for a fixed-size child-memory read.
+pub const ABSOLUTE_READ_CAP: usize = NETWORK_PAYLOAD_CAP;
 /// bytes of `struct open_how` the loop needs: the leading u64 `flags` field.
 pub const OPEN_HOW_FLAGS_SIZE: usize = 8;
 
@@ -225,9 +227,9 @@ mod tests {
     fn the_absolute_ceiling_bounds_any_requested_cap() {
         let mem = FakeMem {
             base: 0x1000,
-            bytes: vec![b'a'; 16384],
+            bytes: vec![b'a'; ABSOLUTE_READ_CAP + 1],
         };
-        match read_str(&mem, 0x1000, 16384) {
+        match read_str(&mem, 0x1000, ABSOLUTE_READ_CAP + 1) {
             Err(MemReadError::NoNulWithinCap(cap)) => assert_eq!(cap, ABSOLUTE_READ_CAP),
             other => panic!("expected NoNulWithinCap at the ceiling, got {other:?}"),
         }

@@ -19,7 +19,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::recorder::Mode;
-use crate::sandbox::child::{self, ChildSetup, SUPERVISOR_ACK, SockFprog};
+use crate::sandbox::child::{self, CHILD_BOUNDARY_READY, ChildSetup, SUPERVISOR_ACK, SockFprog};
 use crate::sandbox::filter::{SockFilter, build_filter};
 use crate::supervisor::notify::NotifyFd;
 
@@ -166,6 +166,21 @@ fn parent_handshake(
         drop(notify_fd);
         let _ = reap(pid);
         return Err(SpawnError::Handshake(io::Error::last_os_error()));
+    }
+    let mut boundary_ready = [0u8; 1];
+    // SAFETY: read writes one byte into local storage. EOF means child setup failed
+    // after listener handoff, most notably while applying Landlock.
+    let n = unsafe {
+        libc::read(
+            supervisor_sock.as_raw_fd(),
+            boundary_ready.as_mut_ptr().cast(),
+            boundary_ready.len(),
+        )
+    };
+    if n != 1 || boundary_ready[0] != CHILD_BOUNDARY_READY {
+        drop(notify_fd);
+        let status = reap(pid).unwrap_or(-1);
+        return Err(SpawnError::ChildSetup { status });
     }
 
     let notify = NotifyFd::new(notify_fd).map_err(SpawnError::Handshake)?;

@@ -156,6 +156,35 @@ pub struct SyscallEvent {
     /// present in record-only when a present policy would have denied (ADR-0010)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub would_deny: Option<bool>,
+    /// independent policy evidence for each authorized operand of a two-path operation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operand_decisions: Option<Vec<FsOperandDecision>>,
+}
+
+/// Policy evidence for one operand of a two-path filesystem operation.
+#[derive(Debug, Clone, Serialize)]
+pub struct FsOperandDecision {
+    /// Whether this evidence applies to the primary path or destination.
+    pub operand: FsOperand,
+    /// Required access mode evaluated independently for this operand.
+    pub access: FsAccess,
+    /// Policy decision for this operand and access mode.
+    pub decision: Decision,
+    /// Ask resolution when the operand matched an ask rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_resolution: Option<AskResolution>,
+    /// Policy rule that decided this operand.
+    pub matched_rule: String,
+}
+
+/// Operand names used by [`FsOperandDecision`].
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsOperand {
+    /// The primary `path` field.
+    Path,
+    /// The `dest` field.
+    Dest,
 }
 
 /// the typed fact a decision was made on: resolved path, host and port, or binary,
@@ -490,6 +519,7 @@ mod tests {
                 ask_resolution: None,
                 matched_rule: "base:workspace".into(),
                 would_deny: None,
+                operand_decisions: None,
             }),
         };
         assert_eq!(
@@ -528,6 +558,22 @@ mod tests {
                 ask_resolution: None,
                 matched_rule: "base:record_only".into(),
                 would_deny: None,
+                operand_decisions: Some(vec![
+                    FsOperandDecision {
+                        operand: FsOperand::Path,
+                        access: FsAccess::Delete,
+                        decision: Decision::Allow,
+                        ask_resolution: None,
+                        matched_rule: "base:workspace".into(),
+                    },
+                    FsOperandDecision {
+                        operand: FsOperand::Dest,
+                        access: FsAccess::Create,
+                        decision: Decision::Deny,
+                        ask_resolution: None,
+                        matched_rule: "base:enforce".into(),
+                    },
+                ]),
             }),
         };
         assert_eq!(
@@ -538,6 +584,23 @@ mod tests {
                 "access": ["write"],
                 "dest": "/home/op/project/b.txt"
             })
+        );
+        assert_eq!(
+            as_value(&event)["operand_decisions"],
+            json!([
+                {
+                    "operand": "path",
+                    "access": "delete",
+                    "decision": "allow",
+                    "matched_rule": "base:workspace"
+                },
+                {
+                    "operand": "dest",
+                    "access": "create",
+                    "decision": "deny",
+                    "matched_rule": "base:enforce"
+                }
+            ])
         );
     }
 
@@ -554,6 +617,7 @@ mod tests {
                 ask_resolution: None,
                 matched_rule: "sr4:io_uring".into(),
                 would_deny: None,
+                operand_decisions: None,
             }),
         };
         assert_eq!(as_value(&event)["fact"], json!({ "family": "raw" }));
@@ -577,6 +641,7 @@ mod tests {
                 ask_resolution: Some(AskResolution::TimedOut),
                 matched_rule: "net.2".into(),
                 would_deny: Some(true),
+                operand_decisions: None,
             }),
         };
         assert_eq!(

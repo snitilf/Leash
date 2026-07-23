@@ -16,24 +16,62 @@
 //! only consumer is the unit tests, hence the scoped dead-code allow.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+#[cfg(target_os = "linux")]
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsFd, FromRawFd};
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::policy::{Evaluation, Policy, Request};
+#[cfg(target_os = "linux")]
+use crate::recorder::FsOperand;
 use crate::recorder::{
-    AskResolution, Attendance, Decision, EventBody, Fact, RecorderError, SyscallEvent, TraceSink,
-    TraceWriter,
+    AskResolution, Attendance, Decision, EventBody, Fact, FsOperandDecision, RecorderError,
+    SyscallEvent, TraceSink, TraceWriter,
 };
 use crate::sandbox::filter::{AUDIT_ARCH_X86_64, DENIED_RECORDED, X32_SYSCALL_BIT, nr};
+#[cfg(target_os = "linux")]
+use crate::supervisor::broker::{
+    BrokerResult, BrokerResultOrPath, MutationOperation, NetworkOperation,
+};
 use crate::supervisor::fact::{AccessSpec, FsShape, PathArg, flags, fs_shape, syscall_name};
 use crate::supervisor::mem::MemReadError;
+#[cfg(target_os = "linux")]
+use crate::supervisor::notify::SECCOMP_ADDFD_FLAG_SEND;
 use crate::supervisor::notify::SeccompNotif;
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(60);
 const CLONE_ARGS_MIN_SIZE: u64 = 8;
 const CLONE_ARGS_MAX_SIZE: u64 = 88;
+const OPEN_HOW_SIZE: usize = 24;
+
+#[derive(Debug, Clone)]
+enum FsInvocation {
+    Open {
+        flags: u64,
+        mode: u32,
+        unsupported_errno: Option<i32>,
+    },
+    Mutation(MutationInvocation),
+}
+
+#[derive(Debug, Clone)]
+enum MutationInvocation {
+    Truncate { length: i64 },
+    Rename { flags: u32 },
+    Mkdir { mode: u32 },
+    Unlink { flags: i32 },
+    Link { flags: i32 },
+    Symlink { target: Vec<u8> },
+    Chmod { mode: u32 },
+    Chown { uid: u32, gid: u32, flags: i32 },
+}
 
 /// matched-rule ids for a policy-less run (trace.md section 2).
 pub mod rule {
@@ -53,6 +91,8 @@ pub mod rule {
     pub const PROCESS_TREE_DENY: &str = "failsafe:process_tree";
     /// the pidfd_getfd unconditional deny (SR-4, ADR-0019)
     pub const PIDFD_GETFD: &str = "sr4:pidfd_getfd";
+    /// broker path preparation or realization refused the operand
+    pub const REALIZATION: &str = "failsafe:realization";
 }
 
 /// how the run ended.
@@ -73,12 +113,16 @@ pub enum RunError {
     /// the notify fd itself failed outside the per-notification arcs.
     #[error("notify fd failed: {0}")]
     Notify(#[source] io::Error),
-    /// enforce mode is not yet safe to serve; refusing is the fail-closed answer.
-    #[error("enforce mode is not implemented (needs safe allow realization)")]
-    UnsupportedMode,
+    /// enforce mode reached the loop without its confined realization broker.
+    #[error("enforce mode requires a confined realization broker")]
+    MissingBroker,
     /// enforce mode reached the loop without a loaded policy.
     #[error("enforce mode requires a loaded policy")]
     EnforceWithoutPolicy,
+    /// the confined side-effect broker failed, so the run aborts fail-closed.
+    #[cfg(target_os = "linux")]
+    #[error("confined realization broker failed: {0}")]
+    Broker(#[from] crate::supervisor::broker::BrokerError),
 }
 
 /// immutable inputs for one notify-loop run.
@@ -94,6 +138,11 @@ pub struct RunConfig<'a> {
     pub ask_timeout: Duration,
     /// root of the supervised process tree
     pub root_pid: u32,
+    /// confined side-effect broker; required in enforce mode
+    #[cfg(target_os = "linux")]
+    pub broker: Option<&'a RefCell<crate::supervisor::broker::Broker>>,
+    /// pre-resolved exact hostname rules
+    pub resolved_hosts: Option<&'a HashMap<String, Vec<IpAddr>>>,
 }
 
 impl<'a> RunConfig<'a> {
@@ -105,6 +154,9 @@ impl<'a> RunConfig<'a> {
             attendance,
             ask_timeout: ASK_TIMEOUT,
             root_pid,
+            #[cfg(target_os = "linux")]
+            broker: None,
+            resolved_hosts: None,
         }
     }
 
@@ -116,6 +168,29 @@ impl<'a> RunConfig<'a> {
             attendance,
             ask_timeout: ASK_TIMEOUT,
             root_pid,
+            #[cfg(target_os = "linux")]
+            broker: None,
+            resolved_hosts: None,
+        }
+    }
+
+    /// enforce with the confined broker and pre-resolved hostname cache.
+    #[cfg(target_os = "linux")]
+    pub fn enforce_with_broker(
+        root_pid: u32,
+        attendance: Attendance,
+        policy: &'a Policy,
+        broker: &'a RefCell<crate::supervisor::broker::Broker>,
+        resolved_hosts: &'a HashMap<String, Vec<IpAddr>>,
+    ) -> Self {
+        Self {
+            mode: crate::recorder::Mode::Enforce,
+            policy: Some(policy),
+            attendance,
+            ask_timeout: ASK_TIMEOUT,
+            root_pid,
+            broker: Some(broker),
+            resolved_hosts: Some(resolved_hosts),
         }
     }
 
@@ -123,8 +198,9 @@ impl<'a> RunConfig<'a> {
         if self.mode == crate::recorder::Mode::Enforce && self.policy.is_none() {
             return Err(RunError::EnforceWithoutPolicy);
         }
-        if self.mode == crate::recorder::Mode::Enforce {
-            return Err(RunError::UnsupportedMode);
+        #[cfg(target_os = "linux")]
+        if self.mode == crate::recorder::Mode::Enforce && self.broker.is_none() {
+            return Err(RunError::MissingBroker);
         }
         Ok(self)
     }
@@ -140,6 +216,18 @@ pub(crate) trait Notifier {
     fn send_continue(&self, id: u64) -> io::Result<()>;
     /// fail the trapped syscall with an errno.
     fn send_error(&self, id: u64, errno: i32) -> io::Result<()>;
+    /// complete the trapped syscall with a successful scalar value.
+    fn send_success(&self, id: u64, value: i64) -> io::Result<()>;
+    /// atomically inject an fd and complete an fd-returning syscall.
+    fn send_addfd(
+        &self,
+        id: u64,
+        srcfd: BorrowedFd<'_>,
+        flags: u32,
+        newfd_flags: u32,
+    ) -> io::Result<i32>;
+    /// duplicate one descriptor from the trapped process.
+    fn duplicate_fd(&self, pid: u32, target_fd: RawFd) -> io::Result<OwnedFd>;
     /// bounded nul-terminated read from child memory (mem.rs caps).
     fn read_path(&self, pid: u32, addr: u64) -> Result<Vec<u8>, MemReadError>;
     /// bounded fixed-size read from child memory.
@@ -170,12 +258,19 @@ pub(crate) enum Handled {
     Dropped,
 }
 
+#[derive(Clone)]
 struct ResolvedDecision {
     event_decision: Decision,
     response_decision: Decision,
     ask_resolution: Option<AskResolution>,
     matched_rule: String,
     would_deny: Option<bool>,
+}
+
+#[cfg(target_os = "linux")]
+struct ResolvedOperand {
+    effective: ResolvedDecision,
+    evidence: Vec<FsOperandDecision>,
 }
 
 fn fixed_decision(decision: Decision, matched_rule: &str) -> ResolvedDecision {
@@ -186,6 +281,71 @@ fn fixed_decision(decision: Decision, matched_rule: &str) -> ResolvedDecision {
         matched_rule: matched_rule.to_string(),
         would_deny: None,
     }
+}
+
+fn open_mode(sys_nr: u32, notif: &SeccompNotif) -> u32 {
+    match sys_nr {
+        nr::OPEN => notif.data.args[2] as u32,
+        nr::CREAT => notif.data.args[1] as u32,
+        nr::OPENAT => notif.data.args[3] as u32,
+        _ => 0,
+    }
+}
+
+fn mutation_invocation(
+    sys_nr: u32,
+    notif: &SeccompNotif,
+    path: &std::path::Path,
+) -> Result<MutationInvocation, MemReadError> {
+    let invocation = match sys_nr {
+        nr::TRUNCATE => MutationInvocation::Truncate {
+            length: notif.data.args[1] as i64,
+        },
+        nr::RENAME | nr::RENAMEAT => MutationInvocation::Rename { flags: 0 },
+        nr::RENAMEAT2 => MutationInvocation::Rename {
+            flags: notif.data.args[4] as u32,
+        },
+        nr::MKDIR => MutationInvocation::Mkdir {
+            mode: notif.data.args[1] as u32,
+        },
+        nr::MKDIRAT => MutationInvocation::Mkdir {
+            mode: notif.data.args[2] as u32,
+        },
+        nr::RMDIR => MutationInvocation::Unlink {
+            flags: libc::AT_REMOVEDIR,
+        },
+        nr::UNLINK => MutationInvocation::Unlink { flags: 0 },
+        nr::UNLINKAT => MutationInvocation::Unlink {
+            flags: notif.data.args[2] as i32,
+        },
+        nr::LINK => MutationInvocation::Link { flags: 0 },
+        nr::LINKAT => MutationInvocation::Link {
+            flags: notif.data.args[4] as i32,
+        },
+        nr::SYMLINK | nr::SYMLINKAT => MutationInvocation::Symlink {
+            target: path.as_os_str().as_bytes().to_vec(),
+        },
+        nr::CHMOD => MutationInvocation::Chmod {
+            mode: notif.data.args[1] as u32,
+        },
+        nr::FCHMODAT => MutationInvocation::Chmod {
+            mode: notif.data.args[2] as u32,
+        },
+        nr::CHOWN => MutationInvocation::Chown {
+            uid: notif.data.args[1] as u32,
+            gid: notif.data.args[2] as u32,
+            flags: 0,
+        },
+        nr::FCHOWNAT => MutationInvocation::Chown {
+            uid: notif.data.args[2] as u32,
+            gid: notif.data.args[3] as u32,
+            flags: notif.data.args[4] as i32,
+        },
+        _ => {
+            return Err(MemReadError::Io(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+    };
+    Ok(invocation)
 }
 
 fn resolve_decision(config: &RunConfig<'_>, request: &Request<'_>) -> ResolvedDecision {
@@ -227,16 +387,8 @@ fn resolve_ask(config: &RunConfig<'_>) -> AskResolution {
     if config.attendance == Attendance::Unattended {
         return AskResolution::Unattended;
     }
-
-    #[cfg(target_os = "linux")]
-    {
-        prompt_for_ask(config.ask_timeout)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = config.ask_timeout;
-        AskResolution::TimedOut
-    }
+    let _ = config.ask_timeout;
+    AskResolution::Denied
 }
 
 /// a `send` that tolerates the target dying first: ENOENT means the child is gone and
@@ -296,7 +448,7 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
 
     // the filesystem families (syscalls.md sections 3.1-3.2): the recorded slice.
     if let Some(shape) = fs_shape(sys_nr) {
-        return handle_fs(kernel, notif, writer, config, ts, &shape);
+        return handle_fs(kernel, notif, writer, config, ts, &shape, sys_nr);
     }
 
     // execve/execveat: recorded with the same bracketed path read (Fact::Exec); the
@@ -327,6 +479,7 @@ fn handle_fs<N: Notifier, S: TraceSink>(
     config: &RunConfig<'_>,
     ts: u64,
     shape: &FsShape,
+    sys_nr: u32,
 ) -> Result<Handled, RunError> {
     // bracket open (notify-loop.md section 2): a read against a dead or reused id
     // must never become a fact.
@@ -334,25 +487,74 @@ fn handle_fs<N: Notifier, S: TraceSink>(
         return Ok(Handled::Dropped);
     }
 
-    let gathered: Result<(PathBuf, Option<PathBuf>, Vec<crate::recorder::FsAccess>), MemReadError> =
-        (|| {
-            let path = read_anchored(kernel, notif, &shape.path)?;
-            let dest = match &shape.dest {
-                Some(arg) => Some(read_anchored(kernel, notif, arg)?),
-                None => None,
-            };
-            let access = match shape.access {
-                AccessSpec::Fixed(list) => list.to_vec(),
-                AccessSpec::OpenFlags { arg } => {
-                    crate::supervisor::fact::open_flags_access(notif.data.args[arg])
+    let gathered: Result<
+        (
+            PathBuf,
+            Option<PathBuf>,
+            Vec<crate::recorder::FsAccess>,
+            FsInvocation,
+        ),
+        MemReadError,
+    > = (|| {
+        let path = read_anchored(kernel, notif, &shape.path)?;
+        let dest = match &shape.dest {
+            Some(arg) => Some(read_anchored(kernel, notif, arg)?),
+            None => None,
+        };
+        let (access, invocation) = match shape.access {
+            AccessSpec::Fixed(list) => (
+                list.to_vec(),
+                FsInvocation::Mutation(mutation_invocation(sys_nr, notif, &path)?),
+            ),
+            AccessSpec::OpenFlags { arg } => {
+                let flags = notif.data.args[arg];
+                (
+                    crate::supervisor::fact::open_flags_access(flags),
+                    FsInvocation::Open {
+                        flags,
+                        mode: open_mode(sys_nr, notif),
+                        unsupported_errno: None,
+                    },
+                )
+            }
+            AccessSpec::OpenHow { arg } => {
+                let size = usize::try_from(notif.data.args[3]).unwrap_or(0);
+                if size < OPEN_HOW_SIZE {
+                    return Err(MemReadError::Short {
+                        wanted: OPEN_HOW_SIZE,
+                        got: size,
+                    });
                 }
-                AccessSpec::OpenHow { arg } => {
-                    let raw_flags = kernel.read_u64(notif.pid, notif.data.args[arg])?;
-                    crate::supervisor::fact::open_flags_access(raw_flags)
-                }
-            };
-            Ok((path, dest, access))
-        })();
+                let read_size = if config.mode == crate::recorder::Mode::Enforce {
+                    size.min(crate::supervisor::mem::ABSOLUTE_READ_CAP)
+                } else {
+                    OPEN_HOW_SIZE
+                };
+                let bytes = kernel.read_bytes(notif.pid, notif.data.args[arg], read_size)?;
+                let flags = u64::from_ne_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
+                let mode = u64::from_ne_bytes(bytes[8..16].try_into().unwrap_or([0; 8]));
+                let resolve = u64::from_ne_bytes(bytes[16..24].try_into().unwrap_or([0; 8]));
+                let unsupported_errno = if size > crate::supervisor::mem::ABSOLUTE_READ_CAP
+                    || bytes[OPEN_HOW_SIZE..].iter().any(|byte| *byte != 0)
+                {
+                    Some(libc::E2BIG)
+                } else if resolve != 0 {
+                    Some(libc::EOPNOTSUPP)
+                } else {
+                    None
+                };
+                (
+                    crate::supervisor::fact::open_flags_access(flags),
+                    FsInvocation::Open {
+                        flags,
+                        mode: u32::try_from(mode).unwrap_or(u32::MAX),
+                        unsupported_errno,
+                    },
+                )
+            }
+        };
+        Ok((path, dest, access, invocation))
+    })();
 
     // bracket close: a read spanning the child's death is discarded (case B).
     if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
@@ -360,7 +562,15 @@ fn handle_fs<N: Notifier, S: TraceSink>(
     }
 
     match gathered {
-        Ok((path, dest, access)) => {
+        Ok((path, dest, access, invocation)) => {
+            #[cfg(not(target_os = "linux"))]
+            let _ = &invocation;
+            #[cfg(target_os = "linux")]
+            if config.mode == crate::recorder::Mode::Enforce {
+                return handle_fs_enforce(
+                    kernel, notif, writer, config, ts, shape, path, dest, access, invocation,
+                );
+            }
             let path_text = path.to_string_lossy();
             let decision = resolve_decision(
                 config,
@@ -391,6 +601,367 @@ fn handle_fs<N: Notifier, S: TraceSink>(
             tolerate_dead(kernel.send_error(notif.id, libc::EACCES))?;
             Ok(Handled::Responded)
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn handle_fs_enforce<N: Notifier, S: TraceSink>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    writer: &mut TraceWriter<S>,
+    config: &RunConfig<'_>,
+    ts: u64,
+    shape: &FsShape,
+    lexical_path: PathBuf,
+    lexical_dest: Option<PathBuf>,
+    access: Vec<crate::recorder::FsAccess>,
+    invocation: FsInvocation,
+) -> Result<Handled, RunError> {
+    let broker = config.broker.ok_or(RunError::MissingBroker)?;
+    let symlink_target = matches!(
+        invocation,
+        FsInvocation::Mutation(MutationInvocation::Symlink { .. })
+    );
+    let (primary_input, secondary_input) = if symlink_target {
+        (
+            lexical_dest
+                .as_ref()
+                .ok_or_else(|| RunError::Notify(io::Error::from_raw_os_error(libc::EINVAL)))?,
+            None,
+        )
+    } else {
+        (&lexical_path, lexical_dest.as_ref())
+    };
+    let (primary_follow, primary_missing, secondary_follow, secondary_missing) =
+        path_prepare_modes(&invocation);
+
+    let primary =
+        match broker
+            .borrow_mut()
+            .prepare_path(primary_input, primary_follow, primary_missing)?
+        {
+            BrokerResultOrPath::Path(path) => path,
+            BrokerResultOrPath::Result(BrokerResult::Errno(errno)) => {
+                return record_realization_deny(
+                    kernel,
+                    notif,
+                    writer,
+                    ts,
+                    shape.name,
+                    lexical_path,
+                    lexical_dest,
+                    access,
+                    errno,
+                );
+            }
+            BrokerResultOrPath::Result(_) => {
+                return Err(RunError::Notify(io::Error::other(
+                    "broker prepare returned a non-errno result",
+                )));
+            }
+        };
+    let secondary = if let Some(input) = secondary_input {
+        match broker
+            .borrow_mut()
+            .prepare_path(input, secondary_follow, secondary_missing)?
+        {
+            BrokerResultOrPath::Path(path) => Some(path),
+            BrokerResultOrPath::Result(BrokerResult::Errno(errno)) => {
+                broker.borrow_mut().release(primary)?;
+                return record_realization_deny(
+                    kernel,
+                    notif,
+                    writer,
+                    ts,
+                    shape.name,
+                    lexical_path,
+                    lexical_dest,
+                    access,
+                    errno,
+                );
+            }
+            BrokerResultOrPath::Result(_) => {
+                broker.borrow_mut().release(primary)?;
+                return Err(RunError::Notify(io::Error::other(
+                    "broker prepare returned a non-errno result",
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
+    let primary_identity = primary.identity().to_path_buf();
+    let secondary_identity = secondary.as_ref().map(|path| path.identity().to_path_buf());
+    let (fact_path, fact_dest) = if symlink_target {
+        (lexical_path.clone(), Some(primary_identity.clone()))
+    } else {
+        (primary_identity.clone(), secondary_identity.clone())
+    };
+    let primary_access = primary_access(&invocation, &access);
+    let primary_operand = if symlink_target {
+        FsOperand::Dest
+    } else {
+        FsOperand::Path
+    };
+    let primary_decision =
+        resolve_required_fs(config, &primary_identity, &primary_access, primary_operand);
+    let secondary_decision = secondary.as_ref().map(|path| {
+        let required = secondary_access(&invocation, path.exists());
+        resolve_required_fs(config, path.identity(), &required, FsOperand::Dest)
+    });
+    let operand_decisions = if symlink_target {
+        Some(primary_decision.evidence.clone())
+    } else {
+        secondary_decision.as_ref().map(|secondary| {
+            primary_decision
+                .evidence
+                .iter()
+                .chain(&secondary.evidence)
+                .cloned()
+                .collect()
+        })
+    };
+    let decision = if primary_decision.effective.response_decision != Decision::Allow {
+        primary_decision.effective.clone()
+    } else if let Some(decision) = secondary_decision
+        && decision.effective.response_decision != Decision::Allow
+    {
+        decision.effective
+    } else {
+        primary_decision.effective
+    };
+
+    record_with_operands(
+        writer,
+        ts,
+        notif,
+        shape.name,
+        Fact::Fs {
+            path: fact_path,
+            access: access.clone(),
+            dest: fact_dest,
+        },
+        &decision,
+        operand_decisions,
+    )?;
+
+    if decision.response_decision != Decision::Allow {
+        broker.borrow_mut().release(primary)?;
+        if let Some(secondary) = secondary {
+            broker.borrow_mut().release(secondary)?;
+        }
+        tolerate_dead(kernel.send_error(notif.id, libc::EACCES))?;
+        return Ok(Handled::Responded);
+    }
+
+    if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+        broker.borrow_mut().release(primary)?;
+        if let Some(secondary) = secondary {
+            broker.borrow_mut().release(secondary)?;
+        }
+        return Ok(Handled::Dropped);
+    }
+
+    let close_on_exec = match &invocation {
+        FsInvocation::Open { flags, .. } if flags & libc::O_CLOEXEC as u64 != 0 => {
+            libc::O_CLOEXEC as u32
+        }
+        _ => 0,
+    };
+    let result = match invocation {
+        FsInvocation::Open {
+            flags,
+            mode,
+            unsupported_errno,
+        } => {
+            if let Some(errno) = unsupported_errno {
+                broker.borrow_mut().release(primary)?;
+                BrokerResult::Errno(errno)
+            } else {
+                broker.borrow_mut().commit_open(primary, flags, mode)?
+            }
+        }
+        FsInvocation::Mutation(operation) => {
+            let operation = broker_mutation(operation);
+            broker
+                .borrow_mut()
+                .commit_mutation(primary, secondary, operation)?
+        }
+    };
+    respond_broker_result(kernel, notif.id, result, close_on_exec)?;
+    Ok(Handled::Responded)
+}
+
+#[cfg(target_os = "linux")]
+fn path_prepare_modes(invocation: &FsInvocation) -> (bool, bool, bool, bool) {
+    match invocation {
+        FsInvocation::Open { flags, .. } => (
+            flags & libc::O_NOFOLLOW as u64 == 0,
+            flags & libc::O_CREAT as u64 != 0,
+            false,
+            false,
+        ),
+        FsInvocation::Mutation(MutationInvocation::Truncate { .. })
+        | FsInvocation::Mutation(MutationInvocation::Chmod { .. })
+        | FsInvocation::Mutation(MutationInvocation::Chown { flags: 0, .. }) => {
+            (true, false, false, false)
+        }
+        FsInvocation::Mutation(MutationInvocation::Chown { .. }) => (false, false, false, false),
+        FsInvocation::Mutation(MutationInvocation::Rename { .. }) => (false, false, false, true),
+        FsInvocation::Mutation(MutationInvocation::Mkdir { .. }) => (false, true, false, false),
+        FsInvocation::Mutation(MutationInvocation::Unlink { .. }) => (false, false, false, false),
+        FsInvocation::Mutation(MutationInvocation::Link { flags }) => {
+            (*flags & libc::AT_SYMLINK_FOLLOW != 0, false, false, true)
+        }
+        FsInvocation::Mutation(MutationInvocation::Symlink { .. }) => (false, true, false, false),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn primary_access(
+    invocation: &FsInvocation,
+    open_access: &[crate::recorder::FsAccess],
+) -> Vec<crate::recorder::FsAccess> {
+    use crate::recorder::FsAccess::{Create, Delete, Read, Write};
+    match invocation {
+        FsInvocation::Open { .. } => open_access.to_vec(),
+        FsInvocation::Mutation(MutationInvocation::Rename { flags }) if *flags & 2 != 0 => {
+            vec![Delete, Create]
+        }
+        FsInvocation::Mutation(MutationInvocation::Rename { .. }) => vec![Delete],
+        FsInvocation::Mutation(MutationInvocation::Link { .. }) => vec![Read],
+        FsInvocation::Mutation(MutationInvocation::Mkdir { .. })
+        | FsInvocation::Mutation(MutationInvocation::Symlink { .. }) => vec![Create],
+        FsInvocation::Mutation(MutationInvocation::Unlink { .. }) => vec![Delete],
+        FsInvocation::Mutation(
+            MutationInvocation::Truncate { .. }
+            | MutationInvocation::Chmod { .. }
+            | MutationInvocation::Chown { .. },
+        ) => vec![Write],
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn secondary_access(
+    invocation: &FsInvocation,
+    destination_exists: bool,
+) -> Vec<crate::recorder::FsAccess> {
+    use crate::recorder::FsAccess::{Create, Delete};
+    match invocation {
+        FsInvocation::Mutation(MutationInvocation::Rename { flags }) if *flags & 2 != 0 => {
+            vec![Delete, Create]
+        }
+        FsInvocation::Mutation(MutationInvocation::Rename { .. }) if destination_exists => {
+            vec![Create, Delete]
+        }
+        FsInvocation::Mutation(
+            MutationInvocation::Rename { .. } | MutationInvocation::Link { .. },
+        ) => vec![Create],
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_required_fs(
+    config: &RunConfig<'_>,
+    path: &std::path::Path,
+    access: &[crate::recorder::FsAccess],
+    operand: FsOperand,
+) -> ResolvedOperand {
+    let path_text = path.to_string_lossy();
+    let mut first_allow = None;
+    let mut first_deny = None;
+    let mut evidence = Vec::with_capacity(access.len());
+    for required in access {
+        let decision = resolve_decision(
+            config,
+            &Request::Fs {
+                path: &path_text,
+                access: std::slice::from_ref(required),
+            },
+        );
+        evidence.push(FsOperandDecision {
+            operand,
+            access: *required,
+            decision: decision.event_decision,
+            ask_resolution: decision.ask_resolution,
+            matched_rule: decision.matched_rule.clone(),
+        });
+        if decision.response_decision != Decision::Allow && first_deny.is_none() {
+            first_deny = Some(decision.clone());
+        }
+        if first_allow.is_none() {
+            first_allow = Some(decision);
+        }
+    }
+    ResolvedOperand {
+        effective: first_deny
+            .or(first_allow)
+            .unwrap_or_else(|| fixed_decision(Decision::Deny, rule::REALIZATION)),
+        evidence,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn broker_mutation(invocation: MutationInvocation) -> MutationOperation {
+    match invocation {
+        MutationInvocation::Truncate { length } => MutationOperation::Truncate { length },
+        MutationInvocation::Rename { flags } => MutationOperation::Rename { flags },
+        MutationInvocation::Mkdir { mode } => MutationOperation::Mkdir { mode },
+        MutationInvocation::Unlink { flags } => MutationOperation::Unlink { flags },
+        MutationInvocation::Link { flags } => MutationOperation::Link { flags },
+        MutationInvocation::Symlink { target } => MutationOperation::Symlink { target },
+        MutationInvocation::Chmod { mode } => MutationOperation::Chmod { mode },
+        MutationInvocation::Chown { uid, gid, flags } => {
+            MutationOperation::Chown { uid, gid, flags }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn record_realization_deny<N: Notifier, S: TraceSink>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    writer: &mut TraceWriter<S>,
+    ts: u64,
+    syscall: &str,
+    path: PathBuf,
+    dest: Option<PathBuf>,
+    access: Vec<crate::recorder::FsAccess>,
+    errno: i32,
+) -> Result<Handled, RunError> {
+    record(
+        writer,
+        ts,
+        notif,
+        syscall,
+        Fact::Fs { path, access, dest },
+        &fixed_decision(Decision::Deny, rule::REALIZATION),
+    )?;
+    tolerate_dead(kernel.send_error(notif.id, errno))?;
+    Ok(Handled::Responded)
+}
+
+#[cfg(target_os = "linux")]
+fn respond_broker_result<N: Notifier>(
+    kernel: &N,
+    id: u64,
+    result: BrokerResult,
+    newfd_flags: u32,
+) -> Result<(), RunError> {
+    match result {
+        BrokerResult::Value(value) => tolerate_dead(kernel.send_success(id, value)),
+        BrokerResult::Fd(fd) => {
+            match kernel.send_addfd(id, fd.as_fd(), SECCOMP_ADDFD_FLAG_SEND, newfd_flags) {
+                Ok(_) => Ok(()),
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+                Err(error) => Err(RunError::Notify(error)),
+            }
+        }
+        BrokerResult::Errno(errno) => tolerate_dead(kernel.send_error(id, errno)),
     }
 }
 
@@ -599,10 +1170,38 @@ fn handle_network<N: Notifier, S: TraceSink>(
         return Ok(Handled::Dropped);
     }
     let sockaddr = kernel.read_bytes(notif.pid, notif.data.args[addr_arg], len);
+    let payload = if sys_nr == nr::SENDTO && config.mode == crate::recorder::Mode::Enforce {
+        match usize::try_from(notif.data.args[2]) {
+            Ok(length) if length <= crate::supervisor::mem::NETWORK_PAYLOAD_CAP => {
+                kernel.read_bytes(notif.pid, notif.data.args[1], length)
+            }
+            _ => Err(MemReadError::NoNulWithinCap(
+                crate::supervisor::mem::NETWORK_PAYLOAD_CAP,
+            )),
+        }
+    } else {
+        Ok(Vec::new())
+    };
     if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
         return Ok(Handled::Dropped);
     }
-    let (ip, port) = match sockaddr.and_then(parse_sockaddr) {
+    let sockaddr = match sockaddr {
+        Ok(sockaddr) => sockaddr,
+        Err(_) => {
+            record_network_read_failure(kernel, notif, writer, config, ts, name)?;
+            return Ok(Handled::Responded);
+        }
+    };
+    let payload = match payload {
+        Ok(payload) => payload,
+        Err(_) => {
+            record_network_read_failure(kernel, notif, writer, config, ts, name)?;
+            return Ok(Handled::Responded);
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = &payload;
+    let (ip, port) = match parse_sockaddr(sockaddr.clone()) {
         Ok(dest) => dest,
         Err(_) => {
             record_network_read_failure(kernel, notif, writer, config, ts, name)?;
@@ -610,17 +1209,75 @@ fn handle_network<N: Notifier, S: TraceSink>(
         }
     };
     let host = ip.to_string();
+    let hostname = resolved_hostname(config, ip);
     let decision = resolve_decision(
         config,
         &Request::Net {
             ip,
-            hostname: None,
+            hostname: hostname.as_deref(),
             port,
         },
     );
     record(writer, ts, notif, name, Fact::Net { host, port }, &decision)?;
-    respond_continue_or_deny(kernel, notif.id, &decision)?;
+    if config.mode == crate::recorder::Mode::RecordOnly {
+        respond_continue_or_deny(kernel, notif.id, &decision)?;
+        return Ok(Handled::Responded);
+    }
+    if decision.response_decision != Decision::Allow {
+        tolerate_dead(kernel.send_error(notif.id, libc::EACCES))?;
+        return Ok(Handled::Responded);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+            return Ok(Handled::Dropped);
+        }
+        let target_fd = RawFd::try_from(notif.data.args[0])
+            .map_err(|_| RunError::Notify(io::Error::from_raw_os_error(libc::EBADF)))?;
+        let socket = match kernel.duplicate_fd(notif.pid, target_fd) {
+            Ok(socket) => socket,
+            Err(error) => {
+                tolerate_dead(
+                    kernel.send_error(notif.id, error.raw_os_error().unwrap_or(libc::EBADF)),
+                )?;
+                return Ok(Handled::Responded);
+            }
+        };
+        let operation = match sys_nr {
+            nr::CONNECT => NetworkOperation::Connect,
+            nr::BIND => NetworkOperation::Bind,
+            nr::SENDTO => NetworkOperation::SendTo,
+            _ => unreachable!("network table checked above"),
+        };
+        let flags = if sys_nr == nr::SENDTO {
+            notif.data.args[3] as i32
+        } else {
+            0
+        };
+        let result = config
+            .broker
+            .ok_or(RunError::MissingBroker)?
+            .borrow_mut()
+            .network(operation, socket, sockaddr, payload, flags)?;
+        respond_broker_result(kernel, notif.id, result, 0)?;
+    }
     Ok(Handled::Responded)
+}
+
+fn resolved_hostname(config: &RunConfig<'_>, ip: IpAddr) -> Option<String> {
+    let policy = config.policy?;
+    let cache = config.resolved_hosts?;
+    for rule in &policy.net {
+        if let crate::policy::HostRule::Exact(host) = &rule.host
+            && cache
+                .get(host)
+                .is_some_and(|addresses| addresses.contains(&ip))
+        {
+            return Some(host.clone());
+        }
+    }
+    None
 }
 
 fn record_network_read_failure<N: Notifier, S: TraceSink>(
@@ -728,7 +1385,7 @@ fn read_anchored<N: Notifier>(
         return Ok(path);
     }
     let anchor = match arg.dirfd_arg {
-        Some(i) if notif.data.args[i] != flags::AT_FDCWD => {
+        Some(i) if u64::from(notif.data.args[i] as u32) != flags::AT_FDCWD => {
             DirAnchor::Fd(notif.data.args[i] as u32)
         }
         _ => DirAnchor::Cwd,
@@ -755,6 +1412,18 @@ fn record<S: TraceSink>(
     fact: Fact,
     decision: &ResolvedDecision,
 ) -> Result<(), RunError> {
+    record_with_operands(writer, ts, notif, name, fact, decision, None)
+}
+
+fn record_with_operands<S: TraceSink>(
+    writer: &mut TraceWriter<S>,
+    ts: u64,
+    notif: &SeccompNotif,
+    name: &str,
+    fact: Fact,
+    decision: &ResolvedDecision,
+    operand_decisions: Option<Vec<FsOperandDecision>>,
+) -> Result<(), RunError> {
     writer.append(
         ts,
         EventBody::Syscall(SyscallEvent {
@@ -765,13 +1434,12 @@ fn record<S: TraceSink>(
             ask_resolution: decision.ask_resolution,
             matched_rule: decision.matched_rule.clone(),
             would_deny: decision.would_deny,
+            operand_decisions,
         }),
     )?;
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-use linux::prompt_for_ask;
 #[cfg(target_os = "linux")]
 pub use linux::run_loop;
 
@@ -798,6 +1466,35 @@ mod linux {
         }
         fn send_error(&self, id: u64, errno: i32) -> io::Result<()> {
             self.notify.send_error(id, errno)
+        }
+        fn send_success(&self, id: u64, value: i64) -> io::Result<()> {
+            self.notify.send_success(id, value)
+        }
+        fn send_addfd(
+            &self,
+            id: u64,
+            srcfd: BorrowedFd<'_>,
+            flags: u32,
+            newfd_flags: u32,
+        ) -> io::Result<i32> {
+            self.notify.send_addfd(id, srcfd, flags, newfd_flags)
+        }
+        fn duplicate_fd(&self, pid: u32, target_fd: RawFd) -> io::Result<OwnedFd> {
+            let tgid = process_tgid(pid)?;
+            // SAFETY: pidfd_open takes the thread-group leader pid and zero flags.
+            let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, tgid, 0) };
+            if pidfd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: pidfd is live, target_fd is looked up in that process, flags are zero.
+            let duplicate = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, target_fd, 0) };
+            // SAFETY: pidfd_open returned a descriptor owned by this scope.
+            unsafe { libc::close(pidfd as RawFd) };
+            if duplicate < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: pidfd_getfd returned a new descriptor.
+            Ok(unsafe { OwnedFd::from_raw_fd(duplicate as RawFd) })
         }
         fn read_path(&self, pid: u32, addr: u64) -> Result<Vec<u8>, MemReadError> {
             ChildMem::open(pid)?.read_path(addr)
@@ -918,6 +1615,19 @@ mod linux {
         Ok(false)
     }
 
+    fn process_tgid(pid: u32) -> io::Result<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+        for line in status.lines() {
+            if let Some(tgid) = line.strip_prefix("Tgid:") {
+                return tgid
+                    .trim()
+                    .parse()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad Tgid"));
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::InvalidData, "missing Tgid"))
+    }
+
     fn parent_pid(pid: u32) -> io::Result<u32> {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
         for line in status.lines() {
@@ -929,47 +1639,6 @@ mod linux {
             }
         }
         Err(io::Error::new(io::ErrorKind::InvalidData, "missing PPid"))
-    }
-
-    pub(super) fn prompt_for_ask(timeout: Duration) -> AskResolution {
-        use std::io::{Read, Write};
-        use std::os::fd::AsRawFd;
-
-        let Ok(mut tty) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-        else {
-            return AskResolution::Denied;
-        };
-        if tty
-            .write_all(b"leash: allow requested action? [y/N] ")
-            .is_err()
-        {
-            return AskResolution::Denied;
-        }
-        let _ = tty.flush();
-
-        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-        let mut pfd = libc::pollfd {
-            fd: tty.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll reads and writes one pollfd we own.
-        let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
-        if rc == 0 {
-            return AskResolution::TimedOut;
-        }
-        if rc < 0 {
-            return AskResolution::Denied;
-        }
-
-        let mut byte = [0u8; 1];
-        match tty.read(&mut byte) {
-            Ok(1) if byte[0] == b'y' || byte[0] == b'Y' => AskResolution::Approved,
-            Ok(_) | Err(_) => AskResolution::Denied,
-        }
     }
 
     /// wall-clock milliseconds for the event envelope; the clock going backwards past
@@ -1043,6 +1712,25 @@ mod tests {
             }
             self.sent.borrow_mut().push(format!("error:{id}:{errno}"));
             Ok(())
+        }
+        fn send_success(&self, id: u64, value: i64) -> io::Result<()> {
+            self.sent.borrow_mut().push(format!("success:{id}:{value}"));
+            Ok(())
+        }
+        fn send_addfd(
+            &self,
+            id: u64,
+            _srcfd: BorrowedFd<'_>,
+            flags: u32,
+            newfd_flags: u32,
+        ) -> io::Result<i32> {
+            self.sent
+                .borrow_mut()
+                .push(format!("addfd:{id}:{flags}:{newfd_flags}"));
+            Ok(9)
+        }
+        fn duplicate_fd(&self, _pid: u32, _target_fd: RawFd) -> io::Result<OwnedFd> {
+            Err(io::Error::from_raw_os_error(libc::EBADF))
         }
         fn read_path(&self, _pid: u32, addr: u64) -> Result<Vec<u8>, MemReadError> {
             match self.mem.get(&addr) {
@@ -1267,9 +1955,12 @@ mod tests {
 
     #[test]
     fn openat2_reads_its_flags_from_child_memory() {
-        let how_flags = (flags::O_WRONLY | flags::O_CREAT).to_ne_bytes().to_vec();
+        let mut open_how = Vec::with_capacity(OPEN_HOW_SIZE);
+        open_how.extend_from_slice(&(flags::O_WRONLY | flags::O_CREAT).to_ne_bytes());
+        open_how.extend_from_slice(&0_u64.to_ne_bytes());
+        open_how.extend_from_slice(&0_u64.to_ne_bytes());
         let mut kernel = FakeNotifier::default().with_cstr(0x1000, "/work/out");
-        kernel.mem.insert(0x3000, how_flags);
+        kernel.mem.insert(0x3000, open_how);
 
         let mut w = writer();
         handle_notification(
@@ -1537,20 +2228,18 @@ mod tests {
         assert_eq!(ev["matched_rule"], rule::RECORD_ONLY);
     }
 
-    /// enforcement stays switched off at the loop entry, which is what lets the pinned
-    /// enforce legs below be decision-table facts rather than shipped behaviour: an
-    /// enforce run is refused before any child is served (`docs/README.md` status, and
-    /// the same refusal before spawn in `session.rs`).
+    /// A bare enforce config lacks the confined broker and must refuse before serving.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn an_enforce_run_is_refused_before_the_loop_serves_anything() {
+    fn an_enforce_run_without_a_broker_is_refused() {
         let p = policy("schema_version = 1\n");
         let refused = RunConfig::enforce(4242, Attendance::Unattended, &p)
             .validate()
             .expect_err("enforce must not validate");
-        assert!(matches!(refused, RunError::UnsupportedMode), "{refused:?}");
+        assert!(matches!(refused, RunError::MissingBroker), "{refused:?}");
         assert_eq!(
-            RunError::UnsupportedMode.to_string(),
-            "enforce mode is not implemented (needs safe allow realization)"
+            RunError::MissingBroker.to_string(),
+            "enforce mode requires a confined realization broker"
         );
         RunConfig::record_only(4242, Attendance::Unattended)
             .validate()
@@ -1695,48 +2384,40 @@ mod tests {
 
     #[test]
     fn enforce_unmatched_outside_fs_denies_by_default() {
-        let kernel = FakeNotifier::default().with_cstr(0x1000, "/etc/hosts");
         let p = policy("schema_version = 1\n");
         let config = RunConfig::enforce(4242, Attendance::Unattended, &p);
-        let mut w = writer();
-        super::handle_notification(
-            &kernel,
-            &notif(nr::OPENAT, [flags::AT_FDCWD, 0x1000, 0, 0, 0, 0]),
-            &mut w,
+        let decision = resolve_decision(
             &config,
-            1_000,
-        )
-        .unwrap();
+            &Request::Fs {
+                path: "/etc/hosts",
+                access: &[crate::recorder::FsAccess::Read],
+            },
+        );
 
-        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
-        let ev = &events(w)[0];
-        assert_eq!(ev["decision"], "deny");
-        assert_eq!(ev["matched_rule"], "base:enforce");
+        assert_eq!(decision.event_decision, Decision::Deny);
+        assert_eq!(decision.response_decision, Decision::Deny);
+        assert_eq!(decision.matched_rule, "base:enforce");
     }
 
     #[test]
-    fn unattended_ask_records_ask_and_denies() {
-        let kernel = FakeNotifier::default().with_cstr(0x1000, "/etc/hosts");
+    fn unattended_ask_resolves_to_deny_without_prompting() {
         let p = policy(
             "schema_version = 1\n\
              [[fs]]\npath=\"/etc/**\"\nmode=[\"read\"]\naction=\"ask\"\n",
         );
         let config = RunConfig::enforce(4242, Attendance::Unattended, &p);
-        let mut w = writer();
-        super::handle_notification(
-            &kernel,
-            &notif(nr::OPENAT, [flags::AT_FDCWD, 0x1000, 0, 0, 0, 0]),
-            &mut w,
+        let decision = resolve_decision(
             &config,
-            1_000,
-        )
-        .unwrap();
+            &Request::Fs {
+                path: "/etc/hosts",
+                access: &[crate::recorder::FsAccess::Read],
+            },
+        );
 
-        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
-        let ev = &events(w)[0];
-        assert_eq!(ev["decision"], "ask");
-        assert_eq!(ev["ask_resolution"], "unattended");
-        assert_eq!(ev["matched_rule"], "fs.1");
+        assert_eq!(decision.event_decision, Decision::Ask);
+        assert_eq!(decision.response_decision, Decision::Deny);
+        assert_eq!(decision.ask_resolution, Some(AskResolution::Unattended));
+        assert_eq!(decision.matched_rule, "fs.1");
     }
 
     #[test]
@@ -1804,5 +2485,25 @@ mod tests {
         assert_eq!(evs[1]["fact"]["access"], serde_json::json!(["create"]));
         assert_eq!(evs[2]["fact"]["access"], serde_json::json!(["write"]));
         assert_eq!(evs[3]["fact"]["access"], serde_json::json!(["write"]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rename_exchange_requires_delete_and_create_on_both_operands() {
+        let invocation = FsInvocation::Mutation(MutationInvocation::Rename { flags: 2 });
+        assert_eq!(
+            primary_access(&invocation, &[]),
+            vec![
+                crate::recorder::FsAccess::Delete,
+                crate::recorder::FsAccess::Create
+            ]
+        );
+        assert_eq!(
+            secondary_access(&invocation, true),
+            vec![
+                crate::recorder::FsAccess::Delete,
+                crate::recorder::FsAccess::Create
+            ]
+        );
     }
 }

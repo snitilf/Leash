@@ -29,6 +29,8 @@ pub const CHILD_SETUP_EXIT: i32 = 121;
 pub const CHILD_READY: u8 = b'L';
 /// the ack byte the supervisor sends once it holds the notify fd and is ready to serve.
 pub const SUPERVISOR_ACK: u8 = b'A';
+/// the child confirms every pre-exec boundary is installed.
+pub const CHILD_BOUNDARY_READY: u8 = b'B';
 
 /// `struct sock_fprog`: the header the kernel reads to install a cbpf program.
 #[repr(C)]
@@ -126,6 +128,18 @@ pub unsafe fn enter(setup: &ChildSetup) -> ! {
     // restrict itself, and no allocation is permitted in this post-fork path.
     if let Some(fd) = setup.landlock_ruleset
         && !unsafe { super::landlock::restrict_self(fd) }
+    {
+        die();
+    }
+    let boundary_ready = [CHILD_BOUNDARY_READY];
+    // SAFETY: child_sock remains live until close_range and the one-byte buffer is local.
+    if unsafe {
+        libc::write(
+            setup.child_sock,
+            boundary_ready.as_ptr().cast(),
+            boundary_ready.len(),
+        )
+    } != 1
     {
         die();
     }

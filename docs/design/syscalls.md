@@ -72,22 +72,22 @@ bare value. The response column states how an allow is realized; the rule behind
 
 | Syscall | Also on ARM64 | Decision basis | Allow realized by | Landlock backstop |
 |---|---|---|---|---|
-| `openat`, `openat2` | yes | path + access mode (pointer) | `ADDFD`: supervisor opens the resolved path, injects the fd | `FS_READ_FILE` / `FS_WRITE_FILE`, or `FS_READ_DIR` for a directory |
+| `openat`, `openat2` | yes | path + access mode (pointer) | `ADDFD`: confined broker opens the resolved path, supervisor injects the returned fd | `FS_READ_FILE` / `FS_WRITE_FILE`, or `FS_READ_DIR` for a directory |
 | `open`, `creat` | no (x86-64 legacy only) | path + access mode (pointer) | `ADDFD` | same |
 
 ### 3.2 Filesystem mutation (no fd returned)
 
 | Syscall | Also on ARM64 | Decision basis | Allow realized by | Landlock backstop |
 |---|---|---|---|---|
-| `renameat`, `renameat2` | yes | source + dest paths (pointers) | supervisor performs it on the resolved paths, spoofs the return | `FS_REFER` (+ dir rights) |
+| `renameat`, `renameat2` | yes | source + dest paths (pointers) | confined broker performs it on retained parent handles, supervisor spoofs the return | `FS_REFER` (+ dir rights) |
 | `rename` | no (x86-64) | as above | as above | as above |
-| `unlinkat` | yes | path + flags (pointer + scalar) | supervisor-executed, spoofed return | `FS_REMOVE_FILE` / `FS_REMOVE_DIR` |
+| `unlinkat` | yes | path + flags (pointer + scalar) | broker-executed, spoofed return | `FS_REMOVE_FILE` / `FS_REMOVE_DIR` |
 | `unlink`, `rmdir` | no (x86-64) | path (pointer) | as above | as above |
-| `mkdirat` | yes | path (pointer) | supervisor-executed, spoofed return | `FS_MAKE_DIR` |
+| `mkdirat` | yes | path (pointer) | broker-executed, spoofed return | `FS_MAKE_DIR` |
 | `mkdir` | no (x86-64) | path (pointer) | as above | as above |
-| `linkat`, `symlinkat` | yes | paths (pointers) | supervisor-executed, spoofed return | `FS_MAKE_REG` / `FS_MAKE_SYM` |
+| `linkat`, `symlinkat` | yes | paths (pointers) | broker-executed, spoofed return | `FS_MAKE_REG` / `FS_MAKE_SYM` |
 | `link`, `symlink` | no (x86-64) | paths (pointers) | as above | as above |
-| `truncate` | yes | path + length (pointer + scalar) | supervisor-executed, spoofed return | `FS_TRUNCATE` (ABI 3, Linux 6.2) |
+| `truncate` | yes | path + length (pointer + scalar) | broker-executed, spoofed return | `FS_TRUNCATE` (ABI 3, Linux 6.2) |
 
 `truncate`'s backstop is the dedicated `FS_TRUNCATE` right, not `FS_WRITE_FILE` (which governs opening
 for write). It is above the kernel floor (ABI 3 is Linux 6.2, floor is ABI 2), so where the running
@@ -161,11 +161,23 @@ The issue #26 implementation denies it in both modes under the `sr4:pidfd_getfd`
 
 ### 3.5 Network
 
+ADR-0020 supersedes the fresh-socket realization described in the original slate-2 text below.
+The supervisor duplicates the trapped process's actual socket with `pidfd_getfd` and passes it to the Landlock-confined broker.
+The broker performs `connect`, `bind`, or `sendto` against the once-copied address, and `sendto` also uses a once-copied payload and flags.
+No network operation replaces the child's descriptor with `ADDFD SETFD`.
+This preserves the socket's type, protocol, options, binding state, and open file description.
+
+The supported enforce-mode address families are `AF_INET` and `AF_INET6`.
+IP, CIDR, and `*` policy hosts are directly enforceable.
+Exact hostnames use the supervisor's bounded address cache.
+Suffix hostname rules are rejected before an enforce child is spawned because an IP-only `sockaddr` cannot prove which wildcard hostname the child intended.
+UDP port control is a named Landlock residual on the supported ABI range.
+
 | Syscall | Also on ARM64 | Decision basis | Allow realized by | Landlock backstop |
 |---|---|---|---|---|
-| `connect` | yes | `sockaddr` host + port (pointer) | supervisor connects a fresh socket, injects it with `ADDFD`; or `CONTINUE` for allow-all policies | `NET_CONNECT_TCP` (port only) |
-| `bind` | yes | `sockaddr` port (pointer) | supervisor-executed or `CONTINUE` per policy | `NET_BIND_TCP` (port only) |
-| `sendto` | yes | destination `sockaddr` on an unconnected socket (pointer) | as `connect` | `NET_CONNECT_TCP` (port only) |
+| `connect` | yes | `sockaddr` host + port (pointer) | confined broker operates on a `pidfd_getfd` duplicate; or `CONTINUE` for allow-all policies | `NET_CONNECT_TCP` (TCP port only) |
+| `bind` | yes | `sockaddr` port (pointer) | confined broker operates on a `pidfd_getfd` duplicate; or `CONTINUE` for allow-all policies | `NET_BIND_TCP` (TCP port only) |
+| `sendto` | yes | destination `sockaddr`, payload, and flags (pointers + scalars) | confined broker sends once-copied payload on a `pidfd_getfd` duplicate | none on the supported ABI range |
 
 Network is arch-uniform: `socket`, `connect`, and `bind` exist directly on both x86-64 and ARM64
 (the multiplexed `socketcall` is a 32-bit-x86 artifact and is denied as a foreign-ABI syscall,
@@ -181,19 +193,19 @@ connection boundary at `connect`/`bind`/`sendto` and treats `sendmsg` to an unco
 named residual in [`escapes.md`](escapes.md) rather than trapping all `sendmsg`; revisiting this is a
 tier:2 change if a workload sends to unconnected sockets via `sendmsg`.
 
-Landlock's network rules are **port-based**, so they cannot enforce a host allowlist (FR-7); they
-backstop the port dimension only. Host-level enforcement therefore rests on the seccomp decision,
-which makes the `sockaddr` TOCTOU real: with a bare `CONTINUE`, a second thread could rewrite the
-address between the supervisor's read and the kernel's connect. The design closes it by realizing a
-host-enforced allow as a supervisor-side connect injected with `ADDFD` (the supervisor opens a
-socket, connects it to the validated address, and installs it over the child's fd number), never as
-`CONTINUE`. `CONTINUE` is used only where the policy imposes no host constraint. The fidelity cost of the
-injected socket (socket options the child set before `connect`) is accepted as-is at slate 2: no
-options are carried onto the injected socket, the loss is a named residual in
-[`escapes.md`](escapes.md), and widening fidelity is a tier:2 change if a real workload breaks on
-it.
+Landlock's network rules are **port-based**, so they cannot enforce a host allowlist (FR-7), and the supported ABI range exposes only TCP port rights.
+Host-level enforcement and UDP destination enforcement therefore rest on the seccomp decision.
+A bare `CONTINUE` would let a second thread rewrite the address or payload between the supervisor's read and the kernel's use.
+ADR-0020 closes that race by duplicating the actual child socket and making the confined broker execute against once-copied inputs.
+`CONTINUE` is used only where the policy imposes no host constraint and no pointer value affects the allow.
 
 ## 4. The allow-realization rule (normative)
+
+ADR-0020 refines rules 2 and 3 with a Landlock-confined broker.
+The unrestricted supervisor never performs a policy-governed side effect.
+Filesystem opens and mutations use a broker prepare phase with retained handles, followed by record, final `ID_VALID`, and broker commit.
+Network operations use a `pidfd_getfd` duplicate of the actual child socket and execute in the broker without replacing the child fd.
+An operation that exceeds the broker deadline aborts the run fail-closed.
 
 One rule governs every "allow" response, and it is the load-bearing security decision of this file
 (I4). It is stated once here and once in [`notify-loop.md`](notify-loop.md); the two must agree.
@@ -210,21 +222,17 @@ a `raw` allow in record-only and a `raw` fail-closed deny in enforce
    realized with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`. The kernel re-executes the same syscall; there
    is no child-controlled memory to race.
 2. If the decision reads a pointer argument (a path, a `sockaddr`) and the syscall returns an fd, the
-   allow is realized with `SECCOMP_ADDFD`: the supervisor opens the resolved resource itself and
-   injects the fd. The child never gets a re-editable argument between check and use.
-3. If the decision reads a pointer argument and no fd can be injected as the return value (the
-   mutation family, `connect` under a host policy), the supervisor performs the operation itself on
-   the resolved target and spoofs the return value. `CONTINUE` is not used, because `CONTINUE`
-   re-reads the pointer. Where the child also needs the resulting resource, not just a return code,
-   the supervisor hands it back with `ADDFD` over the argument fd: for a host-enforced `connect` it
-   opens a socket, connects it to the validated address, installs it over the child's socket fd
-   (`ADDFD` with `SETFD`), and returns success. The fidelity limit of this, socket options the child
-   set before `connect`, is the accepted residual noted in section 3.5.
+   allow is realized with `SECCOMP_ADDFD`: the confined broker opens the resolved resource and
+   returns the fd for supervisor injection. The child never gets a re-editable argument between check and use.
+3. If the decision reads a pointer argument and no fd can be injected as the return value, the confined broker performs the operation on a pinned resource and the supervisor spoofs the exact return value or errno.
+   `CONTINUE` is not used because it would re-read child memory.
+   Filesystem mutations use retained broker handles.
+   Network calls use a `pidfd_getfd` duplicate of the actual child socket, so no argument fd is replaced.
 4. `execve` and `execveat` are the one exception where an allow must use `CONTINUE`; enforcement is
    delegated to the Landlock `FS_EXECUTE` backstop (section 3.3), and the residual is recorded.
 
-Path resolution for cases 2 and 3 is done by the supervisor with `openat2` against a
-supervisor-held dirfd (`RESOLVE_BENEATH` rejects absolute paths, so the anchor is always explicit).
+Path resolution for cases 2 and 3 is done by the confined broker with `openat2` against an
+inherited authoritative root dirfd (`RESOLVE_BENEATH` rejects absolute paths, so the anchor is always explicit).
 The flag set, fixed at slate 2, differs by anchor. Resolution beneath the workspace uses
 `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`: in-tree symlinks are followed, because real projects
 depend on them (pnpm's `node_modules`, virtualenvs), and the kernel still guarantees the final
@@ -233,6 +241,12 @@ links are refused explicitly. Resolution against any other allowed root uses
 `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` (which implies `NO_MAGICLINKS`): out-of-workspace allows
 are rare, explicit paths and get the strictest treatment. Policy is always evaluated against the
 final resolved path. This is what defeats the symlink and `/proc` self-reference escapes (SR-2).
+The namespace-root (`/`) anchor is the one non-workspace exception: it uses
+`RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS` because no ordinary symlink can escape above `/`, and
+this preserves standard layouts such as `/lib` pointing into `/usr/lib`.
+For a child `openat2`, v1 accepts the base `open_how` layout plus zero-filled extension bytes.
+Nonzero extension bytes return `E2BIG`.
+Nonzero caller `resolve` flags return `EOPNOTSUPP` until their exact interaction with the broker's mandatory resolution flags is specified and tested.
 
 ## 5. The denied-and-recorded set
 

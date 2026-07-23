@@ -129,6 +129,10 @@ pub enum SessionError {
     /// the notify loop aborted (notify-loop.md's fail-closed arcs).
     #[error("run loop failed: {0}")]
     Run(#[from] crate::supervisor::run::RunError),
+    /// the confined realization broker could not be established or served.
+    #[cfg(target_os = "linux")]
+    #[error("broker failed: {0}")]
+    Broker(#[from] crate::supervisor::broker::BrokerError),
     /// the reaped wait status could not be decoded as an exit or a signal death.
     #[error("child wait status undecodable: {0}")]
     WaitStatus(#[from] MalformedWaitStatus),
@@ -150,12 +154,16 @@ mod linux {
         EventBody, Mode, RecorderError, RunDir, RunMeta, TRACE_SCHEMA_VERSION, TraceSink,
         TraceWriter,
     };
-    use crate::sandbox::landlock::{self, LandlockHull};
+    use crate::sandbox::landlock::{self, LandlockHull, PreparedRuleset};
+    use crate::supervisor::broker::Broker;
     use crate::supervisor::preflight::{self, Outcome};
     use crate::supervisor::run::run_loop;
     use crate::supervisor::spawn::{SpawnSpec, spawn_supervised};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::io::Write;
-    use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+    use std::net::{IpAddr, ToSocketAddrs};
+    use std::os::fd::AsRawFd;
     use std::time::SystemTime;
 
     struct EnforcementSetup {
@@ -163,7 +171,8 @@ mod linux {
         policy_digest: Option<String>,
         landlock_abi: Option<u32>,
         landlock_residuals: Option<Vec<String>>,
-        ruleset: Option<OwnedFd>,
+        ruleset: Option<PreparedRuleset>,
+        resolved_hosts: HashMap<String, Vec<IpAddr>>,
     }
 
     /// drive one run start to finish: preflight, run directory, lifecycle events, spawn,
@@ -204,7 +213,8 @@ mod linux {
             &run_dir,
             &mut writer,
             enforcement.policy.as_ref(),
-            enforcement.ruleset.as_ref().map(AsRawFd::as_raw_fd),
+            enforcement.ruleset.as_ref(),
+            &enforcement.resolved_hosts,
         )
     }
 
@@ -219,6 +229,7 @@ mod linux {
                 landlock_abi: None,
                 landlock_residuals: None,
                 ruleset: None,
+                resolved_hosts: HashMap::new(),
             });
         }
 
@@ -234,8 +245,9 @@ mod linux {
                 home: &home,
             },
         )?;
+        let resolved_hosts = resolve_policy_hosts(&loaded.policy)?;
         let hull: LandlockHull = landlock::derive_hull(&loaded.policy, landlock_abi);
-        let ruleset = landlock::build_ruleset(&hull)?;
+        let ruleset = landlock::prepare_ruleset(&hull)?;
 
         Ok(EnforcementSetup {
             policy: Some(loaded.policy),
@@ -243,7 +255,44 @@ mod linux {
             landlock_abi: Some(landlock_abi),
             landlock_residuals: Some(hull.residuals),
             ruleset: Some(ruleset),
+            resolved_hosts,
         })
+    }
+
+    fn resolve_policy_hosts(
+        policy: &crate::policy::Policy,
+    ) -> Result<HashMap<String, Vec<IpAddr>>, SessionError> {
+        let mut cache = HashMap::new();
+        for rule in &policy.net {
+            match &rule.host {
+                crate::policy::HostRule::Exact(host) => {
+                    let addresses = (host.as_str(), 0)
+                        .to_socket_addrs()
+                        .map_err(|error| {
+                            SessionError::Refused(format!(
+                                "could not resolve exact policy host {host:?}: {error}"
+                            ))
+                        })?
+                        .map(|address| address.ip())
+                        .collect::<Vec<_>>();
+                    if addresses.is_empty() {
+                        return Err(SessionError::Refused(format!(
+                            "exact policy host {host:?} resolved to no addresses"
+                        )));
+                    }
+                    cache.insert(host.clone(), addresses);
+                }
+                crate::policy::HostRule::Suffix(suffix) => {
+                    return Err(SessionError::Refused(format!(
+                        "suffix host policy \"*.{suffix}\" is not enforceable in schema version 1 (ADR-0020)"
+                    )));
+                }
+                crate::policy::HostRule::Any
+                | crate::policy::HostRule::Ip(_)
+                | crate::policy::HostRule::Cidr { .. } => {}
+            }
+        }
+        Ok(cache)
     }
 
     /// the body of `run_session` with the trace writer injected: the seam the fail-closed
@@ -257,7 +306,15 @@ mod linux {
         run_dir: &RunDir,
         writer: &mut TraceWriter<S>,
     ) -> Result<SessionOutcome, SessionError> {
-        run_session_with_writer_and_ruleset(spec, meta, run_dir, writer, None, None)
+        run_session_with_writer_and_ruleset(
+            spec,
+            meta,
+            run_dir,
+            writer,
+            None,
+            None,
+            &HashMap::new(),
+        )
     }
 
     fn run_session_with_writer_and_ruleset<S: TraceSink>(
@@ -265,8 +322,9 @@ mod linux {
         meta: RunMeta,
         run_dir: &RunDir,
         writer: &mut TraceWriter<S>,
-        _policy: Option<&crate::policy::Policy>,
-        landlock_ruleset: Option<RawFd>,
+        policy: Option<&crate::policy::Policy>,
+        prepared_ruleset: Option<&PreparedRuleset>,
+        resolved_hosts: &HashMap<String, Vec<IpAddr>>,
     ) -> Result<SessionOutcome, SessionError> {
         // step 3: announce the mode on stderr; stdout belongs to the child (FR-19)
         match meta.mode {
@@ -285,28 +343,36 @@ mod linux {
         writer.append(meta.start_ts, EventBody::RunStart(meta))?;
         writer.sync()?;
 
-        if mode == Mode::Enforce {
-            return Err(SessionError::Run(
-                crate::supervisor::run::RunError::UnsupportedMode,
-            ));
-        }
+        let broker = match mode {
+            Mode::RecordOnly => None,
+            Mode::Enforce => Some(RefCell::new(Broker::spawn(
+                prepared_ruleset.ok_or(SessionError::Run(
+                    crate::supervisor::run::RunError::MissingBroker,
+                ))?,
+                &spec.workspace,
+            )?)),
+        };
 
         // steps 5-6: spawn and serve until the tree exits
         let child = spawn_supervised(&SpawnSpec {
             argv: spec.argv.clone(),
             stdout: None,
             mode,
-            landlock_ruleset,
+            landlock_ruleset: prepared_ruleset.map(|ruleset| ruleset.ruleset_fd().as_raw_fd()),
         })?;
         let config = match mode {
             Mode::RecordOnly => {
                 crate::supervisor::run::RunConfig::record_only(child.pid as u32, spec.attendance)
             }
-            Mode::Enforce => {
-                return Err(SessionError::Run(
-                    crate::supervisor::run::RunError::UnsupportedMode,
-                ));
-            }
+            Mode::Enforce => crate::supervisor::run::RunConfig::enforce_with_broker(
+                child.pid as u32,
+                spec.attendance,
+                policy.ok_or(crate::supervisor::run::RunError::EnforceWithoutPolicy)?,
+                broker
+                    .as_ref()
+                    .ok_or(crate::supervisor::run::RunError::MissingBroker)?,
+                resolved_hosts,
+            ),
         };
         let outcome = run_loop(child, config, writer)?;
 
