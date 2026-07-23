@@ -1621,11 +1621,9 @@ mod tests {
         }
     }
 
-    /// the `host` field as the shipped build writes it. `policy.md` section 2.2 and
-    /// `trace.md` section 2 pin IPv4-mapped normalization ahead of the code, and name the
-    /// mapped form below as the gap the issue #26 implementation PR closes; when that
-    /// lands, the mapped case becomes `"1.2.3.4"` and this test moves with it. The IPv4
-    /// and native-IPv6 cases are unaffected by that change.
+    /// the `host` field uses the canonical form pinned by `policy.md` section 2.2 and
+    /// `trace.md` section 2: IPv4-mapped IPv6 records as IPv4, while native IPv6 is
+    /// unchanged.
     #[test]
     fn a_network_fact_records_the_destination_host_and_port() {
         fn sockaddr_in(port: u16, octets: [u8; 4]) -> Vec<u8> {

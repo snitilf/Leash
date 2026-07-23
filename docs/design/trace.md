@@ -78,14 +78,11 @@ Fact details fixed by the notify loop:
 - A cross-process fact carries `target_pid` when the syscall exposes one as a scalar register argument.
   `pidfd_getfd` carries no target pid, because its pidfd argument cannot be safely resolved under `CONTINUE`.
   It is denied and recorded in both modes as a member of the denied-and-recorded set ([`syscalls.md`](syscalls.md) section 5), under the `sr4:pidfd_getfd` id, because an imported fd is I/O the trace could not otherwise attribute (ADR-0019, recorded 2026-07-23).
-  The shipped M2 build matches this in neither mode: record-only allows it under `base:record_only`, and enforce denies it under a separate `failsafe:pidfd_getfd` id predating the decision.
-  The issue #26 implementation PR moves both legs onto the single vocabulary above, which is when a trace will start carrying the `sr4:pidfd_getfd` form; the gap is named in [`escapes.md`](escapes.md) section 4 until then.
 - A network fact carries the destination `host` string and `port` parsed from the trapped `sockaddr`.
   By the recorded decision of 2026-07-23 (the issue #26 hygiene pass), `host` carries the canonical form of the destination: an IPv4-mapped IPv6 address is written as its IPv4 form, so a dual-stack `connect` to `93.184.216.34` records `"93.184.216.34"` and never `"::ffff:93.184.216.34"` ([`policy.md`](policy.md) section 2.2).
   A native IPv6 destination is unchanged.
   This narrows the set of values the field can take without changing its type, so `schema_version` does not move; a reader that accepted the mapped form still decodes the canonical one.
-  The normalizing seam is unimplemented as of this pass: the shipped M2 build records a mapped destination as `"::ffff:93.184.216.34"`, and the `sockaddr` parse that canonicalizes it lands in the issue #26 implementation PR ([`policy.md`](policy.md) section 2.2).
-  A trace read before that PR can therefore carry the mapped form, and a reader that must span both should canonicalize on its own side.
+  Older traces can carry the mapped form, so a reader spanning both forms should canonicalize on its own side.
   If the `sockaddr` cannot be read or parsed within its bound, the event is recorded as `raw`.
   In record-only that raw network event is allowed, because record-only enforces nothing outside the denied-and-recorded set (ADR-0019, recorded 2026-07-23; FR-9 and I3 carry the same mode scope).
   In enforce mode the same untrusted network fact denies fail-closed.

@@ -42,7 +42,8 @@ Each layer references the ones above it by **stable ID** (requirement IDs like `
 - **M2 enforcement is in progress.**
   Policy parsing and pure evaluation, Landlock ruleset derivation and application primitives, and typed process, network, and cross-process trace/report facts have landed.
   Enforce mode still refuses before spawning because safe pointer-argument allow realization and its escape suite remain open in issue #25.
-  FR-2 family completeness remains open in issue #26, and attended approval remains blocked on #25 in issue #30.
+  FR-2 family completeness is implemented on the issue #26 branch and awaits Linux CI validation.
+  Attended approval remains blocked on #25 in issue #30.
 - One spec item remains deferred on purpose: OQ-9 (the ARM64 target), closing on a real ARM64 need.
   OQ-5 closed on 2026-07-13 into NFR-2's concrete budget from the M1 measurements.
 - No design parameter remains open.

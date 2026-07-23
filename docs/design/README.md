@@ -21,14 +21,10 @@ not edited casually. Three amendments have landed since:
   `notify-loop.md` sections 2 and 4 and `syscalls.md` section 4, `pidfd_getfd` joining the
   denied-and-recorded set in `syscalls.md` sections 3.4 and 5, the `host` field, the cross-process
   fact, and the raw-fact wording in `trace.md` section 2, invariant I3 in `architecture.md`
-  section 3, and the escape row and two entries in `escapes.md` sections 3 and 4. Each carries its
+  section 3, and the escape row and residual entry in `escapes.md` sections 3 and 4. Each carries its
   provenance where it lands, as an inline date or as the ADR-0019 citation.
 
-Two of those pins are ahead of the code on purpose, and both land in the issue #26 implementation
-PR: the IPv4-mapped normalization at the `sockaddr` and policy-load seams, and the `pidfd_getfd`
-denial in both modes, record-only behaviour and enforce rule id alike. Each is flagged where a
-reader would otherwise be misled, and the second is carried in `escapes.md` section 4 until it
-closes.
+The issue #26 implementation applies the IPv4-mapped normalization at the `sockaddr` and policy-load seams and denies `pidfd_getfd` in both modes under the stable SR-4 rule id.
 
 ## Reading order
 
