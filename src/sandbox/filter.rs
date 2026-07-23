@@ -38,6 +38,10 @@ const BPF_RET_K: u16 = 0x06; // BPF_RET | BPF_K
 // byte offsets into struct seccomp_data (include/uapi/linux/seccomp.h).
 const SECCOMP_DATA_NR: u32 = 0;
 const SECCOMP_DATA_ARCH: u32 = 4;
+const SECCOMP_DATA_ARGS: u32 = 16;
+const SENDTO_DEST_ARG: u32 = 4;
+const SENDTO_DEST_LO: u32 = SECCOMP_DATA_ARGS + SENDTO_DEST_ARG * 8;
+const SENDTO_DEST_HI: u32 = SENDTO_DEST_LO + 4;
 
 /// filter return value: run the syscall with no supervisor involvement
 /// (include/uapi/linux/seccomp.h).
@@ -158,23 +162,28 @@ pub const DENIED_RECORDED: &[u32] = &[
 ];
 
 /// build the filter program. every tabled syscall, every x32-bit number, and every
-/// foreign-arch entry routes to the notif return; everything else passes through.
+/// foreign-arch entry routes to the notif return, except connected-socket `sendto` calls
+/// whose destination pointer is null; everything else passes through.
 ///
 /// shape: load arch, bail to notif on mismatch; load nr, bail to notif on bit 30; one
-/// jeq per tabled number, all jumping to the shared notif return past the allow return.
-/// with two tables of ~40 numbers every jump offset stays far below the u8 bound, which
-/// `filter_is_well_formed` pins.
+/// jeq per ordinary tabled number, all jumping to the shared notif return past the allow
+/// return. `sendto` branches through two 32-bit loads to test its 64-bit destination
+/// pointer. with two tables of ~40 numbers every jump offset stays far below the u8 bound,
+/// which `filter_is_well_formed` pins.
 pub fn build_filter() -> Vec<SockFilter> {
     let tabled: Vec<u32> = MEDIATED.iter().chain(DENIED_RECORDED).copied().collect();
-    // ld arch + jeq, ld nr + jset, one jeq per number, ret allow, ret notif
-    let len = 4 + tabled.len() + 2;
+    // ld arch + jeq, ld nr + jset, one jeq per number, four extra sendto
+    // destination-pointer instructions, ret allow, ret notif
+    let len = 4 + tabled.len() + 4 + 2;
+    let allow_pc = len - 2;
     let notif_pc = len - 1;
     let mut prog = Vec::with_capacity(len);
 
     // the largest jump is from pc 1 to the notif return, an offset of table length + 3;
     // the compile-time check below keeps it inside the u8 jump field as the tables grow.
-    const _: () = assert!(MEDIATED.len() + DENIED_RECORDED.len() + 3 <= u8::MAX as usize);
+    const _: () = assert!(MEDIATED.len() + DENIED_RECORDED.len() + 7 <= u8::MAX as usize);
     let jump_to_notif = |from_pc: usize| -> u8 { (notif_pc - from_pc - 1) as u8 };
+    let jump_to_allow = |from_pc: usize| -> u8 { (allow_pc - from_pc - 1) as u8 };
 
     prog.push(SockFilter {
         code: BPF_LD_W_ABS,
@@ -202,6 +211,41 @@ pub fn build_filter() -> Vec<SockFilter> {
     });
     for nr in tabled {
         let pc = prog.len();
+        if nr == nr::SENDTO {
+            prog.push(SockFilter {
+                code: BPF_JEQ_K,
+                jt: 0,
+                jf: 4,
+                k: nr,
+            });
+            prog.push(SockFilter {
+                code: BPF_LD_W_ABS,
+                jt: 0,
+                jf: 0,
+                k: SENDTO_DEST_LO,
+            });
+            let low_pc = prog.len();
+            prog.push(SockFilter {
+                code: BPF_JEQ_K,
+                jt: 0,
+                jf: jump_to_notif(low_pc),
+                k: 0,
+            });
+            prog.push(SockFilter {
+                code: BPF_LD_W_ABS,
+                jt: 0,
+                jf: 0,
+                k: SENDTO_DEST_HI,
+            });
+            let high_pc = prog.len();
+            prog.push(SockFilter {
+                code: BPF_JEQ_K,
+                jt: jump_to_allow(high_pc),
+                jf: jump_to_notif(high_pc),
+                k: 0,
+            });
+            continue;
+        }
         prog.push(SockFilter {
             code: BPF_JEQ_K,
             jt: jump_to_notif(pc),
@@ -234,7 +278,7 @@ mod tests {
     /// the tests' expected outcomes come from the bpf semantics in the kernel docs, not
     /// from the construction code: unknown opcodes, out-of-range jumps, out-of-range
     /// loads, and running off the end are all hard errors.
-    fn run(prog: &[SockFilter], nr: u32, arch: u32) -> Result<u32, String> {
+    fn run(prog: &[SockFilter], nr: u32, arch: u32, args: [u64; 6]) -> Result<u32, String> {
         let mut acc: u32 = 0;
         let mut pc: usize = 0;
         // a filter this size terminates in far fewer steps; the bound catches loops,
@@ -248,6 +292,17 @@ mod tests {
                     acc = match insn.k {
                         SECCOMP_DATA_NR => nr,
                         SECCOMP_DATA_ARCH => arch,
+                        offset if (SECCOMP_DATA_ARGS..SECCOMP_DATA_ARGS + 48).contains(&offset) => {
+                            let relative = offset - SECCOMP_DATA_ARGS;
+                            let arg = args[(relative / 8) as usize];
+                            if relative % 8 == 0 {
+                                arg as u32
+                            } else if relative % 8 == 4 {
+                                (arg >> 32) as u32
+                            } else {
+                                return Err(format!("unaligned argument load at offset {offset}"));
+                            }
+                        }
                         k => return Err(format!("load from unmodeled offset {k}")),
                     };
                     pc += 1;
@@ -268,16 +323,38 @@ mod tests {
     }
 
     fn run_x86_64(nr: u32) -> u32 {
-        run(&build_filter(), nr, AUDIT_ARCH_X86_64).expect("filter must terminate")
+        run(&build_filter(), nr, AUDIT_ARCH_X86_64, [0; 6]).expect("filter must terminate")
+    }
+
+    fn run_x86_64_with_args(nr: u32, args: [u64; 6]) -> u32 {
+        run(&build_filter(), nr, AUDIT_ARCH_X86_64, args).expect("filter must terminate")
     }
 
     #[test]
     fn filter_routes_every_tabled_syscall_to_user_notif() {
         for &nr in MEDIATED.iter().chain(DENIED_RECORDED) {
+            let mut args = [0; 6];
+            if nr == nr::SENDTO {
+                args[4] = 1;
+            }
             assert_eq!(
-                run_x86_64(nr),
+                run_x86_64_with_args(nr, args),
                 SECCOMP_RET_USER_NOTIF,
                 "tabled syscall {nr} must trap"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_only_bypasses_sendto_with_a_null_destination() {
+        assert_eq!(run_x86_64(nr::SENDTO), SECCOMP_RET_ALLOW);
+
+        for dest in [1, u64::from(u32::MAX), 1_u64 << 32, u64::MAX] {
+            let mut args = [0; 6];
+            args[4] = dest;
+            assert_eq!(
+                run_x86_64_with_args(nr::SENDTO, args),
+                SECCOMP_RET_USER_NOTIF
             );
         }
     }
@@ -315,7 +392,7 @@ mod tests {
         // only after the arch check, so even an "allowed" i386 number traps.
         for nr in [0, 1, 39, nr::OPENAT] {
             assert_eq!(
-                run(&build_filter(), nr, AUDIT_ARCH_I386).expect("filter must terminate"),
+                run(&build_filter(), nr, AUDIT_ARCH_I386, [0; 6]).expect("filter must terminate"),
                 SECCOMP_RET_USER_NOTIF
             );
         }
