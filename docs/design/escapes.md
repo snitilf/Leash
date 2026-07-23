@@ -2,7 +2,7 @@
 
 - Status: settled (2026-07-08). The M0 spike's gate, narrowed to the x86-64 leg by ADR-0014, is met; this file freezes with the design layer.
 - Governs: the escape classes the design must resist, the mechanism and test that stop each, and the residual risks that are accepted and named.
-- Cites: FR-1, FR-3, FR-4, FR-9; NFR-5; SR-1, SR-2, SR-3, SR-4; ADR-0002, ADR-0003, ADR-0011, ADR-0012, ADR-0013. Invariants I1-I5 are defined in [`architecture.md`](architecture.md).
+- Cites: FR-1, FR-3, FR-4, FR-9; NFR-5; SR-1, SR-2, SR-3, SR-4; ADR-0002, ADR-0003, ADR-0011, ADR-0012, ADR-0013, ADR-0019. Invariants I1-I5 are defined in [`architecture.md`](architecture.md).
 
 This file is written last because it audits the rest of the design layer. Every other file points a
 residual or an escape test here; this is where those promises are collected and checked against each

@@ -3,8 +3,8 @@
 - Status: settled (slate 2 closed 2026-07-08)
 - Governs: the per-run directory layout, the JSONL event schema, durability, and the human-readable
   session report.
-- Cites: FR-2, FR-3, FR-5, FR-16, FR-19, FR-21; NFR-3; ADR-0002, ADR-0010, ADR-0011. Invariants I2,
-  I3, I4 are defined in [`architecture.md`](architecture.md).
+- Cites: FR-2, FR-3, FR-5, FR-16, FR-19, FR-21; NFR-3; ADR-0002, ADR-0010, ADR-0011, ADR-0019.
+  Invariants I2, I3, I4 are defined in [`architecture.md`](architecture.md).
 
 The **trace** is the ground-truth account of what the agent did, authored solely by the supervisor
 (FR-3, I2). This file fixes where it lives, the shape of each **event**, and the **session report**

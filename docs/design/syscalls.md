@@ -3,8 +3,9 @@
 - Status: settled (slate 2 closed 2026-07-08)
 - Governs: which syscalls the seccomp filter mediates, denies, or passes through, and how each
   allowed one is realized safely.
-- Cites: FR-2, FR-4, FR-15; NFR-3; SR-2, SR-3, SR-4; ADR-0003, ADR-0006, ADR-0010, ADR-0011,
-  ADR-0012, ADR-0013. Invariants I1, I3, I4, I5 are defined in [`architecture.md`](architecture.md).
+- Cites: FR-2, FR-4, FR-15, FR-19; NFR-3; SR-2, SR-3, SR-4; ADR-0003, ADR-0006, ADR-0010, ADR-0011,
+  ADR-0012, ADR-0013, ADR-0019. Invariants I1, I3, I4, I5 are defined in
+  [`architecture.md`](architecture.md).
 
 This file fixes the mediation surface: the exact sets of syscalls that are mediated, denied, or
 allowed to run unmediated, and the rule for how an allowed mediated syscall is carried out without
