@@ -9,12 +9,6 @@
 //! resolved set; the child's resolver is never trusted (policy.md section 2.2). the match
 //! helpers here are the pure primitives that later step composes.
 //!
-//! not yet implemented here: policy.md section 2.2 pins IPv4-mapped IPv6 normalization on
-//! the rule side too (`::ffff:1.2.3.4` loading as `1.2.3.4`, a mapped `/96`-or-longer CIDR
-//! loading as the IPv4 block it covers, a shorter mapped CIDR rejected at load). until that
-//! seam lands with the issue #26 implementation PR, a mapped-form rule is stored as written
-//! and will not match the IPv4 form of the same destination.
-
 use std::fmt;
 use std::net::IpAddr;
 
@@ -76,6 +70,17 @@ impl HostRule {
         if let Some((addr, prefix)) = host.split_once('/') {
             let addr: IpAddr = addr.parse().map_err(|_| HostError::InvalidCidr)?;
             let prefix: u8 = prefix.parse().map_err(|_| HostError::InvalidCidr)?;
+            if let IpAddr::V6(v6) = addr
+                && let Some(v4) = v6.to_ipv4_mapped()
+            {
+                if prefix < 96 {
+                    return Err(HostError::InvalidCidr);
+                }
+                return Ok(HostRule::Cidr {
+                    addr: IpAddr::V4(v4),
+                    prefix: prefix - 96,
+                });
+            }
             let max = match addr {
                 IpAddr::V4(_) => 32,
                 IpAddr::V6(_) => 128,
@@ -86,7 +91,7 @@ impl HostRule {
             return Ok(HostRule::Cidr { addr, prefix });
         }
         if let Ok(ip) = host.parse::<IpAddr>() {
-            return Ok(HostRule::Ip(ip));
+            return Ok(HostRule::Ip(normalize_ip(ip)));
         }
         if valid_hostname(host) {
             return Ok(HostRule::Exact(host.to_ascii_lowercase()));
@@ -123,6 +128,13 @@ impl HostRule {
             }
             HostRule::Ip(_) | HostRule::Cidr { .. } => false,
         }
+    }
+}
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        IpAddr::V4(v4) => IpAddr::V4(v4),
     }
 }
 
@@ -209,6 +221,10 @@ mod tests {
         );
         assert_eq!(HostRule::parse("::1"), Ok(HostRule::Ip(ip("::1"))));
         assert_eq!(
+            HostRule::parse("::ffff:203.0.113.7"),
+            Ok(HostRule::Ip(ip("203.0.113.7")))
+        );
+        assert_eq!(
             HostRule::parse("10.0.0.0/8"),
             Ok(HostRule::Cidr {
                 addr: ip("10.0.0.0"),
@@ -220,6 +236,13 @@ mod tests {
             Ok(HostRule::Cidr {
                 addr: ip("fd00::"),
                 prefix: 8
+            })
+        );
+        assert_eq!(
+            HostRule::parse("::ffff:192.0.2.0/120"),
+            Ok(HostRule::Cidr {
+                addr: ip("192.0.2.0"),
+                prefix: 24
             })
         );
     }
@@ -245,6 +268,10 @@ mod tests {
         assert_eq!(HostRule::parse("fd00::/129"), Err(HostError::InvalidCidr));
         assert_eq!(HostRule::parse("999.0.0.0/8"), Err(HostError::InvalidCidr));
         assert_eq!(HostRule::parse("10.0.0.0/x"), Err(HostError::InvalidCidr));
+        assert_eq!(
+            HostRule::parse("::ffff:192.0.2.0/95"),
+            Err(HostError::InvalidCidr)
+        );
     }
 
     #[test]
@@ -259,6 +286,15 @@ mod tests {
         let exact = HostRule::parse("203.0.113.7").unwrap();
         assert!(exact.matches_ip(ip("203.0.113.7")));
         assert!(!exact.matches_ip(ip("203.0.113.8")));
+
+        let mapped = HostRule::parse("::ffff:203.0.113.7").unwrap();
+        assert!(mapped.matches_ip(ip("203.0.113.7")));
+        assert_eq!(mapped.to_string(), "203.0.113.7");
+
+        let mapped_cidr = HostRule::parse("::ffff:192.0.2.0/120").unwrap();
+        assert!(mapped_cidr.matches_ip(ip("192.0.2.99")));
+        assert!(!mapped_cidr.matches_ip(ip("192.0.3.1")));
+        assert_eq!(mapped_cidr.to_string(), "192.0.2.0/24");
 
         let all = HostRule::parse("0.0.0.0/0").unwrap();
         assert!(all.matches_ip(ip("8.8.8.8")));

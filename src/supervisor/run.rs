@@ -32,6 +32,8 @@ use crate::supervisor::mem::MemReadError;
 use crate::supervisor::notify::SeccompNotif;
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(60);
+const CLONE_ARGS_MIN_SIZE: u64 = 8;
+const CLONE_ARGS_MAX_SIZE: u64 = 88;
 
 /// matched-rule ids for a policy-less run (trace.md section 2).
 pub mod rule {
@@ -49,10 +51,8 @@ pub mod rule {
     pub const PROCESS_TREE: &str = "base:process_tree";
     /// cross-process control attempted outside the supervised tree
     pub const PROCESS_TREE_DENY: &str = "failsafe:process_tree";
-    /// pidfd_getfd is not safely resolvable in enforce mode v1. ADR-0019 has since put the
-    /// syscall in the SR-4 denied-and-recorded set, denied under `sr4:pidfd_getfd` in both
-    /// modes; this id and the record-only allow are the gap escapes.md section 4 names.
-    pub const PIDFD_GETFD: &str = "failsafe:pidfd_getfd";
+    /// the pidfd_getfd unconditional deny (SR-4, ADR-0019)
+    pub const PIDFD_GETFD: &str = "sr4:pidfd_getfd";
 }
 
 /// how the run ended.
@@ -277,13 +277,18 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
     }
     if DENIED_RECORDED.contains(&sys_nr) {
         let name = syscall_name(sys_nr).unwrap_or("unknown");
+        let matched_rule = if sys_nr == nr::PIDFD_GETFD {
+            rule::PIDFD_GETFD
+        } else {
+            rule::IO_URING
+        };
         record(
             writer,
             ts,
             notif,
             name,
             Fact::Raw {},
-            &fixed_decision(Decision::Deny, rule::IO_URING),
+            &fixed_decision(Decision::Deny, matched_rule),
         )?;
         tolerate_dead(kernel.send_error(notif.id, libc::ENOSYS))?;
         return Ok(Handled::Responded);
@@ -466,6 +471,19 @@ fn handle_process<N: Notifier, S: TraceSink>(
     let flags = if sys_nr == nr::CLONE {
         Some(notif.data.args[0])
     } else if sys_nr == nr::CLONE3 {
+        let size = notif.data.args[1];
+        if !(CLONE_ARGS_MIN_SIZE..=CLONE_ARGS_MAX_SIZE).contains(&size) {
+            record(
+                writer,
+                ts,
+                notif,
+                name,
+                Fact::Raw {},
+                &fixed_decision(Decision::Deny, rule::MEMORY_READ),
+            )?;
+            tolerate_dead(kernel.send_error(notif.id, libc::EACCES))?;
+            return Ok(Handled::Responded);
+        }
         if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
             return Ok(Handled::Dropped);
         }
@@ -520,24 +538,6 @@ fn handle_cross_process<N: Notifier, S: TraceSink>(
     sys_nr: u32,
 ) -> Result<Handled, RunError> {
     let name = syscall_name(sys_nr).unwrap_or("unknown");
-    if sys_nr == nr::PIDFD_GETFD {
-        let decision = if config.mode == crate::recorder::Mode::RecordOnly {
-            fixed_decision(Decision::Allow, rule::RECORD_ONLY)
-        } else {
-            fixed_decision(Decision::Deny, rule::PIDFD_GETFD)
-        };
-        record(
-            writer,
-            ts,
-            notif,
-            name,
-            Fact::CrossProcess { target_pid: None },
-            &decision,
-        )?;
-        respond_continue_or_deny(kernel, notif.id, &decision)?;
-        return Ok(Handled::Responded);
-    }
-
     let target_pid = match sys_nr {
         nr::PTRACE => notif.data.args[1] as u32,
         nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV => notif.data.args[0] as u32,
@@ -683,7 +683,8 @@ fn parse_sockaddr(bytes: Vec<u8>) -> Result<(IpAddr, u16), MemReadError> {
             let port = u16::from_be_bytes([bytes[2], bytes[3]]);
             let mut addr = [0u8; 16];
             addr.copy_from_slice(&bytes[8..24]);
-            Ok((IpAddr::V6(Ipv6Addr::from(addr)), port))
+            let ip = Ipv6Addr::from(addr);
+            Ok((ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4), port))
         }
         _ => Err(MemReadError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -703,7 +704,7 @@ fn is_network(sys_nr: u32) -> bool {
 fn is_cross_process(sys_nr: u32) -> bool {
     matches!(
         sys_nr,
-        nr::PTRACE | nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV | nr::PIDFD_GETFD
+        nr::PTRACE | nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV
     )
 }
 
@@ -1443,20 +1444,80 @@ mod tests {
     fn process_and_cross_process_syscalls_record_typed_facts() {
         let kernel = FakeNotifier::default();
         let mut w = writer();
-        for n in [nr::CLONE, nr::PTRACE, nr::PIDFD_GETFD] {
-            handle_notification(&kernel, &notif(n, [0; 6]), &mut w, 1_000).unwrap();
-        }
-        assert_eq!(kernel.sent().len(), 3);
+        handle_notification(&kernel, &notif(nr::CLONE, [0; 6]), &mut w, 1_000).unwrap();
+        handle_notification(
+            &kernel,
+            &notif(nr::PTRACE, [0, 71, 0, 0, 0, 0]),
+            &mut w,
+            1_001,
+        )
+        .unwrap();
+        handle_notification(
+            &kernel,
+            &notif(nr::PROCESS_VM_READV, [72, 0, 0, 0, 0, 0]),
+            &mut w,
+            1_002,
+        )
+        .unwrap();
+        handle_notification(
+            &kernel,
+            &notif(nr::PROCESS_VM_WRITEV, [73, 0, 0, 0, 0, 0]),
+            &mut w,
+            1_003,
+        )
+        .unwrap();
+        assert_eq!(kernel.sent().len(), 4);
         assert!(kernel.sent().iter().all(|s| s.starts_with("continue:")));
         let evs = events(w);
         assert_eq!(evs[0]["fact"]["family"], "process");
         assert_eq!(evs[0]["fact"]["flags"], 0);
         assert_eq!(evs[1]["fact"]["family"], "cross_process");
-        assert_eq!(evs[1]["fact"]["target_pid"], 0);
+        assert_eq!(evs[1]["fact"]["target_pid"], 71);
         assert_eq!(evs[2]["fact"]["family"], "cross_process");
-        assert!(evs[2]["fact"]["target_pid"].is_null());
-        assert_eq!(evs[2]["decision"], "allow");
-        assert_eq!(evs[2]["matched_rule"], rule::RECORD_ONLY);
+        assert_eq!(evs[2]["fact"]["target_pid"], 72);
+        assert_eq!(evs[3]["fact"]["target_pid"], 73);
+        assert!(evs.iter().all(|ev| ev["decision"] == "allow"));
+        assert!(evs.iter().all(|ev| ev["matched_rule"] == rule::RECORD_ONLY));
+    }
+
+    #[test]
+    fn clone3_only_reads_flags_for_supported_struct_sizes() {
+        for size in [CLONE_ARGS_MIN_SIZE, CLONE_ARGS_MAX_SIZE] {
+            let kernel =
+                FakeNotifier::default().with_bytes(0x1000, 0x1234_u64.to_ne_bytes().to_vec());
+            let mut w = writer();
+            handle_notification(
+                &kernel,
+                &notif(nr::CLONE3, [0x1000, size, 0, 0, 0, 0]),
+                &mut w,
+                1_000,
+            )
+            .unwrap();
+            assert_eq!(kernel.sent(), vec!["continue:7"]);
+            assert_eq!(events(w)[0]["fact"]["flags"], 0x1234);
+        }
+
+        for size in [
+            0,
+            CLONE_ARGS_MIN_SIZE - 1,
+            CLONE_ARGS_MAX_SIZE + 1,
+            u64::MAX,
+        ] {
+            let kernel = FakeNotifier::default();
+            let mut w = writer();
+            handle_notification(
+                &kernel,
+                &notif(nr::CLONE3, [0xdead, size, 0, 0, 0, 0]),
+                &mut w,
+                1_000,
+            )
+            .unwrap();
+            assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+            let ev = &events(w)[0];
+            assert_eq!(ev["fact"]["family"], "raw");
+            assert_eq!(ev["decision"], "deny");
+            assert_eq!(ev["matched_rule"], rule::MEMORY_READ);
+        }
     }
 
     #[test]
@@ -1525,6 +1586,41 @@ mod tests {
         assert_eq!(ev["matched_rule"], rule::MEMORY_READ);
     }
 
+    #[test]
+    fn network_overcap_sockaddr_uses_the_mode_specific_raw_decision() {
+        for enforce in [false, true] {
+            let kernel = FakeNotifier::default();
+            let p = policy("schema_version = 1\n");
+            let config = if enforce {
+                RunConfig::enforce(4242, Attendance::Unattended, &p)
+            } else {
+                RunConfig::record_only(4242, Attendance::Unattended)
+            };
+            let mut w = writer();
+            super::handle_notification(
+                &kernel,
+                &notif(nr::SENDTO, [3, 0, 0, 0, 0xdead, 129]),
+                &mut w,
+                &config,
+                1_000,
+            )
+            .unwrap();
+
+            let ev = &events(w)[0];
+            assert_eq!(ev["syscall"], "sendto");
+            assert_eq!(ev["fact"]["family"], "raw");
+            if enforce {
+                assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+                assert_eq!(ev["decision"], "deny");
+                assert_eq!(ev["matched_rule"], rule::MEMORY_READ);
+            } else {
+                assert_eq!(kernel.sent(), vec!["continue:7"]);
+                assert_eq!(ev["decision"], "allow");
+                assert_eq!(ev["matched_rule"], rule::RECORD_ONLY);
+            }
+        }
+    }
+
     /// the `host` field as the shipped build writes it. `policy.md` section 2.2 and
     /// `trace.md` section 2 pin IPv4-mapped normalization ahead of the code, and name the
     /// mapped form below as the gap the issue #26 implementation PR closes; when that
@@ -1570,42 +1666,35 @@ mod tests {
         assert!(evs.iter().all(|e| e["fact"]["family"] == "net"));
         assert_eq!(evs[0]["fact"]["host"], "1.2.3.4");
         assert_eq!(evs[0]["fact"]["port"], 443);
-        // the documented pre-normalization gap: the same destination through a
-        // dual-stack socket does not yet canonicalize to its IPv4 form.
-        assert_eq!(evs[1]["fact"]["host"], "::ffff:1.2.3.4");
+        assert_eq!(evs[1]["fact"]["host"], "1.2.3.4");
         assert_eq!(evs[2]["fact"]["host"], "2606:4700:4700::1111");
         assert_eq!(evs[2]["fact"]["port"], 53);
     }
 
-    /// the `pidfd_getfd` gap `escapes.md` section 4 names, in its enforce leg: ADR-0019
-    /// puts the syscall in the denied-and-recorded set under `sr4:pidfd_getfd` in both
-    /// modes, and the shipped build denies it under the older `failsafe:pidfd_getfd` id
-    /// while record-only allows it outright (the test above). Both legs move onto the one
-    /// vocabulary in the issue #26 implementation PR.
     #[test]
-    fn pidfd_getfd_denies_under_the_pre_adr_0019_id_in_enforce() {
-        let kernel = FakeNotifier::default();
+    fn pidfd_getfd_is_denied_and_recorded_under_sr4_in_both_modes() {
         let p = policy("schema_version = 1\n");
-        let config = RunConfig::enforce(4242, Attendance::Unattended, &p);
-        let mut w = writer();
-        super::handle_notification(
-            &kernel,
-            &notif(nr::PIDFD_GETFD, [0; 6]),
-            &mut w,
-            &config,
-            1_000,
-        )
-        .unwrap();
+        for config in [
+            RunConfig::record_only(4242, Attendance::Unattended),
+            RunConfig::enforce(4242, Attendance::Unattended, &p),
+        ] {
+            let kernel = FakeNotifier::default();
+            let mut w = writer();
+            super::handle_notification(
+                &kernel,
+                &notif(nr::PIDFD_GETFD, [0; 6]),
+                &mut w,
+                &config,
+                1_000,
+            )
+            .unwrap();
 
-        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
-        let ev = &events(w)[0];
-        assert_eq!(ev["fact"]["family"], "cross_process");
-        assert_eq!(ev["decision"], "deny");
-        assert_eq!(ev["matched_rule"], "failsafe:pidfd_getfd");
-        assert_ne!(
-            ev["matched_rule"], "sr4:pidfd_getfd",
-            "ADR-0019's id lands with the issue #26 implementation PR"
-        );
+            assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::ENOSYS)]);
+            let ev = &events(w)[0];
+            assert_eq!(ev["fact"]["family"], "raw");
+            assert_eq!(ev["decision"], "deny");
+            assert_eq!(ev["matched_rule"], rule::PIDFD_GETFD);
+        }
     }
 
     #[test]
