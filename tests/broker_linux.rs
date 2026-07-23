@@ -15,6 +15,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use leash::policy::{ExpandContext, Policy};
 use leash::sandbox::landlock;
+use leash::supervisor::broker::{Broker, BrokerResult, BrokerResultOrPath};
 
 static FORK_LOCK: Mutex<()> = Mutex::new(());
 
@@ -205,6 +206,64 @@ fn pidfd_duplicate_operates_on_the_childs_socket_object() {
         1
     );
     assert_eq!(wait_exit(pid), 0);
+}
+
+#[test]
+fn production_broker_prepares_and_commits_an_allowed_open() {
+    let _guard = fork_guard();
+    let workspace = tempfile::tempdir().unwrap();
+    let allowed_path = workspace.path().join("allowed.txt");
+    std::fs::write(&allowed_path, b"prepared-open").unwrap();
+    let policy = Policy::parse(
+        "schema_version = 1\n",
+        &ExpandContext {
+            workspace: workspace.path().to_str().unwrap(),
+            home: "/tmp",
+        },
+    )
+    .unwrap();
+    let prepared_ruleset = landlock::prepare_ruleset(&landlock::derive_hull(&policy, 4)).unwrap();
+    let mut broker = Broker::spawn(&prepared_ruleset, workspace.path()).unwrap();
+    let prepared = match broker.prepare_path(&allowed_path, true, false).unwrap() {
+        BrokerResultOrPath::Path(path) => path,
+        other => panic!("expected prepared path, got {other:?}"),
+    };
+    assert_eq!(prepared.identity(), allowed_path);
+    let mut returned = match broker
+        .commit_open(prepared, libc::O_RDONLY as u64, 0)
+        .unwrap()
+    {
+        BrokerResult::Fd(fd) => std::fs::File::from(fd),
+        other => panic!("expected returned fd, got {other:?}"),
+    };
+    let mut contents = String::new();
+    returned.read_to_string(&mut contents).unwrap();
+    assert_eq!(contents, "prepared-open");
+}
+
+#[test]
+fn production_broker_rejects_a_path_outside_every_anchor() {
+    let _guard = fork_guard();
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_path = outside.path().join("outside.txt");
+    std::fs::write(&outside_path, b"outside").unwrap();
+    let policy = Policy::parse(
+        "schema_version = 1\n",
+        &ExpandContext {
+            workspace: workspace.path().to_str().unwrap(),
+            home: "/tmp",
+        },
+    )
+    .unwrap();
+    let prepared_ruleset = landlock::prepare_ruleset(&landlock::derive_hull(&policy, 4)).unwrap();
+    let mut broker = Broker::spawn(&prepared_ruleset, workspace.path()).unwrap();
+    match broker.prepare_path(&outside_path, true, false).unwrap() {
+        BrokerResultOrPath::Result(BrokerResult::Errno(errno)) => {
+            assert_eq!(errno, libc::EACCES)
+        }
+        other => panic!("expected EACCES, got {other:?}"),
+    }
 }
 
 fn seqpacket_pair() -> (OwnedFd, OwnedFd) {

@@ -7,6 +7,8 @@
 //! no default-allow branch to fall into. record precedes respond: an action the recorder
 //! cannot write does not happen.
 
+#[cfg(target_os = "linux")]
+pub mod broker;
 pub mod fact;
 pub mod mem;
 pub mod notify;

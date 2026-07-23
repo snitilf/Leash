@@ -277,8 +277,57 @@ pub enum LandlockError {
 mod linux {
     use super::*;
     use std::ffi::CString;
-    use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+    use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
     use std::path::Path;
+
+    /// One authoritative policy hierarchy opened before either enforcing task starts.
+    #[derive(Debug)]
+    pub struct RootAnchor {
+        root: PathBuf,
+        allowed_access: u64,
+        fd: OwnedFd,
+    }
+
+    impl RootAnchor {
+        /// Canonical path represented by this anchor.
+        pub fn root(&self) -> &Path {
+            &self.root
+        }
+
+        /// Landlock rights granted beneath this anchor.
+        pub fn allowed_access(&self) -> u64 {
+            self.allowed_access
+        }
+
+        /// Descriptor inherited by the confined broker.
+        pub fn as_fd(&self) -> BorrowedFd<'_> {
+            self.fd.as_fd()
+        }
+    }
+
+    /// Ruleset plus the exact hierarchy descriptors from which it was built.
+    #[derive(Debug)]
+    pub struct PreparedRuleset {
+        ruleset: OwnedFd,
+        anchors: Vec<RootAnchor>,
+    }
+
+    impl PreparedRuleset {
+        /// Ruleset descriptor applied to the broker and agent.
+        pub fn ruleset_fd(&self) -> BorrowedFd<'_> {
+            self.ruleset.as_fd()
+        }
+
+        /// Authoritative path anchors inherited by the broker.
+        pub fn anchors(&self) -> &[RootAnchor] {
+            &self.anchors
+        }
+
+        /// Split the prepared object when ownership of both parts is needed.
+        pub fn into_parts(self) -> (OwnedFd, Vec<RootAnchor>) {
+            (self.ruleset, self.anchors)
+        }
+    }
 
     #[cfg(test)]
     pub(super) const CREATE_RULESET_VERSION: libc::c_ulong = 1 << 0;
@@ -305,6 +354,12 @@ mod linux {
 
     /// Build a Landlock ruleset fd in the parent.
     pub fn build_ruleset(hull: &LandlockHull) -> Result<OwnedFd, LandlockError> {
+        Ok(prepare_ruleset(hull)?.ruleset)
+    }
+
+    /// Open every hierarchy once and build Landlock from those retained descriptors.
+    pub fn prepare_ruleset(hull: &LandlockHull) -> Result<PreparedRuleset, LandlockError> {
+        let anchors = open_anchors(&hull.fs)?;
         let attr = RulesetAttr {
             handled_access_fs: hull.handled_access_fs,
             handled_access_net: hull.handled_access_net,
@@ -324,17 +379,21 @@ mod linux {
         // SAFETY: the syscall returned a new ruleset fd owned by this process.
         let ruleset = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
 
-        for grant in &hull.fs {
-            add_path_rule(&ruleset, grant)?;
+        for anchor in &anchors {
+            add_path_rule(&ruleset, anchor)?;
         }
         if hull.handled_access_net != 0 {
             add_net_rules(&ruleset, &hull.net)?;
         }
 
-        Ok(ruleset)
+        Ok(PreparedRuleset { ruleset, anchors })
     }
 
-    fn add_path_rule(ruleset: &OwnedFd, grant: &FsGrant) -> Result<(), LandlockError> {
+    fn open_anchors(grants: &[FsGrant]) -> Result<Vec<RootAnchor>, LandlockError> {
+        grants.iter().map(open_anchor).collect()
+    }
+
+    fn open_anchor(grant: &FsGrant) -> Result<RootAnchor, LandlockError> {
         let resolved = deepest_existing_ancestor(&grant.root).map_err(|source| {
             LandlockError::OpenHierarchy {
                 path: grant.root.clone(),
@@ -351,11 +410,21 @@ mod linux {
                 source: std::io::Error::last_os_error(),
             });
         }
-        let attr = PathBeneathAttr {
+        // SAFETY: open returned a new descriptor owned by this process.
+        let fd = unsafe { OwnedFd::from_raw_fd(parent_fd) };
+        Ok(RootAnchor {
+            root: resolved,
             allowed_access: grant.allowed_access,
-            parent_fd,
+            fd,
+        })
+    }
+
+    fn add_path_rule(ruleset: &OwnedFd, anchor: &RootAnchor) -> Result<(), LandlockError> {
+        let attr = PathBeneathAttr {
+            allowed_access: anchor.allowed_access,
+            parent_fd: anchor.fd.as_raw_fd(),
         };
-        // SAFETY: landlock_add_rule reads `attr`, borrowing parent_fd only for the call.
+        // SAFETY: landlock_add_rule reads `attr`, borrowing the retained anchor fd.
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_landlock_add_rule,
@@ -365,11 +434,9 @@ mod linux {
                 0,
             )
         };
-        // SAFETY: parent_fd was opened above and is no longer needed after add_rule.
-        unsafe { libc::close(parent_fd) };
         if rc != 0 {
             return Err(LandlockError::AddRule {
-                path: resolved.display().to_string(),
+                path: anchor.root.display().to_string(),
                 source: std::io::Error::last_os_error(),
             });
         }
@@ -439,6 +506,8 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 pub use linux::build_ruleset;
+#[cfg(target_os = "linux")]
+pub use linux::{PreparedRuleset, RootAnchor, prepare_ruleset};
 
 /// Apply a parent-built Landlock ruleset to the current process.
 ///
