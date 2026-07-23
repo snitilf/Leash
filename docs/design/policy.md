@@ -112,6 +112,8 @@ Pinned by the recorded decisions of 2026-07-13:
   `*.example.com` matches `api.example.com` and never `example.com`. Covering the apex takes one
   additional exact rule.
 - Hostname matching is case-insensitive. Port 0 is a load-time rejection.
+- An IPv4-mapped IPv6 destination (`::ffff:a.b.c.d`) is normalized to IPv4 before it is recorded or evaluated.
+  This makes an IPv4 literal or CIDR rule apply consistently to the same destination reached through an IPv4 or dual-stack socket; native IPv6 destinations remain IPv6.
 
 ### 2.3 One execution control (fixed at slate 2)
 

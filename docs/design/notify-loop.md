@@ -51,13 +51,11 @@ The child's pointer arguments are the whole TOCTOU problem (SR-2, I4). The rules
   `/proc/<pid>/mem` at the address from the trap-time registers.
 - Bracket the read with `ID_VALID`: check validity, read, check validity again. A read that spans the
   child's death is discarded, and the id cannot have been silently reused underneath it.
-- Cap every read. The caps, fixed at slate 2, are the kernel's own limits: 4096 bytes for a path
-  (`PATH_MAX`), 128 bytes for a `sockaddr` (`sizeof(struct sockaddr_storage)`), the current kernel
-  struct size for `clone_args` (and likewise for `openat2`'s `open_how`, read under the same
-  struct-size rule), and one page as the absolute ceiling for any read. An unbounded or
-  attacker-chosen length is a denial-of-service on the single decision thread; over the cap
-  resolves to deny (section 4, case C), because a value larger than the kernel itself would accept
-  is hostile by definition.
+- Cap every read.
+  The caps, fixed at slate 2, are the kernel's own limits: 4096 bytes for a path (`PATH_MAX`), 128 bytes for a `sockaddr` (`sizeof(struct sockaddr_storage)`), the current kernel struct size for `clone_args` (and likewise for `openat2`'s `open_how`, read under the same struct-size rule), and one page as the absolute ceiling for any read.
+  An unbounded or attacker-chosen length is a denial-of-service on the single decision thread.
+  A malformed or over-cap path or `clone_args` resolves to deny (section 4, case C), because the trusted fact cannot be built.
+  A malformed or over-cap network address is the mode-specific exception recorded in [`trace.md`](trace.md) section 2: record-only records a raw allow, while enforce records a raw fail-closed deny.
 - The value read is used once, to build the typed fact, and for a pointer-argument allow it is never
   handed back to the child as a re-editable argument. That is why the allow-realization rule
   (section 3) forbids `CONTINUE` for pointer-argument decisions: `CONTINUE` re-reads child memory at
