@@ -3,7 +3,8 @@
 - Status: settled (slate 2 closed 2026-07-08)
 - Governs: the protocol the supervisor runs on the seccomp notification fd, how it reads child
   memory safely, and how every error path resolves to deny.
-- Cites: FR-2, FR-3, FR-9, FR-10, FR-20; NFR-1, NFR-6; SR-2, SR-3; ADR-0002, ADR-0011, ADR-0012.
+- Cites: FR-2, FR-3, FR-9, FR-10, FR-20; NFR-1, NFR-6; SR-2, SR-3; ADR-0002, ADR-0010, ADR-0011,
+  ADR-0012, ADR-0019.
   Invariants I2, I3, I4, I5 are defined in [`architecture.md`](architecture.md).
 
 This is the state machine that turns one `seccomp_notif` into one **decision** and one **event**. It
@@ -51,13 +52,13 @@ The child's pointer arguments are the whole TOCTOU problem (SR-2, I4). The rules
   `/proc/<pid>/mem` at the address from the trap-time registers.
 - Bracket the read with `ID_VALID`: check validity, read, check validity again. A read that spans the
   child's death is discarded, and the id cannot have been silently reused underneath it.
-- Cap every read. The caps, fixed at slate 2, are the kernel's own limits: 4096 bytes for a path
-  (`PATH_MAX`), 128 bytes for a `sockaddr` (`sizeof(struct sockaddr_storage)`), the current kernel
-  struct size for `clone_args` (and likewise for `openat2`'s `open_how`, read under the same
-  struct-size rule), and one page as the absolute ceiling for any read. An unbounded or
-  attacker-chosen length is a denial-of-service on the single decision thread; over the cap
-  resolves to deny (section 4, case C), because a value larger than the kernel itself would accept
-  is hostile by definition.
+- Cap every read.
+  The caps, fixed at slate 2, are the kernel's own limits: 4096 bytes for a path (`PATH_MAX`), 128 bytes for a `sockaddr` (`sizeof(struct sockaddr_storage)`), the current kernel struct size for `clone_args` (and likewise for `openat2`'s `open_how`, read under the same struct-size rule), and one page as the absolute ceiling for any read.
+  An unbounded or attacker-chosen length is a denial-of-service on the single decision thread.
+  A malformed or over-cap path or `clone_args` resolves to deny (section 4, case C), because the trusted fact cannot be built.
+  A malformed or over-cap network address is the one arc in the section 4 enumeration that is scoped by mode, per ADR-0019 (recorded 2026-07-23, the issue #26 hygiene pass), matching the network-fact rule already fixed in [`trace.md`](trace.md) section 2: record-only records a raw allow, while enforce records a raw fail-closed deny.
+  The same ADR settled the arc it is most easily confused with the other way: `pidfd_getfd` is denied and recorded in both modes, because an imported fd leaves the trace unable to attribute later I/O ([`syscalls.md`](syscalls.md) section 5, SR-4).
+  This is not a softening of I3 or FR-9; both now carry that mode scope explicitly, because record-only enforces nothing outside the denied-and-recorded set (ADR-0010) and denying there would deny an action the mode never claimed to constrain.
 - The value read is used once, to build the typed fact, and for a pointer-argument allow it is never
   handed back to the child as a re-editable argument. That is why the allow-realization rule
   (section 3) forbids `CONTINUE` for pointer-argument decisions: `CONTINUE` re-reads child memory at
@@ -91,7 +92,7 @@ syscall never took effect, so it records none.
 |---|---|---|---|
 | A | `NOTIF_RECV` returns `EINTR` | retry the receive | no notification was dequeued; nothing is pending release |
 | B | `ID_VALID` fails, or `RECV`/`SEND` reports the notification dead (the child exited, or a fatal signal is ending it) | drop the notification, continue | the child's syscall does not complete; there is nothing to release to a dead or dying process |
-| C | child-memory read fails, or exceeds the size cap | deny (`SEND` an errno, e.g. `EACCES`) | a fact that cannot be trusted cannot be allowed (I4) |
+| C | child-memory read fails, or exceeds the size cap | deny (`SEND` an errno, e.g. `EACCES`), except a network address in **record-only**, which records a `raw` allow (section 2, ADR-0019, recorded 2026-07-23 for #26) | a fact that cannot be trusted cannot be allowed (I4); in record-only nothing outside the denied-and-recorded set is enforced (ADR-0010), so the untrusted network fact is recorded raw rather than denied, and the arc is fail-closed wherever enforcement is claimed (FR-9, I3, both scoped for this arc) |
 | D | the `policy` engine cannot decide | impossible by construction: the engine is total and returns a decision for every fact; deny-by-default is the base rule in **enforce** mode (FR-19) | there is no undecided fact |
 | E | the recorder write fails | deny this action, then abort the run and tear down | no allow the supervisor cannot record (section 3, FR-3) |
 | F | an **ask** reaches its timeout (FR-10), or the run is unattended (FR-20) | deny | timeout-to-deny and unattended-to-deny are the specified behaviors |

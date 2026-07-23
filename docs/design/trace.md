@@ -3,8 +3,8 @@
 - Status: settled (slate 2 closed 2026-07-08)
 - Governs: the per-run directory layout, the JSONL event schema, durability, and the human-readable
   session report.
-- Cites: FR-2, FR-3, FR-5, FR-16, FR-19, FR-21; NFR-3; ADR-0002, ADR-0010, ADR-0011. Invariants I2,
-  I3, I4 are defined in [`architecture.md`](architecture.md).
+- Cites: FR-2, FR-3, FR-5, FR-16, FR-19, FR-21; NFR-3; ADR-0002, ADR-0010, ADR-0011, ADR-0019.
+  Invariants I2, I3, I4 are defined in [`architecture.md`](architecture.md).
 
 The **trace** is the ground-truth account of what the agent did, authored solely by the supervisor
 (FR-3, I2). This file fixes where it lives, the shape of each **event**, and the **session report**
@@ -69,23 +69,31 @@ Fact details fixed by the notify loop:
   optional `dest` field alongside `path`; single-path facts omit it.
 - An event whose decision was made without a trusted typed fact carries the `raw` fact family with
   no fields: the denied-and-recorded set ([`syscalls.md`](syscalls.md) section 5), and a case-C
-  deny where the pointer argument could not be read within its cap
-  ([`notify-loop.md`](notify-loop.md) section 4). The envelope's `syscall` field still names the
+  event where the pointer argument could not be read within its cap
+  ([`notify-loop.md`](notify-loop.md) section 4), which is a deny except for the record-only
+  network allow fixed below (ADR-0019, recorded 2026-07-23). The envelope's `syscall` field still names the
   call, which is the recordable substance of those events.
 - A process-creation fact carries optional `flags`.
   `clone` and `clone3` fill it from the kernel-trusted scalar or bounded `clone_args` read; `fork` and `vfork` omit it.
 - A cross-process fact carries `target_pid` when the syscall exposes one as a scalar register argument.
   `pidfd_getfd` carries no target pid, because its pidfd argument cannot be safely resolved under `CONTINUE`.
-  In record-only it records and continues; in enforce mode it denies fail-closed until safe pidfd resolution exists.
+  It is denied and recorded in both modes as a member of the denied-and-recorded set ([`syscalls.md`](syscalls.md) section 5), under the `sr4:pidfd_getfd` id, because an imported fd is I/O the trace could not otherwise attribute (ADR-0019, recorded 2026-07-23).
+  The shipped M2 build matches this in neither mode: record-only allows it under `base:record_only`, and enforce denies it under a separate `failsafe:pidfd_getfd` id predating the decision.
+  The issue #26 implementation PR moves both legs onto the single vocabulary above, which is when a trace will start carrying the `sr4:pidfd_getfd` form; the gap is named in [`escapes.md`](escapes.md) section 4 until then.
 - A network fact carries the destination `host` string and `port` parsed from the trapped `sockaddr`.
+  By the recorded decision of 2026-07-23 (the issue #26 hygiene pass), `host` carries the canonical form of the destination: an IPv4-mapped IPv6 address is written as its IPv4 form, so a dual-stack `connect` to `93.184.216.34` records `"93.184.216.34"` and never `"::ffff:93.184.216.34"` ([`policy.md`](policy.md) section 2.2).
+  A native IPv6 destination is unchanged.
+  This narrows the set of values the field can take without changing its type, so `schema_version` does not move; a reader that accepted the mapped form still decodes the canonical one.
+  The normalizing seam is unimplemented as of this pass: the shipped M2 build records a mapped destination as `"::ffff:93.184.216.34"`, and the `sockaddr` parse that canonicalizes it lands in the issue #26 implementation PR ([`policy.md`](policy.md) section 2.2).
+  A trace read before that PR can therefore carry the mapped form, and a reader that must span both should canonicalize on its own side.
   If the `sockaddr` cannot be read or parsed within its bound, the event is recorded as `raw`.
-  In record-only that raw network event is allowed, because record-only enforces nothing outside the denied-and-recorded set.
+  In record-only that raw network event is allowed, because record-only enforces nothing outside the denied-and-recorded set (ADR-0019, recorded 2026-07-23; FR-9 and I3 carry the same mode scope).
   In enforce mode the same untrusted network fact denies fail-closed.
 
 In a run with no policy, `matched_rule` carries a fixed base id naming what decided the event:
 `base:record_only` (the record-only base allow, [`policy.md`](policy.md) section 3),
-`sr4:io_uring` and `sr3:foreign_abi` (the denied-and-recorded set), and `failsafe:memory_read`
-(a case-C deny). These are trace vocabulary, not policy rules; a loaded policy's rule ids never
+`sr4:io_uring`, `sr4:pidfd_getfd`, and `sr3:foreign_abi` (the denied-and-recorded set), and
+`failsafe:memory_read` (a case-C deny). These are trace vocabulary, not policy rules; a loaded policy's rule ids never
 collide with them because they carry a `:` and rule ids are plain names.
 
 `run_start` carries the same facts as `meta.json` so the stream is self-contained. `step` marks a

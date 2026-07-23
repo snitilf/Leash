@@ -265,7 +265,10 @@ fn format_report(
     let mode_line = if mode == "enforce" {
         "enforce".to_string()
     } else {
-        "record-only (nothing was enforced; every action was allowed and recorded)".to_string()
+        // FR-19 and SR-4: record-only enforces no policy, but the denied-and-recorded set
+        // is refused in this mode too, so the line must not claim every action was allowed.
+        "record-only (no policy was enforced; only un-mediated I/O paths were denied, per SR-4)"
+            .to_string()
     };
 
     let exit_line = if !have_run_end {
@@ -534,7 +537,7 @@ mod tests {
         let report = render_report(&trace).unwrap();
         let golden = [
             "leash session report",
-            "mode: record-only (nothing was enforced; every action was allowed and recorded)",
+            "mode: record-only (no policy was enforced; only un-mediated I/O paths were denied, per SR-4)",
             "command: claude -p",
             "workspace: /w",
             "exit: code 0",
@@ -567,7 +570,7 @@ mod tests {
     fn record_only_report_uses_no_enforcement_language() {
         let trace = run_start_line("record_only", "[]", "/w");
         let report = render_report(&trace).unwrap();
-        assert!(report.contains("nothing was enforced"));
+        assert!(report.contains("no policy was enforced"));
         assert!(!report.contains("enforce mode"));
         assert!(!report.contains("blocked"));
         assert!(!report.contains("policy denied"));

@@ -29,7 +29,7 @@ A system call the supervisor intercepts and decides on before the kernel execute
 _Avoid_: hooked call, trapped call (use "mediated")
 
 **Decision**:
-The supervisor's verdict on a mediated syscall: **allow**, **deny**, or **ask**. Always resolves; on error it resolves to **deny** (fail-closed).
+The supervisor's verdict on a mediated syscall: **allow**, **deny**, or **ask**. Always resolves; on error it resolves to **deny** (**fail-closed**), with the one mode-scoped exception FR-9 states.
 _Avoid_: verdict, ruling, judgement
 
 **Policy**:
@@ -41,7 +41,7 @@ A decision that pauses the child and requests a human yes/no before proceeding.
 _Avoid_: prompt (collides with LLM "prompt"), confirm
 
 **Record-only** (mode):
-The run mode in which every mediated syscall is allowed and traced; nothing is enforced (FR-19). The mode a run gets when no policy file exists.
+The run mode in which every mediated syscall is allowed and traced, except the un-mediated-I/O-path syscalls SR-4 denies in both modes; nothing else is enforced (FR-19). The mode a run gets when no policy file exists.
 _Avoid_: monitor mode, audit mode, dry-run
 
 **Enforce** (mode):
@@ -93,5 +93,5 @@ An action by the child that achieves a policy-forbidden effect despite the bound
 _Avoid_: bypass (acceptable informally; "escape" is canonical), breakout
 
 **Fail-closed**:
-The property that any supervisor error, crash, or timeout resolves a pending decision to **deny**, never allow.
+The property that any supervisor error, crash, or timeout resolves a pending decision to **deny**, never allow. FR-9 states the rule and the one arc it scopes by **mode**.
 _Avoid_: fail-safe, fail-secure

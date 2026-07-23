@@ -36,6 +36,14 @@ Each layer references the ones above it by **stable ID** (requirement IDs like `
 
 ## Status
 
-- **Implementation in progress.** The spec is settled at v0.7 (see [`spec/SPEC.md`](spec/SPEC.md)); the design layer in [`design/`](design/) is frozen as of 2026-07-08, the M0 overlay spike having met its gate on x86-64 (ADR-0009 as refined by ADR-0014). The M1 recorder milestone is complete: the crate skeleton, the trace recorder, the preflight host probes, the spawn protocol, the record-only notify loop for the filesystem family, and the `leash run` CLI with the session report have landed, with behavioral tests running in CI on ubuntu-24.04 and overhead measured on the reference box ([`measurements/0001-m1-overhead.md`](measurements/0001-m1-overhead.md)).
-- One spec item remains deferred on purpose: OQ-9 (the ARM64 target), closing on a real ARM64 need. OQ-5 closed on 2026-07-13 into NFR-2's concrete budget, from the M1 measurements.
-- No design parameter remains open: the step-coalescing window closed at 250 ms from the M1 gap measurements (see the design README's open-parameters table), with the first real agent-session trace named as its confirming input.
+- **Implementation in progress.**
+  The spec is settled at v0.8 (see [`spec/SPEC.md`](spec/SPEC.md)), and the design layer in [`design/`](design/) is frozen as of 2026-07-08.
+  The M0 x86-64 overlay spike and M1 recorder milestone are complete: preflight, spawn, the record-only notify loop, durable traces, reports, the `leash run` CLI, Linux behavioral CI, and the first overhead measurement have landed ([`measurements/0001-m1-overhead.md`](measurements/0001-m1-overhead.md)).
+- **M2 enforcement is in progress.**
+  Policy parsing and pure evaluation, Landlock ruleset derivation and application primitives, and typed process, network, and cross-process trace/report facts have landed.
+  Enforce mode still refuses before spawning because safe pointer-argument allow realization and its escape suite remain open in issue #25.
+  FR-2 family completeness remains open in issue #26, and attended approval remains blocked on #25 in issue #30.
+- One spec item remains deferred on purpose: OQ-9 (the ARM64 target), closing on a real ARM64 need.
+  OQ-5 closed on 2026-07-13 into NFR-2's concrete budget from the M1 measurements.
+- No design parameter remains open.
+  The step-coalescing window closed at 250 ms from the M1 gap measurements (see the design README's open-parameters table), with the first real agent-session trace named as its confirming input.

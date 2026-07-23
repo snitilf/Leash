@@ -8,6 +8,12 @@
 //! resolving the rule's name itself and matching the child's destination IP against the
 //! resolved set; the child's resolver is never trusted (policy.md section 2.2). the match
 //! helpers here are the pure primitives that later step composes.
+//!
+//! not yet implemented here: policy.md section 2.2 pins IPv4-mapped IPv6 normalization on
+//! the rule side too (`::ffff:1.2.3.4` loading as `1.2.3.4`, a mapped `/96`-or-longer CIDR
+//! loading as the IPv4 block it covers, a shorter mapped CIDR rejected at load). until that
+//! seam lands with the issue #26 implementation PR, a mapped-form rule is stored as written
+//! and will not match the IPv4 form of the same destination.
 
 use std::fmt;
 use std::net::IpAddr;

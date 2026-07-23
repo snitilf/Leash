@@ -1,6 +1,6 @@
 # ADR-0017: Record-only allows are realized with CONTINUE
 
-- Status: accepted
+- Status: accepted (case-C clause refined by ADR-0019)
 - Date: 2026-07-10
 
 ## Context

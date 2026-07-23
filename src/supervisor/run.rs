@@ -5,8 +5,10 @@
 //! an action the recorder cannot write is denied and the run aborts (case E). every
 //! pointer argument is read bounded and bracketed by ID_VALID (section 2). record-only
 //! allows are realized with CONTINUE (ADR-0017); the denied-and-recorded set and every
-//! untrusted-fact path deny in this mode too. the fail-closed arcs A-I of section 4 are
-//! the contract of this module; each is named where it is handled.
+//! untrusted-fact path deny in this mode too, with the one arc ADR-0019 scopes by mode:
+//! an undecodable network address records a `raw` allow in record-only and a `raw` deny
+//! in enforce (case C). the fail-closed arcs A-I of section 4 are the contract of this
+//! module; each is named where it is handled.
 //!
 //! the per-notification state machine is written against the [`Notifier`] seam so the
 //! arcs are unit-tested deterministically on any host; only the real notify-fd and /proc
@@ -47,7 +49,9 @@ pub mod rule {
     pub const PROCESS_TREE: &str = "base:process_tree";
     /// cross-process control attempted outside the supervised tree
     pub const PROCESS_TREE_DENY: &str = "failsafe:process_tree";
-    /// pidfd_getfd is not safely resolvable in enforce mode v1
+    /// pidfd_getfd is not safely resolvable in enforce mode v1. ADR-0019 has since put the
+    /// syscall in the SR-4 denied-and-recorded set, denied under `sr4:pidfd_getfd` in both
+    /// modes; this id and the record-only allow are the gap escapes.md section 4 names.
     pub const PIDFD_GETFD: &str = "failsafe:pidfd_getfd";
 }
 
@@ -1009,6 +1013,11 @@ mod tests {
             self.mem.insert(addr, v);
             self
         }
+        /// script a fixed-size struct (a `sockaddr`) at an address.
+        fn with_bytes(mut self, addr: u64, bytes: Vec<u8>) -> Self {
+            self.mem.insert(addr, bytes);
+            self
+        }
         fn sent(&self) -> Vec<String> {
             self.sent.borrow().clone()
         }
@@ -1467,6 +1476,136 @@ mod tests {
         assert_eq!(ev["fact"]["family"], "raw");
         assert_eq!(ev["decision"], "allow");
         assert_eq!(ev["matched_rule"], rule::RECORD_ONLY);
+    }
+
+    /// enforcement stays switched off at the loop entry, which is what lets the pinned
+    /// enforce legs below be decision-table facts rather than shipped behaviour: an
+    /// enforce run is refused before any child is served (`docs/README.md` status, and
+    /// the same refusal before spawn in `session.rs`).
+    #[test]
+    fn an_enforce_run_is_refused_before_the_loop_serves_anything() {
+        let p = policy("schema_version = 1\n");
+        let refused = RunConfig::enforce(4242, Attendance::Unattended, &p)
+            .validate()
+            .expect_err("enforce must not validate");
+        assert!(matches!(refused, RunError::UnsupportedMode), "{refused:?}");
+        assert_eq!(
+            RunError::UnsupportedMode.to_string(),
+            "enforce mode is not implemented (needs safe allow realization)"
+        );
+        RunConfig::record_only(4242, Attendance::Unattended)
+            .validate()
+            .expect("record-only is the mode that serves");
+    }
+
+    /// the enforce leg of the same arc. ADR-0019 scopes exactly one arc of the
+    /// fail-closed enumeration by mode; the record-only leg above allows, and here the
+    /// identical untrusted fact denies fail-closed under `failsafe:memory_read`
+    /// (`notify-loop.md` section 4 case C, spec FR-9, trace.md section 2).
+    #[test]
+    fn network_unreadable_sockaddr_records_raw_and_denies_in_enforce() {
+        let kernel = FakeNotifier::default();
+        let p = policy("schema_version = 1\n");
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p);
+        let mut w = writer();
+        super::handle_notification(
+            &kernel,
+            &notif(nr::CONNECT, [3, 0xdead, 16, 0, 0, 0]),
+            &mut w,
+            &config,
+            1_000,
+        )
+        .unwrap();
+
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        let ev = &events(w)[0];
+        assert_eq!(ev["syscall"], "connect");
+        assert_eq!(ev["fact"]["family"], "raw");
+        assert_eq!(ev["decision"], "deny");
+        assert_eq!(ev["matched_rule"], rule::MEMORY_READ);
+    }
+
+    /// the `host` field as the shipped build writes it. `policy.md` section 2.2 and
+    /// `trace.md` section 2 pin IPv4-mapped normalization ahead of the code, and name the
+    /// mapped form below as the gap the issue #26 implementation PR closes; when that
+    /// lands, the mapped case becomes `"1.2.3.4"` and this test moves with it. The IPv4
+    /// and native-IPv6 cases are unaffected by that change.
+    #[test]
+    fn a_network_fact_records_the_destination_host_and_port() {
+        fn sockaddr_in(port: u16, octets: [u8; 4]) -> Vec<u8> {
+            let mut v = (libc::AF_INET as u16).to_ne_bytes().to_vec();
+            v.extend_from_slice(&port.to_be_bytes());
+            v.extend_from_slice(&octets);
+            v.extend_from_slice(&[0u8; 8]); // sin_zero
+            v
+        }
+        fn sockaddr_in6(port: u16, addr: Ipv6Addr) -> Vec<u8> {
+            let mut v = (libc::AF_INET6 as u16).to_ne_bytes().to_vec();
+            v.extend_from_slice(&port.to_be_bytes());
+            v.extend_from_slice(&[0u8; 4]); // sin6_flowinfo
+            v.extend_from_slice(&addr.octets());
+            v.extend_from_slice(&[0u8; 4]); // sin6_scope_id
+            v
+        }
+
+        let mapped = Ipv6Addr::from(Ipv4Addr::new(1, 2, 3, 4).to_ipv6_mapped().octets());
+        let native = "2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap();
+        let kernel = FakeNotifier::default()
+            .with_bytes(0x2000, sockaddr_in(443, [1, 2, 3, 4]))
+            .with_bytes(0x3000, sockaddr_in6(443, mapped))
+            .with_bytes(0x4000, sockaddr_in6(53, native));
+        let mut w = writer();
+        for (addr, len) in [(0x2000u64, 16u64), (0x3000, 28), (0x4000, 28)] {
+            handle_notification(
+                &kernel,
+                &notif(nr::CONNECT, [3, addr, len, 0, 0, 0]),
+                &mut w,
+                1_000,
+            )
+            .unwrap();
+        }
+
+        assert!(kernel.sent().iter().all(|s| s.starts_with("continue:")));
+        let evs = events(w);
+        assert!(evs.iter().all(|e| e["fact"]["family"] == "net"));
+        assert_eq!(evs[0]["fact"]["host"], "1.2.3.4");
+        assert_eq!(evs[0]["fact"]["port"], 443);
+        // the documented pre-normalization gap: the same destination through a
+        // dual-stack socket does not yet canonicalize to its IPv4 form.
+        assert_eq!(evs[1]["fact"]["host"], "::ffff:1.2.3.4");
+        assert_eq!(evs[2]["fact"]["host"], "2606:4700:4700::1111");
+        assert_eq!(evs[2]["fact"]["port"], 53);
+    }
+
+    /// the `pidfd_getfd` gap `escapes.md` section 4 names, in its enforce leg: ADR-0019
+    /// puts the syscall in the denied-and-recorded set under `sr4:pidfd_getfd` in both
+    /// modes, and the shipped build denies it under the older `failsafe:pidfd_getfd` id
+    /// while record-only allows it outright (the test above). Both legs move onto the one
+    /// vocabulary in the issue #26 implementation PR.
+    #[test]
+    fn pidfd_getfd_denies_under_the_pre_adr_0019_id_in_enforce() {
+        let kernel = FakeNotifier::default();
+        let p = policy("schema_version = 1\n");
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p);
+        let mut w = writer();
+        super::handle_notification(
+            &kernel,
+            &notif(nr::PIDFD_GETFD, [0; 6]),
+            &mut w,
+            &config,
+            1_000,
+        )
+        .unwrap();
+
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        let ev = &events(w)[0];
+        assert_eq!(ev["fact"]["family"], "cross_process");
+        assert_eq!(ev["decision"], "deny");
+        assert_eq!(ev["matched_rule"], "failsafe:pidfd_getfd");
+        assert_ne!(
+            ev["matched_rule"], "sr4:pidfd_getfd",
+            "ADR-0019's id lands with the issue #26 implementation PR"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Leash — Software Specification
 
-- Status: **v0.7, settled** (section 11 holds one explicitly deferred item, OQ-9, with a named closing trigger)
-- Date: 2026-07-13 (v0.7 closed OQ-5 into NFR-2's concrete budget from the M1 measurements; v0.6 added FR-22's exit-code contract; v0.5 recorded FR-14's mode split for the Landlock leg per ADR-0015; v0.4 deferred the ARM64 target per ADR-0014; v0.3 revised FR-14's kernel floor to 5.19 per ADR-0012; v0.2 dated 2026-07-07)
+- Status: **v0.8, settled** (section 11 holds one explicitly deferred item, OQ-9, with a named closing trigger)
+- Date: 2026-07-23 (v0.8 scoped FR-9's undecodable-network arc by mode, made NFR-1 consistent with it, and named `pidfd_getfd` as SR-4's second member, all per ADR-0019, from the issue #26 hygiene pass; v0.7 dated 2026-07-13 closed OQ-5 into NFR-2's concrete budget from the M1 measurements; v0.6 added FR-22's exit-code contract; v0.5 recorded FR-14's mode split for the Landlock leg per ADR-0015; v0.4 deferred the ARM64 target per ADR-0014; v0.3 revised FR-14's kernel floor to 5.19 per ADR-0012; v0.2 dated 2026-07-07)
 - Governs: what Leash must do and why. *How* it is built is the design (`docs/design/`).
 
 Key words **MUST**, **MUST NOT**, **SHOULD**, **MAY** per RFC 2119. IDs are stable and cited by other documents, tests, and code: `F-n` features, `FR-n` functional requirements, `NFR-n` non-functional requirements, `SR-n` security requirements, `OQ-n` open questions. Terms in **bold** are defined in [`CONTEXT.md`](../CONTEXT.md) and used exactly as defined there.
@@ -49,7 +49,7 @@ These carry no requirements yet and nothing in this table is promised; promoting
 |---|---|---|
 | F-8 | TUI timeline | Interactive browser for a run's steps and events, on top of F-5/F-6. Roadmap M3. |
 | F-9 | Policy-drafting helper | Generate a starter policy from a record-only trace (ADR-0010 makes the input available). |
-| F-10 | io_uring mediation | Replace SR-4's denial with equivalent mediation plus escape tests, if a real workload needs it. |
+| F-10 | io_uring mediation | Replace SR-4's `io_uring` denial with equivalent mediation plus escape tests, if a real workload needs it. |
 
 ## 6. Functional requirements
 
@@ -66,6 +66,10 @@ These carry no requirements yet and nothing in this table is promised; promoting
 - **FR-7** — Policy MUST be expressible over at least: filesystem paths, network hosts, and executable binaries.
 - **FR-8** — In **enforce** mode, enforcement MUST be defense-in-depth: the seccomp-unotify decision layer AND a Landlock boundary applied by the child before the agent executes, backstopping every dimension the kernel can express (ADR-0003, ADR-0013). A denied action MUST NOT take effect. Record-only enforces nothing and applies no Landlock ruleset (FR-19).
 - **FR-9** — Every **decision** MUST be **fail-closed**: any supervisor error, crash, or decision timeout resolves the pending action to **deny** (NFR-1).
+  One arc is scoped by mode (ADR-0010, ADR-0019).
+  Where the supervisor cannot decode a network address from the trapped `sockaddr`, **enforce** MUST deny the pending action, while **record-only** MUST record the attempt as an **event** carrying no destination and let it continue, because record-only enforces nothing outside SR-4's denied set (FR-19) and denying there would constrain a mode that makes no enforcement claim.
+  That arc is the only one scoped by mode.
+  Every other arc remains fail-closed in both modes: a filesystem or process-creation fact the supervisor cannot decode, a recorder-write failure, a supervisor crash, a decision timeout, and every syscall establishing an un-mediated I/O path (SR-4, which covers `io_uring_setup` and `pidfd_getfd`).
 - **FR-10** — For an **ask** decision, Leash MUST pause the child and block the action until the operator approves or denies; on no response within a configured bound, it MUST deny.
 - **FR-18** — The **policy** MUST be a TOML file with an explicit schema-version field and a fixed, versioned predicate vocabulary covering at least: filesystem path globs, network host allowlists, and executable binary allowlists, each rule resolving to allow, deny, or **ask**. A policy that fails to parse, has an unknown schema version, or contains unknown predicates MUST be rejected before the run starts, never partially applied.
 - **FR-19** — Leash MUST run in exactly one of two modes (ADR-0010), announced at run start, stamped into the **trace**, and named in the **session report**: **record-only** (every mediated syscall allowed and traced, except syscalls that establish an un-mediated I/O path, which are denied and recorded so the trace stays complete, SR-4; actions a present policy would have denied are flagged) and **enforce** (deny-by-default per the policy, with the **workspace** allowed by default per its definition; requires a policy file). A run with no policy file is record-only. The mode MUST NOT change mid-run. Record-only output MUST NOT be described as enforcement.
@@ -86,6 +90,8 @@ These carry no requirements yet and nothing in this table is promised; promoting
 ## 7. Non-functional requirements
 
 - **NFR-1 — Fail-closed integrity.** The system MUST never fail open. Where any requirement conflicts with this, fail-closed wins.
+  Failing open is measured against what a **mode** claims to enforce.
+  **Record-only** claims nothing beyond SR-4's denied set (FR-19), so recording an undecodable network attempt and letting it continue is not a fail-open in that mode (FR-9, ADR-0019); in **enforce**, where the claim is made, the same arc denies.
 - **NFR-2 — Overhead.** Added latency per mediated syscall and end-to-end wall-clock overhead on a representative agent task MUST be measured and reported (section 10). Leash SHOULD keep overhead low enough to run always-on. On the reference environment (x86-64 KVM, `docs/measurements/0001-m1-overhead.md` section 3), added latency per mediated filesystem syscall MUST NOT exceed 50 microseconds at p50 and 200 microseconds at p99, added latency per exec MUST NOT exceed 2 milliseconds at p50, and end-to-end wall-clock MUST NOT exceed 3x even on a syscall-dense worst-case workload (budget set from the M1 measurements, measurement 0001 section 5; measured 2026-07-13: 31-37 us p50, 2.46x worst case). A typical-agent-session wall-clock target is deferred until a real agent session is measured on the reference environment; that measurement is the trigger to add it.
 - **NFR-3 — Auditability.** Policy MUST be human-readable and diffable; the trace MUST suffice to reconstruct what the agent did without the agent's cooperation.
 - **NFR-4 — Portability & footprint.** MUST NOT require significant ongoing cloud/compute spend; SHOULD stay light enough for modest hardware. The Raspberry Pi 4 class target is deferred with ARM64 (OQ-9).
@@ -99,7 +105,11 @@ The threat model is a working document, promoted into `docs/` once load-bearing 
 - **SR-1** — The system MUST treat the agent and all its descendants as hostile.
 - **SR-2** — The system MUST resist the enumerated **escape** classes: child-process laundering, symlink/TOCTOU races, `/proc` self-reference, alternate-syscall equivalents (including `io_uring` and `openat2`), fd inheritance/passing, recorder-tampering. Each enforced control MUST map to tests for the escapes it claims to stop.
 - **SR-3** — The system MUST NOT rely on any control the child can disable or reason around (ADR-0003).
-- **SR-4** — Syscalls that establish an un-mediated I/O path (notably `io_uring_setup`) MUST be denied in both modes: in **enforce** because the policy could not otherwise constrain the path, and in **record-only** because the path would make the **trace** silently incomplete. The denial MUST be recorded as an **event**, so the attempt is visible and record-only remains non-enforcing in every other respect. Relaxing this for a path requires a spec change adding equivalent mediation and escape tests for that path first.
+- **SR-4** — Syscalls that establish an un-mediated I/O path MUST be denied in both modes: in **enforce** because the policy could not otherwise constrain the path, and in **record-only** because the path would make the **trace** silently incomplete. The denial MUST be recorded as an **event**, so the attempt is visible and record-only remains non-enforcing in every other respect. Relaxing this for a path requires a spec change adding equivalent mediation and escape tests for that path first.
+  The class has two members in v1.
+  `io_uring_setup` submits I/O out of band through a shared ring the filter never observes.
+  `pidfd_getfd` imports a file descriptor out of another process, so the resource it names was decided by no mediated syscall and every later read or write on it is I/O the trace cannot attribute (ADR-0019).
+  Membership is decided by that test, not by the list: a syscall belongs here when letting it through would leave the trace unable to describe I/O the child performed.
 
 ## 9. Out of scope (explicit)
 
@@ -134,7 +144,7 @@ OQ-1..OQ-4 and OQ-6..OQ-8 were resolved on 2026-07-07 into FR-17..FR-21, SR-4, A
 | FR-3 (trace integrity) | ADR-0002 | recorder-tamper escape tests |
 | FR-8 (defense in depth) | ADR-0003, ADR-0013 | per-layer escape tests |
 | FR-6/FR-7 (policy) | ADR-0004 | policy-engine unit tests |
-| FR-2/FR-9 (ordered trace, fail-closed), NFR-6 | ADR-0011 | fail-closed enumeration, notify-loop fault tests |
+| FR-2/FR-9 (ordered trace, fail-closed), NFR-6 | ADR-0011, ADR-0019 (mode scope of the undecodable-network arc) | fail-closed enumeration, notify-loop fault tests |
 | FR-11..13 (time travel) | ADR-0005, ADR-0009 | overlay-semantics tests, mechanism-equivalence tests |
 | FR-14 (kernel floor) | ADR-0012, ADR-0015 | preflight capability probes on 5.19+ |
 | FR-17 (step semantics) | ADR-0006, ADR-0009 | step-boundary tests |
@@ -144,7 +154,7 @@ OQ-1..OQ-4 and OQ-6..OQ-8 were resolved on 2026-07-07 into FR-17..FR-21, SR-4, A
 | FR-20 (approval UX) | ADR-0010 | attended/unattended ask tests |
 | FR-21 (trace persistence) | ADR-0002 | state-dir isolation escape tests |
 | FR-22 (exit-code contract) | design (cli.md section 6) | exit-code contract tests |
-| SR-4 (io_uring denial) | design (syscalls.md section 5) | io_uring escape tests |
+| SR-4 (un-mediated I/O path denial: `io_uring_setup`, `pidfd_getfd`) | ADR-0019, design (syscalls.md section 5) | io_uring and `pidfd_getfd` escape tests |
 | FR-1/FR-4 (agent-agnostic coverage) | ADR-0006 | inheritance + coverage tests |
 | NFR-4 (footprint), FR-15 | ADR-0007, ADR-0014 | build/run on the VPS reference target |
 

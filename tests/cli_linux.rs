@@ -187,7 +187,7 @@ fn record_only_announcement_and_report_language() {
 
     let run_dir = only_run_dir(state.path());
     let report = std::fs::read_to_string(run_dir.join("report.txt")).unwrap();
-    assert!(report.contains("nothing was enforced"));
+    assert!(report.contains("no policy was enforced"));
     assert!(!report.contains("enforce mode"));
     assert!(!report.contains("blocked"));
 }

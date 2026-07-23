@@ -2,7 +2,8 @@
 
 - Status: settled (design layer frozen 2026-07-08)
 - Governs: how the supervisor is structured and how it brings a run into being.
-- Cites: FR-1, FR-3, FR-8, FR-9, FR-14, FR-15; SR-1, SR-3; ADR-0002, ADR-0003, ADR-0006, ADR-0007, ADR-0011.
+- Cites: FR-1, FR-3, FR-8, FR-9, FR-14, FR-15; SR-1, SR-3; ADR-0002, ADR-0003, ADR-0006, ADR-0007,
+  ADR-0011, ADR-0019.
 
 This is the entry point to the design. It fixes the process and trust model, the invariants every
 other design file cites, the module decomposition, and the supervisor lifecycle from preflight to
@@ -69,7 +70,16 @@ by ID. ADR-0002 already refers to I2 by this number; the full list is fixed here
   mode (FR-21), and matches record-only being a camera, not a bouncer; the residual is named in
   [`escapes.md`](escapes.md). (FR-3, FR-21, ADR-0002.)
 - **I3** - Every decision **fails closed**. Any supervisor error, crash, or decision timeout
-  resolves the pending action to deny; the child never gets a default-allow. (FR-9, NFR-1.)
+  resolves the pending action to deny; the child never gets a default-allow. One arc is scoped by
+  mode, the same way I2 is: where the supervisor cannot decode a network address from the trapped
+  `sockaddr`, **enforce** denies, while **record-only** records the attempt with no destination and
+  continues, because record-only enforces nothing outside the denied-and-recorded set (ADR-0010,
+  ADR-0019, and FR-9 as it scopes this arc). That arc is the only one scoped by mode. Every other
+  arc denies in both modes: an undecodable filesystem or process-creation fact, a recorder-write
+  failure, a crash, a decision timeout, and the denied-and-recorded set (SR-4, whose members are
+  `io_uring_setup` and `pidfd_getfd`; the latter imports an fd the trace could not otherwise
+  attribute, so it denies in record-only too). The residuals are named in
+  [`escapes.md`](escapes.md). (FR-9, NFR-1.)
 - **I4** - Decisions are made against kernel-trusted data, never against child-controlled memory
   read naively. Pointer arguments are resolved by the supervisor itself, not trusted as the child
   presented them. (SR-2; TOCTOU handling in [`notify-loop.md`](notify-loop.md).)

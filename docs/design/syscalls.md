@@ -3,8 +3,9 @@
 - Status: settled (slate 2 closed 2026-07-08)
 - Governs: which syscalls the seccomp filter mediates, denies, or passes through, and how each
   allowed one is realized safely.
-- Cites: FR-2, FR-4, FR-15; NFR-3; SR-2, SR-3, SR-4; ADR-0003, ADR-0006, ADR-0010, ADR-0011,
-  ADR-0012, ADR-0013. Invariants I1, I3, I4, I5 are defined in [`architecture.md`](architecture.md).
+- Cites: FR-2, FR-4, FR-15, FR-19; NFR-3; SR-2, SR-3, SR-4; ADR-0003, ADR-0006, ADR-0010, ADR-0011,
+  ADR-0012, ADR-0013, ADR-0019. Invariants I1, I3, I4, I5 are defined in
+  [`architecture.md`](architecture.md).
 
 This file fixes the mediation surface: the exact sets of syscalls that are mediated, denied, or
 allowed to run unmediated, and the rule for how an allowed mediated syscall is carried out without
@@ -134,7 +135,7 @@ the decision is whether the target pid is in that set.
 |---|---|---|---|---|
 | `ptrace` | yes | target pid (scalar) | `CONTINUE` | target is outside the tree |
 | `process_vm_readv`, `process_vm_writev` | yes | target pid (scalar) | `CONTINUE` | target is outside the tree |
-| `pidfd_getfd` | yes | target pidfd (an fd, not a scalar pid) | denied in v1 | always (see below) |
+| `pidfd_getfd` | yes | target pidfd (an fd, not a scalar pid) | denied in v1 | always, in both modes (section 5, see below) |
 
 For `ptrace` and `process_vm_*` the target pid *is* a scalar register argument, kernel-trusted at trap
 time, so the decision is `CONTINUE`-safe (section 4): in-tree use (an agent running `strace` on its own
@@ -150,6 +151,16 @@ number after the check, which is exactly the TOCTOU class rule 1 exists to exclu
 alternative, supervisor-side execution (the supervisor holds the child's pidfd, checks the referent,
 performs the `pidfd_getfd` itself, and injects the result with `ADDFD`), is deferred until a real
 workload needs it.
+
+"Outright" means in both modes, and ADR-0019 pinned that on 2026-07-23 by placing `pidfd_getfd` in
+the denied-and-recorded set of section 5 rather than treating it as a mode-scoped arc.
+An imported fd names a resource no mediated syscall decided, so every later read or write on it is
+I/O the **trace** cannot attribute to anything: the SR-4 test, and the one exception FR-19 carves
+out of record-only non-enforcement.
+The shipped M2 build diverges in both modes: record-only allows it, and enforce denies it under a
+`failsafe:pidfd_getfd` id predating the decision rather than the `sr4:pidfd_getfd` of section 5.
+The issue #26 implementation PR moves both legs onto the one vocabulary; the gap is named in
+[`escapes.md`](escapes.md) section 4 until it does.
 
 ### 3.5 Network
 
@@ -193,7 +204,10 @@ The rule binds decisions that constrain, which in practice means **enforce**-mod
 **record-only**, where every decision is allow and there is no anchor set to resolve beneath,
 allows are realized with `CONTINUE` and the trace-fidelity residual is named in
 [`escapes.md`](escapes.md) section 4 (ADR-0017). The denied-and-recorded set (section 5) and the
-case-C deny are unaffected; they deny in both modes.
+case-C deny are unaffected; they deny in both modes, with the one exception ADR-0019 pinned on
+2026-07-23 (the issue #26 hygiene pass): a malformed or over-cap network address records
+a `raw` allow in record-only and a `raw` fail-closed deny in enforce
+([`notify-loop.md`](notify-loop.md) sections 2 and 4, [`trace.md`](trace.md) section 2).
 
 1. If the decision reads only the syscall number or scalar/flag register arguments, the allow is
    realized with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`. The kernel re-executes the same syscall; there
@@ -240,6 +254,15 @@ operator, especially in record-only, wants to see that the agent reached for the
   operator sees. The cost, that an agent genuinely needing `io_uring` fails in record-only rather than
   running with a partial trace, is the accepted trade (slate 2). Relaxing SR-4 for a path
   requires a spec change adding equivalent mediation and its escape tests first.
+- `pidfd_getfd`, placed here by ADR-0019 on 2026-07-23. It imports a file descriptor out of another
+  process (section 3.4), so the resource that fd names was decided by no mediated syscall and every
+  later read or write on it is I/O the **trace** cannot attribute. That is the same silent
+  incompleteness the `io_uring_setup` denial prevents, which is why it is denied in **both** modes
+  and not scoped by mode: refusing it is not policy enforcement, it is refusing to let the agent
+  make the trace lie. The recorded id is `sr4:pidfd_getfd`, in both modes, replacing the
+  enforce-only `failsafe:pidfd_getfd` the M2 code defines. Neither leg matches yet: the shipped
+  build allows it in record-only and denies it under the old id in enforce. Both move together in
+  the issue #26 implementation PR, a gap named in [`escapes.md`](escapes.md) section 4 until then.
 - Foreign-ABI entry. The filter pins the architecture (`AUDIT_ARCH_X86_64` or `AUDIT_ARCH_AARCH64`)
   and routes any mismatch to deny-and-record. Pinning the arch alone does **not** close the x32 ABI:
   x32 syscalls arrive with `arch == AUDIT_ARCH_X86_64` but with `__X32_SYSCALL_BIT` (bit 30) set in
