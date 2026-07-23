@@ -11,16 +11,31 @@ use std::ffi::CString;
 use std::io::Read;
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use leash::policy::{ExpandContext, Policy};
 use leash::sandbox::landlock;
-use leash::supervisor::broker::{Broker, BrokerResult, BrokerResultOrPath};
+use leash::supervisor::broker::{
+    Broker, BrokerResult, BrokerResultOrPath, MutationOperation, NetworkOperation, PreparedPath,
+};
 
 static FORK_LOCK: Mutex<()> = Mutex::new(());
 
 fn fork_guard() -> MutexGuard<'static, ()> {
     FORK_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn prepare_path(
+    broker: &mut Broker,
+    path: &Path,
+    follow: bool,
+    allow_missing: bool,
+) -> PreparedPath {
+    match broker.prepare_path(path, follow, allow_missing).unwrap() {
+        BrokerResultOrPath::Path(path) => path,
+        other => panic!("expected prepared path, got {other:?}"),
+    }
 }
 
 #[test]
@@ -242,6 +257,148 @@ fn production_broker_prepares_and_commits_an_allowed_open() {
 }
 
 #[test]
+fn production_broker_preserves_o_path_directory_validation() {
+    let _guard = fork_guard();
+    let workspace = tempfile::tempdir().unwrap();
+    let file = workspace.path().join("regular-file");
+    std::fs::write(&file, b"data").unwrap();
+    let policy = Policy::parse(
+        "schema_version = 1\n",
+        &ExpandContext {
+            workspace: workspace.path().to_str().unwrap(),
+            home: "/tmp",
+        },
+    )
+    .unwrap();
+    let prepared_ruleset = landlock::prepare_ruleset(&landlock::derive_hull(&policy, 4)).unwrap();
+    let mut broker = Broker::spawn(&prepared_ruleset, workspace.path()).unwrap();
+    let prepared = match broker.prepare_path(&file, true, false).unwrap() {
+        BrokerResultOrPath::Path(path) => path,
+        other => panic!("expected prepared path, got {other:?}"),
+    };
+    match broker
+        .commit_open(
+            prepared,
+            u64::try_from(libc::O_PATH | libc::O_DIRECTORY).unwrap(),
+            0,
+        )
+        .unwrap()
+    {
+        BrokerResult::Errno(errno) => assert_eq!(errno, libc::ENOTDIR),
+        other => panic!("expected ENOTDIR, got {other:?}"),
+    }
+}
+
+#[test]
+fn production_broker_realizes_the_filesystem_mutation_family() {
+    let _guard = fork_guard();
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().join("source");
+    let hard_link = workspace.path().join("hard-link");
+    let renamed = workspace.path().join("renamed");
+    let directory = workspace.path().join("directory");
+    let symbolic = workspace.path().join("symbolic");
+    std::fs::write(&source, b"source-data").unwrap();
+    let policy = Policy::parse(
+        "schema_version = 1\n",
+        &ExpandContext {
+            workspace: workspace.path().to_str().unwrap(),
+            home: "/tmp",
+        },
+    )
+    .unwrap();
+    let prepared_ruleset = landlock::prepare_ruleset(&landlock::derive_hull(&policy, 4)).unwrap();
+    let mut broker = Broker::spawn(&prepared_ruleset, workspace.path()).unwrap();
+
+    let prepared = prepare_path(&mut broker, &source, true, false);
+    let result = broker
+        .commit_mutation(prepared, None, MutationOperation::Truncate { length: 6 })
+        .unwrap();
+    assert!(matches!(result, BrokerResult::Value(0)));
+    assert_eq!(std::fs::read(&source).unwrap(), b"source");
+
+    let prepared = prepare_path(&mut broker, &directory, false, true);
+    let result = broker
+        .commit_mutation(prepared, None, MutationOperation::Mkdir { mode: 0o700 })
+        .unwrap();
+    assert!(matches!(result, BrokerResult::Value(0)));
+    assert!(directory.is_dir());
+
+    let prepared = prepare_path(&mut broker, &symbolic, false, true);
+    let result = broker
+        .commit_mutation(
+            prepared,
+            None,
+            MutationOperation::Symlink {
+                target: b"source".to_vec(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(result, BrokerResult::Value(0)));
+    assert_eq!(std::fs::read_link(&symbolic).unwrap(), Path::new("source"));
+
+    let source_prepared = prepare_path(&mut broker, &source, false, false);
+    let link_prepared = prepare_path(&mut broker, &hard_link, false, true);
+    let result = broker
+        .commit_mutation(
+            source_prepared,
+            Some(link_prepared),
+            MutationOperation::Link { flags: 0 },
+        )
+        .unwrap();
+    assert!(matches!(result, BrokerResult::Value(0)));
+    assert_eq!(std::fs::read(&hard_link).unwrap(), b"source");
+
+    let source_prepared = prepare_path(&mut broker, &source, false, false);
+    let renamed_prepared = prepare_path(&mut broker, &renamed, false, true);
+    let result = broker
+        .commit_mutation(
+            source_prepared,
+            Some(renamed_prepared),
+            MutationOperation::Rename { flags: 0 },
+        )
+        .unwrap();
+    assert!(matches!(result, BrokerResult::Value(0)));
+    assert!(!source.exists());
+    assert_eq!(std::fs::read(&renamed).unwrap(), b"source");
+
+    let exchange = workspace.path().join("exchange");
+    std::fs::write(&exchange, b"exchange").unwrap();
+    let renamed_prepared = prepare_path(&mut broker, &renamed, false, false);
+    let exchange_prepared = prepare_path(&mut broker, &exchange, false, false);
+    let result = broker
+        .commit_mutation(
+            renamed_prepared,
+            Some(exchange_prepared),
+            MutationOperation::Rename { flags: 2 },
+        )
+        .unwrap();
+    assert!(matches!(result, BrokerResult::Value(0)));
+    assert_eq!(std::fs::read(&renamed).unwrap(), b"exchange");
+    assert_eq!(std::fs::read(&exchange).unwrap(), b"source");
+
+    for operation in [
+        MutationOperation::Chmod { mode: 0o600 },
+        MutationOperation::Chown {
+            uid: u32::MAX,
+            gid: u32::MAX,
+            flags: 0,
+        },
+    ] {
+        let prepared = prepare_path(&mut broker, &renamed, true, false);
+        let result = broker.commit_mutation(prepared, None, operation).unwrap();
+        assert!(matches!(result, BrokerResult::Value(0)));
+    }
+
+    let prepared = prepare_path(&mut broker, &hard_link, false, false);
+    let result = broker
+        .commit_mutation(prepared, None, MutationOperation::Unlink { flags: 0 })
+        .unwrap();
+    assert!(matches!(result, BrokerResult::Value(0)));
+    assert!(!hard_link.exists());
+}
+
+#[test]
 fn production_broker_rejects_a_path_outside_every_anchor() {
     let _guard = fork_guard();
     let workspace = tempfile::tempdir().unwrap();
@@ -264,6 +421,102 @@ fn production_broker_rejects_a_path_outside_every_anchor() {
         }
         other => panic!("expected EACCES, got {other:?}"),
     }
+}
+
+#[test]
+fn prepared_open_is_pinned_across_a_symlink_swap() {
+    let _guard = fork_guard();
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let requested = workspace.path().join("requested.txt");
+    let pinned = workspace.path().join("pinned.txt");
+    let protected = outside.path().join("protected.txt");
+    std::fs::write(&requested, b"original").unwrap();
+    std::fs::write(&protected, b"protected").unwrap();
+    let policy = Policy::parse(
+        "schema_version = 1\n",
+        &ExpandContext {
+            workspace: workspace.path().to_str().unwrap(),
+            home: "/tmp",
+        },
+    )
+    .unwrap();
+    let prepared_ruleset = landlock::prepare_ruleset(&landlock::derive_hull(&policy, 4)).unwrap();
+    let mut broker = Broker::spawn(&prepared_ruleset, workspace.path()).unwrap();
+    let prepared = match broker.prepare_path(&requested, true, false).unwrap() {
+        BrokerResultOrPath::Path(path) => path,
+        other => panic!("expected prepared path, got {other:?}"),
+    };
+
+    std::fs::rename(&requested, &pinned).unwrap();
+    std::os::unix::fs::symlink(&protected, &requested).unwrap();
+    let returned = match broker
+        .commit_open(prepared, (libc::O_WRONLY | libc::O_TRUNC) as u64, 0)
+        .unwrap()
+    {
+        BrokerResult::Fd(fd) => fd,
+        other => panic!("expected returned fd, got {other:?}"),
+    };
+    drop(returned);
+
+    assert_eq!(std::fs::read(&pinned).unwrap(), b"");
+    assert_eq!(std::fs::read(&protected).unwrap(), b"protected");
+}
+
+#[test]
+fn production_broker_sends_the_copied_udp_payload() {
+    let _guard = fork_guard();
+    let workspace = tempfile::tempdir().unwrap();
+    let receiver = udp_receiver();
+    let address = receiver_address(&receiver);
+    let policy = Policy::parse(
+        "schema_version = 1\n",
+        &ExpandContext {
+            workspace: workspace.path().to_str().unwrap(),
+            home: "/tmp",
+        },
+    )
+    .unwrap();
+    let prepared_ruleset = landlock::prepare_ruleset(&landlock::derive_hull(&policy, 4)).unwrap();
+    let mut broker = Broker::spawn(&prepared_ruleset, workspace.path()).unwrap();
+    // SAFETY: socket returns a newly owned descriptor or -1.
+    let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    assert!(socket >= 0, "socket: {}", std::io::Error::last_os_error());
+    // SAFETY: socket returned a new owned descriptor.
+    let socket = unsafe { OwnedFd::from_raw_fd(socket) };
+    // SAFETY: sockaddr_in is plain initialized storage and the slice does not outlive it.
+    let address_bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&raw const address).cast::<u8>(),
+            size_of::<libc::sockaddr_in>(),
+        )
+    }
+    .to_vec();
+    let result = broker
+        .network(
+            NetworkOperation::SendTo,
+            socket,
+            address_bytes,
+            b"broker-sendto".to_vec(),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        result,
+        BrokerResult::Value(value) if value == b"broker-sendto".len() as i64
+    ));
+
+    let mut payload = [0u8; 32];
+    // SAFETY: recv writes into the local payload buffer.
+    let received = unsafe {
+        libc::recv(
+            receiver.as_raw_fd(),
+            payload.as_mut_ptr().cast(),
+            payload.len(),
+            0,
+        )
+    };
+    assert_eq!(&payload[..received as usize], b"broker-sendto");
 }
 
 fn seqpacket_pair() -> (OwnedFd, OwnedFd) {

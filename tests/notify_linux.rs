@@ -872,6 +872,8 @@ fn enforce_mode_without_policy_is_refused() {
         attendance: Attendance::Unattended,
         ask_timeout: Duration::from_secs(60),
         root_pid: pid as u32,
+        broker: None,
+        resolved_hosts: None,
     };
     let result = run_loop(child, config, &mut writer);
     assert!(matches!(result, Err(RunError::EnforceWithoutPolicy)));

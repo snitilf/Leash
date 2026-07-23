@@ -11,6 +11,7 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -255,8 +256,8 @@ fn usage_and_reserved_subcommands_exit_2() {
 }
 
 /// cli.md section 2: `--policy` selects enforce mode, loads the policy before spawn,
-/// and stamps the Landlock metadata. The enforce notify loop still refuses before
-/// spawning the agent until safe allow realization lands.
+/// stamps the Landlock metadata, and runs an allowed dynamic binary through the
+/// confined realization broker.
 #[test]
 fn policy_selects_enforce_and_stamps_landlock_metadata() {
     let ws = tempfile::tempdir().unwrap();
@@ -282,8 +283,8 @@ fn policy_selects_enforce_and_stamps_landlock_metadata() {
     );
     assert_eq!(
         out.status.code(),
-        Some(125),
-        "enforce mode is fail-closed until safe allow realization lands; stderr: {}",
+        Some(0),
+        "allowed enforce run must complete; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -311,6 +312,526 @@ fn policy_selects_enforce_and_stamps_landlock_metadata() {
             .any(|r| r == leash::sandbox::landlock::RESIDUAL_TCP_HOST),
         "host-level TCP residual is always stamped in enforce"
     );
+}
+
+#[test]
+fn enforce_denies_unmatched_write_while_record_only_allows_it() {
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let denied_path = outside.path().join("denied.txt");
+    let policy_state = tempfile::tempdir().unwrap();
+    let policy_path = policy_state.path().join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        "schema_version = 1\n\
+         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+         [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+    )
+    .unwrap();
+
+    let enforced = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            policy_state.path().to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf allowed > allowed.txt; printf denied > \"$1\"",
+            "sh",
+            denied_path.to_str().unwrap(),
+        ],
+        ws.path(),
+    );
+    assert_ne!(
+        enforced.status.code(),
+        Some(0),
+        "the unmatched outside write must fail"
+    );
+    assert_ne!(
+        enforced.status.code(),
+        Some(125),
+        "a policy denial is an agent result, not a supervisor failure: {}",
+        String::from_utf8_lossy(&enforced.stderr)
+    );
+    assert_eq!(
+        std::fs::read(ws.path().join("allowed.txt")).unwrap(),
+        b"allowed"
+    );
+    assert!(!denied_path.exists());
+    let enforce_events = trace_events(&only_run_dir(policy_state.path()));
+    assert!(enforce_events.iter().any(|event| {
+        event["type"] == "syscall"
+            && event["fact"]["path"] == denied_path.to_string_lossy().as_ref()
+            && event["decision"] == "deny"
+    }));
+
+    let record_state = tempfile::tempdir().unwrap();
+    let recorded = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            record_state.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf record-only > \"$1\"",
+            "sh",
+            denied_path.to_str().unwrap(),
+        ],
+        ws.path(),
+    );
+    assert_eq!(
+        recorded.status.code(),
+        Some(0),
+        "record-only must not enforce the policy boundary: {}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    assert_eq!(std::fs::read(&denied_path).unwrap(), b"record-only");
+}
+
+#[test]
+fn enforce_rejects_workspace_symlink_and_proc_magic_link_escapes() {
+    use std::os::unix::fs::symlink;
+
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let protected = outside.path().join("protected.txt");
+    std::fs::write(&protected, b"protected").unwrap();
+    symlink(&protected, ws.path().join("escape")).unwrap();
+
+    let symlink_state = tempfile::tempdir().unwrap();
+    let policy_path = symlink_state.path().join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        "schema_version = 1\n\
+         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+         [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+    )
+    .unwrap();
+    let escaped = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            symlink_state.path().to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf escaped > escape",
+        ],
+        ws.path(),
+    );
+    assert_ne!(escaped.status.code(), Some(0));
+    assert_eq!(std::fs::read(&protected).unwrap(), b"protected");
+
+    let proc_state = tempfile::tempdir().unwrap();
+    let proc_policy = proc_state.path().join("policy.toml");
+    std::fs::write(
+        &proc_policy,
+        "schema_version = 1\n\
+         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+         [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+    )
+    .unwrap();
+    let magic = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            proc_state.path().to_str().unwrap(),
+            "--policy",
+            proc_policy.to_str().unwrap(),
+            "--",
+            "/bin/cat",
+            "/proc/self/fd/0",
+        ],
+        ws.path(),
+    );
+    assert_ne!(magic.status.code(), Some(0));
+    let events = trace_events(&only_run_dir(proc_state.path()));
+    assert!(events.iter().any(|event| {
+        event["fact"]["path"] == "/proc/self/fd/0"
+            && event["decision"] == "deny"
+            && event["matched_rule"] == "failsafe:realization"
+    }));
+}
+
+#[test]
+fn enforce_canonicalizes_a_missing_creation_before_policy_evaluation() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir(ws.path().join("sub")).unwrap();
+    let protected = ws.path().join("protected");
+    let state = tempfile::tempdir().unwrap();
+    let policy_path = state.path().join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        format!(
+            "schema_version = 1\n\
+             [[fs]]\npath={:?}\nmode=[\"create\"]\naction=\"deny\"\n\
+             [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+             [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+            protected.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let attempted = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf bypass > sub/../protected",
+        ],
+        ws.path(),
+    );
+    assert_ne!(attempted.status.code(), Some(0));
+    assert_ne!(
+        attempted.status.code(),
+        Some(125),
+        "the enforce run must start successfully: {}",
+        String::from_utf8_lossy(&attempted.stderr)
+    );
+    assert!(
+        !protected.exists(),
+        "the lexical alias must not bypass the canonical-path deny"
+    );
+    let events = trace_events(&only_run_dir(state.path()));
+    assert!(
+        events.iter().any(|event| {
+            event["fact"]["path"] == protected.to_string_lossy().as_ref()
+                && event["decision"] == "deny"
+                && event["matched_rule"] == "fs.1"
+        }),
+        "canonical denied event missing from trace: {events:#?}"
+    );
+}
+
+#[test]
+fn enforce_denies_a_rename_destination_outside_the_allowed_write_root() {
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let source = ws.path().join("source.txt");
+    let destination = outside.path().join("destination.txt");
+    std::fs::write(&source, b"source").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let policy_path = state.path().join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        "schema_version = 1\n\
+         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+         [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+    )
+    .unwrap();
+
+    let moved = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--",
+            "/bin/mv",
+            source.to_str().unwrap(),
+            destination.to_str().unwrap(),
+        ],
+        ws.path(),
+    );
+    assert_ne!(moved.status.code(), Some(0));
+    assert!(source.exists());
+    assert!(!destination.exists());
+    let events = trace_events(&only_run_dir(state.path()));
+    assert!(events.iter().any(|event| {
+        event["syscall"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("rename"))
+            && event["fact"]["dest"] == destination.to_string_lossy().as_ref()
+            && event["decision"] == "deny"
+    }));
+}
+
+#[test]
+fn enforce_brokers_rename_and_records_each_operand_access() {
+    let ws = tempfile::tempdir().unwrap();
+    let source = ws.path().join("source.txt");
+    let destination = ws.path().join("destination.txt");
+    std::fs::write(&source, b"source").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let policy_path = state.path().join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        "schema_version = 1\n\
+         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+         [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+    )
+    .unwrap();
+
+    let moved = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--",
+            "/bin/mv",
+            source.to_str().unwrap(),
+            destination.to_str().unwrap(),
+        ],
+        ws.path(),
+    );
+    assert_eq!(
+        moved.status.code(),
+        Some(0),
+        "allowed rename must complete: {}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    assert!(!source.exists());
+    assert_eq!(std::fs::read(&destination).unwrap(), b"source");
+
+    let events = trace_events(&only_run_dir(state.path()));
+    let renamed = events
+        .iter()
+        .find(|event| {
+            event["syscall"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("rename"))
+        })
+        .expect("rename event");
+    assert_eq!(renamed["decision"], "allow");
+    assert_eq!(
+        renamed["operand_decisions"],
+        serde_json::json!([
+            {
+                "operand": "path",
+                "access": "delete",
+                "decision": "allow",
+                "matched_rule": "base:workspace"
+            },
+            {
+                "operand": "dest",
+                "access": "create",
+                "decision": "allow",
+                "matched_rule": "base:workspace"
+            }
+        ])
+    );
+}
+
+#[test]
+fn enforce_rename_exchange_checks_create_and_delete_on_both_operands() {
+    let ws = tempfile::tempdir().unwrap();
+    let source = ws.path().join("source");
+    let destination = ws.path().join("destination");
+    std::fs::write(&source, b"source").unwrap();
+    std::fs::write(&destination, b"destination").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let policy_path = state.path().join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        format!(
+            "schema_version = 1\n\
+             [[fs]]\npath={:?}\nmode=[\"create\"]\naction=\"deny\"\n\
+             [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+             [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+            source.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let script = format!(
+        "import ctypes, errno\n\
+         libc=ctypes.CDLL(None,use_errno=True)\n\
+         rc=libc.syscall(316,-100,b{:?},-100,b{:?},2)\n\
+         assert rc == -1 and ctypes.get_errno() == errno.EACCES, (rc,ctypes.get_errno())",
+        source.to_string_lossy(),
+        destination.to_string_lossy()
+    );
+
+    let exchanged = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            &script,
+        ],
+        ws.path(),
+    );
+    assert_eq!(
+        exchanged.status.code(),
+        Some(0),
+        "the agent must observe the policy denial: {}",
+        String::from_utf8_lossy(&exchanged.stderr)
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), b"source");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"destination");
+
+    let events = trace_events(&only_run_dir(state.path()));
+    let exchange = events
+        .iter()
+        .find(|event| event["syscall"] == "renameat2")
+        .expect("renameat2 event");
+    assert_eq!(exchange["decision"], "deny");
+    assert_eq!(exchange["matched_rule"], "fs.1");
+    assert_eq!(
+        exchange["operand_decisions"],
+        serde_json::json!([
+            {
+                "operand": "path",
+                "access": "delete",
+                "decision": "allow",
+                "matched_rule": "base:workspace"
+            },
+            {
+                "operand": "path",
+                "access": "create",
+                "decision": "deny",
+                "matched_rule": "fs.1"
+            },
+            {
+                "operand": "dest",
+                "access": "delete",
+                "decision": "allow",
+                "matched_rule": "base:workspace"
+            },
+            {
+                "operand": "dest",
+                "access": "create",
+                "decision": "allow",
+                "matched_rule": "base:workspace"
+            }
+        ])
+    );
+}
+
+#[test]
+fn enforce_openat2_rejects_nonzero_extensions_and_resolve_flags() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join("target"), b"target").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let policy_path = state.path().join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        "schema_version = 1\n\
+         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+         [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+    )
+    .unwrap();
+    let script = "import ctypes, errno\n\
+                  libc=ctypes.CDLL(None,use_errno=True)\n\
+                  how=(ctypes.c_ulonglong*4)(0,0,0,1)\n\
+                  rc=libc.syscall(437,-100,b'target',ctypes.byref(how),32)\n\
+                  assert rc == -1 and ctypes.get_errno() == errno.E2BIG, (rc,ctypes.get_errno())\n\
+                  how=(ctypes.c_ulonglong*4)(0,0,4,0)\n\
+                  rc=libc.syscall(437,-100,b'target',ctypes.byref(how),24)\n\
+                  assert rc == -1 and ctypes.get_errno() == errno.EOPNOTSUPP, (rc,ctypes.get_errno())";
+
+    let opened = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            script,
+        ],
+        ws.path(),
+    );
+    assert_eq!(
+        opened.status.code(),
+        Some(0),
+        "the agent must observe both documented errors: {}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    let events = trace_events(&only_run_dir(state.path()));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["syscall"] == "openat2")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn enforce_brokers_destination_bearing_udp_sendto() {
+    let receiver = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let port = receiver.local_addr().unwrap().port();
+    let ws = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let policy_path = state.path().join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        format!(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+             [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n\
+             [[net]]\nhost=\"127.0.0.1\"\nport={port}\naction=\"allow\"\n"
+        ),
+    )
+    .unwrap();
+    let script = format!(
+        "import socket\ns=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\nassert s.sendto(b'brokered',('127.0.0.1',{port})) == 8"
+    );
+
+    let sent = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            &script,
+        ],
+        ws.path(),
+    );
+    assert_eq!(
+        sent.status.code(),
+        Some(0),
+        "brokered sendto must preserve behavior: {}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let mut payload = [0u8; 32];
+    let (length, _) = receiver.recv_from(&mut payload).unwrap();
+    assert_eq!(&payload[..length], b"brokered");
+    let events = trace_events(&only_run_dir(state.path()));
+    assert!(events.iter().any(|event| {
+        event["syscall"] == "sendto"
+            && event["decision"] == "allow"
+            && event["fact"]["host"] == "127.0.0.1"
+            && event["fact"]["port"] == port
+    }));
 }
 
 /// policy load errors are supervisor failures and happen before the run directory exists.
