@@ -257,7 +257,7 @@ fn agent_dispatch() {
                 },
                 sin_zero: [0; 8],
             };
-            let byte = [b'x'];
+            let byte = *b"x";
             let rc = libc::sendto(
                 fd,
                 byte.as_ptr().cast(),
@@ -285,7 +285,7 @@ fn agent_dispatch() {
             {
                 std::process::exit(23);
             }
-            let byte = [b'x'];
+            let byte = *b"x";
             let rc = libc::sendto(
                 pair[0],
                 byte.as_ptr().cast(),
