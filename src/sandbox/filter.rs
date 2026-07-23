@@ -292,12 +292,14 @@ mod tests {
                         offset if (SECCOMP_DATA_ARGS..SECCOMP_DATA_ARGS + 48).contains(&offset) => {
                             let relative = offset - SECCOMP_DATA_ARGS;
                             let arg = args[(relative / 8) as usize];
-                            if relative % 8 == 0 {
-                                arg as u32
-                            } else if relative % 8 == 4 {
-                                (arg >> 32) as u32
-                            } else {
-                                return Err(format!("unaligned argument load at offset {offset}"));
+                            match relative % 8 {
+                                0 => arg as u32,
+                                4 => (arg >> 32) as u32,
+                                _ => {
+                                    return Err(format!(
+                                        "unaligned argument load at offset {offset}"
+                                    ));
+                                }
                             }
                         }
                         k => return Err(format!("load from unmodeled offset {k}")),
