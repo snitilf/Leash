@@ -1,9 +1,6 @@
 # ADR-0017: Record-only allows are realized with CONTINUE
 
-- Status: accepted, narrowed on 2026-07-23 (issue #26) in one arc: the "case-C memory-read
-  failures deny in both modes" line below now excludes a malformed or over-cap network address,
-  which records a `raw` allow in record-only ([`../design/notify-loop.md`](../design/notify-loop.md)
-  sections 2 and 4). The decision this ADR records is otherwise unchanged.
+- Status: accepted (case-C clause refined by ADR-0019)
 - Date: 2026-07-10
 
 ## Context

@@ -37,7 +37,7 @@ Each layer references the ones above it by **stable ID** (requirement IDs like `
 ## Status
 
 - **Implementation in progress.**
-  The spec is settled at v0.7 (see [`spec/SPEC.md`](spec/SPEC.md)), and the design layer in [`design/`](design/) is frozen as of 2026-07-08.
+  The spec is settled at v0.8 (see [`spec/SPEC.md`](spec/SPEC.md)), and the design layer in [`design/`](design/) is frozen as of 2026-07-08.
   The M0 x86-64 overlay spike and M1 recorder milestone are complete: preflight, spawn, the record-only notify loop, durable traces, reports, the `leash run` CLI, Linux behavioral CI, and the first overhead measurement have landed ([`measurements/0001-m1-overhead.md`](measurements/0001-m1-overhead.md)).
 - **M2 enforcement is in progress.**
   Policy parsing and pure evaluation, Landlock ruleset derivation and application primitives, and typed process, network, and cross-process trace/report facts have landed.

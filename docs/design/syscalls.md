@@ -193,8 +193,8 @@ The rule binds decisions that constrain, which in practice means **enforce**-mod
 **record-only**, where every decision is allow and there is no anchor set to resolve beneath,
 allows are realized with `CONTINUE` and the trace-fidelity residual is named in
 [`escapes.md`](escapes.md) section 4 (ADR-0017). The denied-and-recorded set (section 5) and the
-case-C deny are unaffected; they deny in both modes, with the one exception the recorded decision
-of 2026-07-23 (the issue #26 hygiene pass) pinned: a malformed or over-cap network address records
+case-C deny are unaffected; they deny in both modes, with the one exception ADR-0019 pinned on
+2026-07-23 (the issue #26 hygiene pass): a malformed or over-cap network address records
 a `raw` allow in record-only and a `raw` fail-closed deny in enforce
 ([`notify-loop.md`](notify-loop.md) sections 2 and 4, [`trace.md`](trace.md) section 2).
 

@@ -71,7 +71,7 @@ Fact details fixed by the notify loop:
   no fields: the denied-and-recorded set ([`syscalls.md`](syscalls.md) section 5), and a case-C
   event where the pointer argument could not be read within its cap
   ([`notify-loop.md`](notify-loop.md) section 4), which is a deny except for the record-only
-  network allow fixed below. The envelope's `syscall` field still names the
+  network allow fixed below (ADR-0019, recorded 2026-07-23). The envelope's `syscall` field still names the
   call, which is the recordable substance of those events.
 - A process-creation fact carries optional `flags`.
   `clone` and `clone3` fill it from the kernel-trusted scalar or bounded `clone_args` read; `fork` and `vfork` omit it.
@@ -79,8 +79,11 @@ Fact details fixed by the notify loop:
   `pidfd_getfd` carries no target pid, because its pidfd argument cannot be safely resolved under `CONTINUE`.
   In record-only it records and continues; in enforce mode it denies fail-closed until safe pidfd resolution exists.
 - A network fact carries the destination `host` string and `port` parsed from the trapped `sockaddr`.
+  By the recorded decision of 2026-07-23 (the issue #26 hygiene pass), `host` carries the canonical form of the destination: an IPv4-mapped IPv6 address is written as its IPv4 form, so a dual-stack `connect` to `93.184.216.34` records `"93.184.216.34"` and never `"::ffff:93.184.216.34"` ([`policy.md`](policy.md) section 2.2).
+  A native IPv6 destination is unchanged.
+  This narrows the set of values the field can take without changing its type, so `schema_version` does not move; a reader that accepted the mapped form still decodes the canonical one.
   If the `sockaddr` cannot be read or parsed within its bound, the event is recorded as `raw`.
-  In record-only that raw network event is allowed, because record-only enforces nothing outside the denied-and-recorded set.
+  In record-only that raw network event is allowed, because record-only enforces nothing outside the denied-and-recorded set (ADR-0019, recorded 2026-07-23; FR-9 and I3 carry the same mode scope).
   In enforce mode the same untrusted network fact denies fail-closed.
 
 In a run with no policy, `matched_rule` carries a fixed base id naming what decided the event:

@@ -8,9 +8,20 @@ Status: **frozen (2026-07-08).** All eight files are settled. The M0 spike's gat
 x86-64 leg by ADR-0014 (the ARM64 target is deferred, spec OQ-9), passed on 2026-07-08, settling
 `snapshot.md` and freezing the layer; `cli.md` was added by the recorded decisions of 2026-07-11
 (FR-22). Changes from here follow change control; a frozen file is amended by a recorded decision,
-not edited casually. The amendments since the freeze are dated inline in the file each one
-touches: 2026-07-13 and 2026-07-14 (`policy.md`, from the slices of #25), and 2026-07-23
-(`policy.md` section 2.2 and `notify-loop.md` sections 2 and 4, from the issue #26 hygiene pass).
+not edited casually. Three amendments have landed since:
+
+- 2026-07-13, from slice 1 of #25: the glob and host pins in `policy.md` sections 2.1 and 2.2
+  (dated inline there), and the 250 ms coalescing window in `snapshot.md` section 1, whose
+  provenance is the open-parameters row below and the measurement it cites rather than an inline
+  date.
+- 2026-07-14, from slice 2 of #25: the workspace base allow in `policy.md` section 1 (dated
+  inline).
+- 2026-07-23, from the issue #26 hygiene pass, carrying ADR-0019 and spec v0.8: the IPv4-mapped
+  normalization in `policy.md` sections 2.2 and 7, the mode-scoped network arc in
+  `notify-loop.md` sections 2 and 4 and `syscalls.md` section 4, the `host` field and raw-fact
+  wording in `trace.md` section 2, invariant I3 in `architecture.md` section 3, and the new
+  residual in `escapes.md` section 4. Each carries its provenance where it lands, as an inline date
+  or as the ADR-0019 citation.
 
 ## Reading order
 
