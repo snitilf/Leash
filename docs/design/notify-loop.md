@@ -13,6 +13,16 @@ realized, are in [`syscalls.md`](syscalls.md); the two files share the allow-rea
 section 4 there and section 3 here, and must agree. Terms in **bold** are in
 [`../CONTEXT.md`](../CONTEXT.md).
 
+### ADR-0020 realization amendment
+
+In enforce mode, a pointer-bearing allow is prepared and committed by a Landlock-confined broker process.
+Preparation resolves and pins resources but performs no side effect.
+The supervisor records the attempt and decision, checks `ID_VALID` again, and only then asks the broker to commit.
+If that final validity check fails, the recorded attempt remains but no side effect or response occurs.
+Events describe observed attempts and decisions, not proof of operation completion.
+If the broker fails or exceeds its operation deadline, the supervisor aborts the run and closes the notification fd fail-closed.
+Issue #25 resolves `ask` to deny without invoking a prompt.
+
 ## 1. The happy path
 
 One notification, start to finish, before the next is received (ADR-0011):

@@ -161,11 +161,23 @@ The issue #26 implementation denies it in both modes under the `sr4:pidfd_getfd`
 
 ### 3.5 Network
 
+ADR-0020 supersedes the fresh-socket realization described in the original slate-2 text below.
+The supervisor duplicates the trapped process's actual socket with `pidfd_getfd` and passes it to the Landlock-confined broker.
+The broker performs `connect`, `bind`, or `sendto` against the once-copied address, and `sendto` also uses a once-copied payload and flags.
+No network operation replaces the child's descriptor with `ADDFD SETFD`.
+This preserves the socket's type, protocol, options, binding state, and open file description.
+
+The supported enforce-mode address families are `AF_INET` and `AF_INET6`.
+IP, CIDR, and `*` policy hosts are directly enforceable.
+Exact hostnames use the supervisor's bounded address cache.
+Suffix hostname rules are rejected before an enforce child is spawned because an IP-only `sockaddr` cannot prove which wildcard hostname the child intended.
+UDP port control is a named Landlock residual on the supported ABI range.
+
 | Syscall | Also on ARM64 | Decision basis | Allow realized by | Landlock backstop |
 |---|---|---|---|---|
-| `connect` | yes | `sockaddr` host + port (pointer) | supervisor connects a fresh socket, injects it with `ADDFD`; or `CONTINUE` for allow-all policies | `NET_CONNECT_TCP` (port only) |
-| `bind` | yes | `sockaddr` port (pointer) | supervisor-executed or `CONTINUE` per policy | `NET_BIND_TCP` (port only) |
-| `sendto` | yes | destination `sockaddr` on an unconnected socket (pointer) | as `connect` | `NET_CONNECT_TCP` (port only) |
+| `connect` | yes | `sockaddr` host + port (pointer) | confined broker operates on a `pidfd_getfd` duplicate; or `CONTINUE` for allow-all policies | `NET_CONNECT_TCP` (TCP port only) |
+| `bind` | yes | `sockaddr` port (pointer) | confined broker operates on a `pidfd_getfd` duplicate; or `CONTINUE` for allow-all policies | `NET_BIND_TCP` (TCP port only) |
+| `sendto` | yes | destination `sockaddr`, payload, and flags (pointers + scalars) | confined broker sends once-copied payload on a `pidfd_getfd` duplicate | none on the supported ABI range |
 
 Network is arch-uniform: `socket`, `connect`, and `bind` exist directly on both x86-64 and ARM64
 (the multiplexed `socketcall` is a 32-bit-x86 artifact and is denied as a foreign-ABI syscall,
@@ -181,19 +193,19 @@ connection boundary at `connect`/`bind`/`sendto` and treats `sendmsg` to an unco
 named residual in [`escapes.md`](escapes.md) rather than trapping all `sendmsg`; revisiting this is a
 tier:2 change if a workload sends to unconnected sockets via `sendmsg`.
 
-Landlock's network rules are **port-based**, so they cannot enforce a host allowlist (FR-7); they
-backstop the port dimension only. Host-level enforcement therefore rests on the seccomp decision,
-which makes the `sockaddr` TOCTOU real: with a bare `CONTINUE`, a second thread could rewrite the
-address between the supervisor's read and the kernel's connect. The design closes it by realizing a
-host-enforced allow as a supervisor-side connect injected with `ADDFD` (the supervisor opens a
-socket, connects it to the validated address, and installs it over the child's fd number), never as
-`CONTINUE`. `CONTINUE` is used only where the policy imposes no host constraint. The fidelity cost of the
-injected socket (socket options the child set before `connect`) is accepted as-is at slate 2: no
-options are carried onto the injected socket, the loss is a named residual in
-[`escapes.md`](escapes.md), and widening fidelity is a tier:2 change if a real workload breaks on
-it.
+Landlock's network rules are **port-based**, so they cannot enforce a host allowlist (FR-7), and the supported ABI range exposes only TCP port rights.
+Host-level enforcement and UDP destination enforcement therefore rest on the seccomp decision.
+A bare `CONTINUE` would let a second thread rewrite the address or payload between the supervisor's read and the kernel's use.
+ADR-0020 closes that race by duplicating the actual child socket and making the confined broker execute against once-copied inputs.
+`CONTINUE` is used only where the policy imposes no host constraint and no pointer value affects the allow.
 
 ## 4. The allow-realization rule (normative)
+
+ADR-0020 refines rules 2 and 3 with a Landlock-confined broker.
+The unrestricted supervisor never performs a policy-governed side effect.
+Filesystem opens and mutations use a broker prepare phase with retained handles, followed by record, final `ID_VALID`, and broker commit.
+Network operations use a `pidfd_getfd` duplicate of the actual child socket and execute in the broker without replacing the child fd.
+An operation that exceeds the broker deadline aborts the run fail-closed.
 
 One rule governs every "allow" response, and it is the load-bearing security decision of this file
 (I4). It is stated once here and once in [`notify-loop.md`](notify-loop.md); the two must agree.
@@ -212,14 +224,10 @@ a `raw` allow in record-only and a `raw` fail-closed deny in enforce
 2. If the decision reads a pointer argument (a path, a `sockaddr`) and the syscall returns an fd, the
    allow is realized with `SECCOMP_ADDFD`: the supervisor opens the resolved resource itself and
    injects the fd. The child never gets a re-editable argument between check and use.
-3. If the decision reads a pointer argument and no fd can be injected as the return value (the
-   mutation family, `connect` under a host policy), the supervisor performs the operation itself on
-   the resolved target and spoofs the return value. `CONTINUE` is not used, because `CONTINUE`
-   re-reads the pointer. Where the child also needs the resulting resource, not just a return code,
-   the supervisor hands it back with `ADDFD` over the argument fd: for a host-enforced `connect` it
-   opens a socket, connects it to the validated address, installs it over the child's socket fd
-   (`ADDFD` with `SETFD`), and returns success. The fidelity limit of this, socket options the child
-   set before `connect`, is the accepted residual noted in section 3.5.
+3. If the decision reads a pointer argument and no fd can be injected as the return value, the confined broker performs the operation on a pinned resource and the supervisor spoofs the exact return value or errno.
+   `CONTINUE` is not used because it would re-read child memory.
+   Filesystem mutations use retained broker handles.
+   Network calls use a `pidfd_getfd` duplicate of the actual child socket, so no argument fd is replaced.
 4. `execve` and `execveat` are the one exception where an allow must use `CONTINUE`; enforcement is
    delegated to the Landlock `FS_EXECUTE` backstop (section 3.3), and the residual is recorded.
 

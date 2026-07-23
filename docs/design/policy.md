@@ -96,6 +96,11 @@ matcher being hand-rolled):
 
 ### 2.2 Host matching (fixed at slate 2)
 
+ADR-0020 narrows what schema version 1 can enforce without pretending an IP address proves an arbitrary DNS name.
+IP, CIDR, and `*` rules match the copied destination directly.
+Exact hostname rules are resolved by the supervisor into a short-lived address cache.
+Suffix hostname rules still parse for compatibility, but an enforce run containing one is rejected before spawn until a DNS-observation or proxy design can bind a concrete queried name to the destination.
+
 A `net` rule's `host` is one of: an exact hostname, a `*.suffix` wildcard, an exact IP address, or
 a CIDR block. IP and CIDR rules match the destination address in the child's `sockaddr` directly.
 A hostname rule is enforced by the supervisor resolving the rule's name itself at decision time
