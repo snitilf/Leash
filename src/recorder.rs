@@ -188,9 +188,8 @@ pub enum Fact {
     },
     /// a cross-process control decision
     CrossProcess {
-        /// target pid when the syscall exposes one as a scalar register argument
-        #[serde(skip_serializing_if = "Option::is_none")]
-        target_pid: Option<u32>,
+        /// target pid, read from the kernel-trusted scalar register argument
+        target_pid: u32,
     },
     /// an execution decision
     Exec {

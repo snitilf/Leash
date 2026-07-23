@@ -18,6 +18,7 @@
 
 use std::ffi::CString;
 use std::io::{self, Write};
+use std::mem::size_of;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -212,6 +213,139 @@ fn agent_dispatch() {
                 0
             } else {
                 18
+            });
+        }
+    }
+
+    if std::env::var_os("LEASH_NOTIFY_BIND_AGENT").is_some() {
+        // SAFETY: socket/bind/close use scalar arguments and a sockaddr we own.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            if fd < 0 {
+                std::process::exit(19);
+            }
+            let addr = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                },
+                sin_zero: [0; 8],
+            };
+            let rc = libc::bind(
+                fd,
+                (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+                size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            libc::close(fd);
+            std::process::exit(if rc == 0 { 0 } else { 20 });
+        }
+    }
+
+    if std::env::var_os("LEASH_NOTIFY_SENDTO_AGENT").is_some() {
+        // SAFETY: socket/sendto/close use scalar arguments and buffers we own.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+            if fd < 0 {
+                std::process::exit(21);
+            }
+            let addr = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 9u16.to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                },
+                sin_zero: [0; 8],
+            };
+            let byte = *b"x";
+            let rc = libc::sendto(
+                fd,
+                byte.as_ptr().cast(),
+                byte.len(),
+                0,
+                (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+                size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            libc::close(fd);
+            std::process::exit(if rc == 1 { 0 } else { 22 });
+        }
+    }
+
+    if std::env::var_os("LEASH_NOTIFY_CONNECTED_SENDTO_AGENT").is_some() {
+        // SAFETY: socketpair/sendto/close use descriptors and a buffer we own. The null
+        // destination selects the already-connected peer and must bypass notification.
+        unsafe {
+            let mut pair = [-1; 2];
+            if libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                0,
+                pair.as_mut_ptr(),
+            ) != 0
+            {
+                std::process::exit(23);
+            }
+            let byte = *b"x";
+            let rc = libc::sendto(
+                pair[0],
+                byte.as_ptr().cast(),
+                byte.len(),
+                0,
+                std::ptr::null(),
+                0,
+            );
+            libc::close(pair[0]);
+            libc::close(pair[1]);
+            std::process::exit(if rc == 1 { 0 } else { 24 });
+        }
+    }
+
+    if std::env::var_os("LEASH_NOTIFY_PROCESS_VM_AGENT").is_some() {
+        // SAFETY: zero iovec counts make both pointers unused. The target is the
+        // out-of-tree supervisor process and the kernel should return zero after CONTINUE.
+        unsafe {
+            let target = libc::getppid();
+            let rc = libc::syscall(
+                libc::SYS_process_vm_readv,
+                target,
+                std::ptr::null::<libc::iovec>(),
+                0usize,
+                std::ptr::null::<libc::iovec>(),
+                0usize,
+                0usize,
+            );
+            let errno = io::Error::last_os_error().raw_os_error();
+            std::process::exit(if rc == 0 || (rc == -1 && errno == Some(libc::EPERM)) {
+                0
+            } else {
+                25
+            });
+        }
+    }
+
+    if std::env::var_os("LEASH_NOTIFY_CLONE3_OVERSIZE_AGENT").is_some() {
+        let args = [0u8; 88];
+        // SAFETY: clone3 receives a valid buffer but an intentionally over-cap size.
+        unsafe {
+            let rc = libc::syscall(libc::SYS_clone3, args.as_ptr(), 89usize);
+            let errno = io::Error::last_os_error().raw_os_error();
+            std::process::exit(if rc == -1 && errno == Some(libc::EACCES) {
+                0
+            } else {
+                26
+            });
+        }
+    }
+
+    if std::env::var_os("LEASH_NOTIFY_PIDFD_GETFD_AGENT").is_some() {
+        // SAFETY: the supervisor denies before the kernel interprets the invalid pidfd.
+        unsafe {
+            let rc = libc::syscall(libc::SYS_pidfd_getfd, -1i32, 0u32, 0u32);
+            let errno = io::Error::last_os_error().raw_os_error();
+            std::process::exit(if rc == -1 && errno == Some(libc::ENOSYS) {
+                0
+            } else {
+                27
             });
         }
     }
@@ -625,6 +759,95 @@ fn connect_appears_as_typed_net_event() {
     assert_eq!(connects[0]["fact"]["host"], "127.0.0.1");
     assert_eq!(connects[0]["fact"]["port"], 9);
     assert_eq!(connects[0]["decision"], "allow");
+}
+
+#[test]
+fn bind_appears_as_typed_net_event() {
+    let _g = spawn_guard();
+    let (result, events) = serve_agent(&[("LEASH_NOTIFY_BIND_AGENT", "1")], MemSink::default());
+    assert_eq!(exited_with(result.expect("loop must complete")), Some(0));
+
+    let binds = syscall_events(&events, "bind");
+    assert_eq!(binds.len(), 1, "{events:?}");
+    assert_eq!(binds[0]["fact"]["family"], "net");
+    assert_eq!(binds[0]["fact"]["host"], "127.0.0.1");
+    assert_eq!(binds[0]["fact"]["port"], 0);
+    assert_eq!(binds[0]["decision"], "allow");
+}
+
+#[test]
+fn destination_bearing_sendto_appears_as_typed_net_event() {
+    let _g = spawn_guard();
+    let (result, events) = serve_agent(&[("LEASH_NOTIFY_SENDTO_AGENT", "1")], MemSink::default());
+    assert_eq!(exited_with(result.expect("loop must complete")), Some(0));
+
+    let sends = syscall_events(&events, "sendto");
+    assert_eq!(sends.len(), 1, "{events:?}");
+    assert_eq!(sends[0]["fact"]["family"], "net");
+    assert_eq!(sends[0]["fact"]["host"], "127.0.0.1");
+    assert_eq!(sends[0]["fact"]["port"], 9);
+    assert_eq!(sends[0]["decision"], "allow");
+}
+
+#[test]
+fn connected_sendto_bypasses_the_notify_loop() {
+    let _g = spawn_guard();
+    let (result, events) = serve_agent(
+        &[("LEASH_NOTIFY_CONNECTED_SENDTO_AGENT", "1")],
+        MemSink::default(),
+    );
+    assert_eq!(exited_with(result.expect("loop must complete")), Some(0));
+    assert!(syscall_events(&events, "sendto").is_empty(), "{events:?}");
+}
+
+#[test]
+fn out_of_tree_process_vm_readv_appears_as_a_typed_event() {
+    let _g = spawn_guard();
+    let (result, events) = serve_agent(
+        &[("LEASH_NOTIFY_PROCESS_VM_AGENT", "1")],
+        MemSink::default(),
+    );
+    assert_eq!(exited_with(result.expect("loop must complete")), Some(0));
+
+    let reads = syscall_events(&events, "process_vm_readv");
+    assert_eq!(reads.len(), 1, "{events:?}");
+    assert_eq!(reads[0]["fact"]["family"], "cross_process");
+    assert!(reads[0]["fact"]["target_pid"].as_u64().unwrap() > 0);
+    assert_eq!(reads[0]["decision"], "allow");
+}
+
+#[test]
+fn oversized_clone3_is_denied_as_an_untrusted_fact() {
+    let _g = spawn_guard();
+    let (result, events) = serve_agent(
+        &[("LEASH_NOTIFY_CLONE3_OVERSIZE_AGENT", "1")],
+        MemSink::default(),
+    );
+    assert_eq!(exited_with(result.expect("loop must complete")), Some(0));
+
+    let denied: Vec<_> = syscall_events(&events, "clone3")
+        .into_iter()
+        .filter(|event| event["decision"] == "deny")
+        .collect();
+    assert_eq!(denied.len(), 1, "{events:?}");
+    assert_eq!(denied[0]["fact"]["family"], "raw");
+    assert_eq!(denied[0]["matched_rule"], "failsafe:memory_read");
+}
+
+#[test]
+fn pidfd_getfd_is_denied_and_recorded_in_record_only() {
+    let _g = spawn_guard();
+    let (result, events) = serve_agent(
+        &[("LEASH_NOTIFY_PIDFD_GETFD_AGENT", "1")],
+        MemSink::default(),
+    );
+    assert_eq!(exited_with(result.expect("loop must complete")), Some(0));
+
+    let attempts = syscall_events(&events, "pidfd_getfd");
+    assert_eq!(attempts.len(), 1, "{events:?}");
+    assert_eq!(attempts[0]["fact"]["family"], "raw");
+    assert_eq!(attempts[0]["decision"], "deny");
+    assert_eq!(attempts[0]["matched_rule"], "sr4:pidfd_getfd");
 }
 
 /// enforce mode without a loaded policy must refuse to run (fail closed), not fall

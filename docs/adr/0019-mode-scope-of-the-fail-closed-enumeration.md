@@ -115,3 +115,9 @@ unchanged.
 - **Record the narrowing in the design layer only.** Rejected: ADRs are immutable, and a clause of
   ADR-0017 is being narrowed, so the refinement needs its own numbered decision
   ([`README.md`](README.md)).
+
+## Implementation status
+
+Implemented on the issue #26 branch on 2026-07-23.
+The runtime now normalizes mapped destinations and policy inputs, and denies `pidfd_getfd` in both modes under `sr4:pidfd_getfd`.
+This closes the temporary implementation gap described above without changing the decision.

@@ -265,9 +265,10 @@ fn format_report(
     let mode_line = if mode == "enforce" {
         "enforce".to_string()
     } else {
-        // FR-19 and SR-4: record-only enforces no policy, but the denied-and-recorded set
-        // is refused in this mode too, so the line must not claim every action was allowed.
-        "record-only (no policy was enforced; only un-mediated I/O paths were denied, per SR-4)"
+        // FR-19 and ADR-0019: record-only enforces no policy, but the denied-and-recorded
+        // set (SR-4), foreign-ABI entries (SR-3), and facts the supervisor could not decode
+        // are refused in this mode too, so the line must not claim every action was allowed.
+        "record-only (no policy was enforced; the denials listed below are the un-mediated I/O paths (SR-4), foreign-ABI entries (SR-3), and undecodable facts)"
             .to_string()
     };
 
@@ -537,7 +538,7 @@ mod tests {
         let report = render_report(&trace).unwrap();
         let golden = [
             "leash session report",
-            "mode: record-only (no policy was enforced; only un-mediated I/O paths were denied, per SR-4)",
+            "mode: record-only (no policy was enforced; the denials listed below are the un-mediated I/O paths (SR-4), foreign-ABI entries (SR-3), and undecodable facts)",
             "command: claude -p",
             "workspace: /w",
             "exit: code 0",

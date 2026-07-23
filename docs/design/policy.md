@@ -123,8 +123,8 @@ gap):
   Normalizing the destination alone would leave a mapped-form rule that can never match, which in a `deny` rule is a boundary the operator believes exists and does not: the same silent under-match section 2.1 rejects brace and class syntax to avoid.
 - A mapped-form CIDR shorter than `/96` is a load-time rejection.
   It spans addresses outside the mapped block, so no single normalized form carries its intent, and section 4 rejects rather than guesses.
-- Both normalizations are pinned here ahead of the code.
-  This is the first, documentation-only PR of the two-PR issue #26 sequence; the implementing seams (the `sockaddr` parse in the notify loop and `host` parsing in the policy loader) land in the subsequent issue #26 PR, and until they do a mapped destination is still recorded and evaluated as IPv6.
+- Both normalizations are implemented as of the second issue #26 PR: the destination side in the `sockaddr` parse of the notify loop, and the rule side in `host` parsing in the policy loader.
+  A mapped destination and a mapped-form rule are both canonicalized to IPv4 before they meet.
 
 ### 2.3 One execution control (fixed at slate 2)
 
