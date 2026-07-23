@@ -75,8 +75,8 @@ Fact details fixed by the notify loop:
   call, which is the recordable substance of those events.
 - A process-creation fact carries optional `flags`.
   `clone` and `clone3` fill it from the kernel-trusted scalar or bounded `clone_args` read; `fork` and `vfork` omit it.
-- A cross-process fact carries `target_pid` when the syscall exposes one as a scalar register argument.
-  `pidfd_getfd` carries no target pid, because its pidfd argument cannot be safely resolved under `CONTINUE`.
+- A cross-process fact always carries `target_pid`, read from the kernel-trusted scalar register argument (`ptrace`, `process_vm_readv`, `process_vm_writev`).
+  `pidfd_getfd` produces no cross-process fact at all: its pidfd argument cannot be safely resolved under `CONTINUE`, so it carries the `raw` family instead.
   It is denied and recorded in both modes as a member of the denied-and-recorded set ([`syscalls.md`](syscalls.md) section 5), under the `sr4:pidfd_getfd` id, because an imported fd is I/O the trace could not otherwise attribute (ADR-0019, recorded 2026-07-23).
 - A network fact carries the destination `host` string and `port` parsed from the trapped `sockaddr`.
   By the recorded decision of 2026-07-23 (the issue #26 hygiene pass), `host` carries the canonical form of the destination: an IPv4-mapped IPv6 address is written as its IPv4 form, so a dual-stack `connect` to `93.184.216.34` records `"93.184.216.34"` and never `"::ffff:93.184.216.34"` ([`policy.md`](policy.md) section 2.2).

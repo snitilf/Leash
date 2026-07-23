@@ -270,10 +270,11 @@ mod linux {
     ) -> Result<SessionOutcome, SessionError> {
         // step 3: announce the mode on stderr; stdout belongs to the child (FR-19)
         match meta.mode {
-            // the same FR-19/SR-4 wording the session report uses (report.rs): no policy is
-            // enforced, but the denied-and-recorded set is refused in this mode too.
+            // the same FR-19/ADR-0019 wording the session report uses (report.rs): no policy
+            // is enforced, but the denied-and-recorded set, foreign-ABI entries, and
+            // undecodable facts are refused in this mode too.
             Mode::RecordOnly => eprintln!(
-                "leash: record-only run; no policy is enforced, and only un-mediated I/O paths are denied (SR-4)"
+                "leash: record-only run; no policy is enforced, and only un-mediated I/O paths (SR-4), foreign-ABI entries (SR-3), and undecodable facts are denied"
             ),
             Mode::Enforce => eprintln!("leash: enforce run"),
         }

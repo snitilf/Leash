@@ -70,6 +70,13 @@ impl HostRule {
         if let Some((addr, prefix)) = host.split_once('/') {
             let addr: IpAddr = addr.parse().map_err(|_| HostError::InvalidCidr)?;
             let prefix: u8 = prefix.parse().map_err(|_| HostError::InvalidCidr)?;
+            let max = match addr {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            if prefix > max {
+                return Err(HostError::InvalidCidr);
+            }
             if let IpAddr::V6(v6) = addr
                 && let Some(v4) = v6.to_ipv4_mapped()
             {
@@ -80,13 +87,6 @@ impl HostRule {
                     addr: IpAddr::V4(v4),
                     prefix: prefix - 96,
                 });
-            }
-            let max = match addr {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            if prefix > max {
-                return Err(HostError::InvalidCidr);
             }
             return Ok(HostRule::Cidr { addr, prefix });
         }
@@ -245,6 +245,20 @@ mod tests {
                 prefix: 24
             })
         );
+        assert_eq!(
+            HostRule::parse("::ffff:192.0.2.1/128"),
+            Ok(HostRule::Cidr {
+                addr: ip("192.0.2.1"),
+                prefix: 32
+            })
+        );
+        assert_eq!(
+            HostRule::parse("::ffff:0:0/96"),
+            Ok(HostRule::Cidr {
+                addr: ip("0.0.0.0"),
+                prefix: 0
+            })
+        );
     }
 
     #[test]
@@ -270,6 +284,18 @@ mod tests {
         assert_eq!(HostRule::parse("10.0.0.0/x"), Err(HostError::InvalidCidr));
         assert_eq!(
             HostRule::parse("::ffff:192.0.2.0/95"),
+            Err(HostError::InvalidCidr)
+        );
+        assert_eq!(
+            HostRule::parse("::ffff:192.0.2.0/129"),
+            Err(HostError::InvalidCidr)
+        );
+        assert_eq!(
+            HostRule::parse("::ffff:192.0.2.0/200"),
+            Err(HostError::InvalidCidr)
+        );
+        assert_eq!(
+            HostRule::parse("::ffff:192.0.2.0/255"),
             Err(HostError::InvalidCidr)
         );
     }

@@ -560,9 +560,7 @@ fn handle_cross_process<N: Notifier, S: TraceSink>(
         ts,
         notif,
         name,
-        Fact::CrossProcess {
-            target_pid: Some(target_pid),
-        },
+        Fact::CrossProcess { target_pid },
         &decision,
     )?;
     respond_continue_or_deny(kernel, notif.id, &decision)?;
