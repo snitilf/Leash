@@ -44,7 +44,7 @@ One notification, start to finish, before the next is received (ADR-0011):
    timestamp) before the response is sent. The ordering is deliberate and load-bearing: see
    section 3.
 6. **Respond.** `ioctl(SECCOMP_IOCTL_NOTIF_SEND)` carries the response: `CONTINUE`, an errno (deny or
-   the spoofed return of a supervisor-executed operation), or an `ADDFD` injection whose return value
+   the spoofed return of a broker-executed operation), or an `ADDFD` injection whose return value
    is the injected fd number, done atomically with `SECCOMP_ADDFD_FLAG_SEND` so the inject and the
    response are one step. Which one is fixed by the allow-realization rule.
 7. **Loop.** Receive the next notification.
@@ -63,7 +63,9 @@ The child's pointer arguments are the whole TOCTOU problem (SR-2, I4). The rules
 - Bracket the read with `ID_VALID`: check validity, read, check validity again. A read that spans the
   child's death is discarded, and the id cannot have been silently reused underneath it.
 - Cap every read.
-  The caps, fixed at slate 2, are the kernel's own limits: 4096 bytes for a path (`PATH_MAX`), 128 bytes for a `sockaddr` (`sizeof(struct sockaddr_storage)`), the current kernel struct size for `clone_args` (and likewise for `openat2`'s `open_how`, read under the same struct-size rule), and one page as the absolute ceiling for any read.
+  The caps are 4096 bytes for a path (`PATH_MAX`), 128 bytes for a `sockaddr` (`sizeof(struct sockaddr_storage)`), the current kernel struct size for `clone_args`, and 65,535 bytes for a destination-bearing `sendto` payload under ADR-0020.
+  An enforce-mode `openat2` reads the base `open_how` plus bounded extension bytes under the rule in [`syscalls.md`](syscalls.md) section 4.
+  The absolute ceiling for any fixed-size read is 65,535 bytes.
   An unbounded or attacker-chosen length is a denial-of-service on the single decision thread.
   A malformed or over-cap path or `clone_args` resolves to deny (section 4, case C), because the trusted fact cannot be built.
   A malformed or over-cap network address is the one arc in the section 4 enumeration that is scoped by mode, per ADR-0019 (recorded 2026-07-23, the issue #26 hygiene pass), matching the network-fact rule already fixed in [`trace.md`](trace.md) section 2: record-only records a raw allow, while enforce records a raw fail-closed deny.
@@ -78,7 +80,7 @@ The child's pointer arguments are the whole TOCTOU problem (SR-2, I4). The rules
 
 The rule from [`syscalls.md`](syscalls.md) section 4, restated so this file is self-contained:
 `CONTINUE` only for a decision on the syscall number or scalar registers; `ADDFD` with a
-supervisor-opened fd for a pointer-argument allow that returns an fd; supervisor-executed with a
+broker-opened fd for a pointer-argument allow that returns an fd; broker-executed with a
 spoofed return for a pointer-argument allow that returns no fd; `execve` alone allowed by `CONTINUE`
 under the Landlock `FS_EXECUTE` backstop. The rule binds decisions that constrain: in
 **record-only** mode every allow is realized with `CONTINUE`, the event carrying the once-read

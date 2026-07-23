@@ -39,11 +39,11 @@ Each layer references the ones above it by **stable ID** (requirement IDs like `
 - **Implementation in progress.**
   The spec is settled at v0.8 (see [`spec/SPEC.md`](spec/SPEC.md)), and the design layer in [`design/`](design/) is frozen as of 2026-07-08.
   The M0 x86-64 overlay spike and M1 recorder milestone are complete: preflight, spawn, the record-only notify loop, durable traces, reports, the `leash run` CLI, Linux behavioral CI, and the first overhead measurement have landed ([`measurements/0001-m1-overhead.md`](measurements/0001-m1-overhead.md)).
-- **M2 enforcement is in progress.**
-  Policy parsing and pure evaluation, Landlock ruleset derivation and application primitives, and typed process, network, and cross-process trace/report facts have landed.
-  Enforce mode still refuses before spawning because safe pointer-argument allow realization and its escape suite remain open in issue #25.
-  FR-2 family completeness is implemented on the issue #26 branch and awaits Linux CI validation.
-  Attended approval remains blocked on #25 in issue #30.
+- **M2 core enforcement is implemented.**
+  Policy parsing and pure evaluation, Landlock ruleset derivation and application, typed process, network, and cross-process trace/report facts, and confined pointer-argument allow realization are complete.
+  Issue #25's Linux escape suite covers deny-by-default behavior, anchored path resolution, symlink swaps, magic links, two-path destinations, the Landlock backstop, network payload delivery, and setup failure before exec.
+  FR-2 family completeness has landed through issue #26.
+  Interactive attended approval remains separate in issue #30; until it lands, every `ask` decision resolves to deny.
 - One spec item remains deferred on purpose: OQ-9 (the ARM64 target), closing on a real ARM64 need.
   OQ-5 closed on 2026-07-13 into NFR-2's concrete budget from the M1 measurements.
 - No design parameter remains open.

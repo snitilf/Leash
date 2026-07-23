@@ -173,7 +173,9 @@ stated reason.
 5. In **enforce** mode the child applies the Landlock ruleset granting exactly the workspace, the
    explicitly allowed paths, and the TCP port backstop for allowed hosts (ADR-0003, ADR-0013). In
    **record-only** mode this step is skipped: nothing is enforced (ADR-0010). Landlock is applied by
-   the child, pre-exec, because a process can only restrict itself and its descendants.
+   the child, pre-exec, because a process can only restrict itself and its descendants. The child
+   then sends a second handshake byte, and the parent does not return from spawn until that byte
+   confirms every pre-exec boundary was installed.
 6. Child closes every file descriptor not on its allowlist (to close fd-inheritance escapes, see
    [`escapes.md`](escapes.md)) and calls `execve` on the agent command. Because the filter is
    already installed, the `execve` of the agent is itself the first mediated event (FR-1, FR-4).

@@ -72,22 +72,22 @@ bare value. The response column states how an allow is realized; the rule behind
 
 | Syscall | Also on ARM64 | Decision basis | Allow realized by | Landlock backstop |
 |---|---|---|---|---|
-| `openat`, `openat2` | yes | path + access mode (pointer) | `ADDFD`: supervisor opens the resolved path, injects the fd | `FS_READ_FILE` / `FS_WRITE_FILE`, or `FS_READ_DIR` for a directory |
+| `openat`, `openat2` | yes | path + access mode (pointer) | `ADDFD`: confined broker opens the resolved path, supervisor injects the returned fd | `FS_READ_FILE` / `FS_WRITE_FILE`, or `FS_READ_DIR` for a directory |
 | `open`, `creat` | no (x86-64 legacy only) | path + access mode (pointer) | `ADDFD` | same |
 
 ### 3.2 Filesystem mutation (no fd returned)
 
 | Syscall | Also on ARM64 | Decision basis | Allow realized by | Landlock backstop |
 |---|---|---|---|---|
-| `renameat`, `renameat2` | yes | source + dest paths (pointers) | supervisor performs it on the resolved paths, spoofs the return | `FS_REFER` (+ dir rights) |
+| `renameat`, `renameat2` | yes | source + dest paths (pointers) | confined broker performs it on retained parent handles, supervisor spoofs the return | `FS_REFER` (+ dir rights) |
 | `rename` | no (x86-64) | as above | as above | as above |
-| `unlinkat` | yes | path + flags (pointer + scalar) | supervisor-executed, spoofed return | `FS_REMOVE_FILE` / `FS_REMOVE_DIR` |
+| `unlinkat` | yes | path + flags (pointer + scalar) | broker-executed, spoofed return | `FS_REMOVE_FILE` / `FS_REMOVE_DIR` |
 | `unlink`, `rmdir` | no (x86-64) | path (pointer) | as above | as above |
-| `mkdirat` | yes | path (pointer) | supervisor-executed, spoofed return | `FS_MAKE_DIR` |
+| `mkdirat` | yes | path (pointer) | broker-executed, spoofed return | `FS_MAKE_DIR` |
 | `mkdir` | no (x86-64) | path (pointer) | as above | as above |
-| `linkat`, `symlinkat` | yes | paths (pointers) | supervisor-executed, spoofed return | `FS_MAKE_REG` / `FS_MAKE_SYM` |
+| `linkat`, `symlinkat` | yes | paths (pointers) | broker-executed, spoofed return | `FS_MAKE_REG` / `FS_MAKE_SYM` |
 | `link`, `symlink` | no (x86-64) | paths (pointers) | as above | as above |
-| `truncate` | yes | path + length (pointer + scalar) | supervisor-executed, spoofed return | `FS_TRUNCATE` (ABI 3, Linux 6.2) |
+| `truncate` | yes | path + length (pointer + scalar) | broker-executed, spoofed return | `FS_TRUNCATE` (ABI 3, Linux 6.2) |
 
 `truncate`'s backstop is the dedicated `FS_TRUNCATE` right, not `FS_WRITE_FILE` (which governs opening
 for write). It is above the kernel floor (ABI 3 is Linux 6.2, floor is ABI 2), so where the running
@@ -222,8 +222,8 @@ a `raw` allow in record-only and a `raw` fail-closed deny in enforce
    realized with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`. The kernel re-executes the same syscall; there
    is no child-controlled memory to race.
 2. If the decision reads a pointer argument (a path, a `sockaddr`) and the syscall returns an fd, the
-   allow is realized with `SECCOMP_ADDFD`: the supervisor opens the resolved resource itself and
-   injects the fd. The child never gets a re-editable argument between check and use.
+   allow is realized with `SECCOMP_ADDFD`: the confined broker opens the resolved resource and
+   returns the fd for supervisor injection. The child never gets a re-editable argument between check and use.
 3. If the decision reads a pointer argument and no fd can be injected as the return value, the confined broker performs the operation on a pinned resource and the supervisor spoofs the exact return value or errno.
    `CONTINUE` is not used because it would re-read child memory.
    Filesystem mutations use retained broker handles.
@@ -231,8 +231,8 @@ a `raw` allow in record-only and a `raw` fail-closed deny in enforce
 4. `execve` and `execveat` are the one exception where an allow must use `CONTINUE`; enforcement is
    delegated to the Landlock `FS_EXECUTE` backstop (section 3.3), and the residual is recorded.
 
-Path resolution for cases 2 and 3 is done by the supervisor with `openat2` against a
-supervisor-held dirfd (`RESOLVE_BENEATH` rejects absolute paths, so the anchor is always explicit).
+Path resolution for cases 2 and 3 is done by the confined broker with `openat2` against an
+inherited authoritative root dirfd (`RESOLVE_BENEATH` rejects absolute paths, so the anchor is always explicit).
 The flag set, fixed at slate 2, differs by anchor. Resolution beneath the workspace uses
 `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`: in-tree symlinks are followed, because real projects
 depend on them (pnpm's `node_modules`, virtualenvs), and the kernel still guarantees the final
@@ -241,6 +241,12 @@ links are refused explicitly. Resolution against any other allowed root uses
 `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` (which implies `NO_MAGICLINKS`): out-of-workspace allows
 are rare, explicit paths and get the strictest treatment. Policy is always evaluated against the
 final resolved path. This is what defeats the symlink and `/proc` self-reference escapes (SR-2).
+The namespace-root (`/`) anchor is the one non-workspace exception: it uses
+`RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS` because no ordinary symlink can escape above `/`, and
+this preserves standard layouts such as `/lib` pointing into `/usr/lib`.
+For a child `openat2`, v1 accepts the base `open_how` layout plus zero-filled extension bytes.
+Nonzero extension bytes return `E2BIG`.
+Nonzero caller `resolve` flags return `EOPNOTSUPP` until their exact interaction with the broker's mandatory resolution flags is specified and tested.
 
 ## 5. The denied-and-recorded set
 

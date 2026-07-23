@@ -96,3 +96,10 @@ Issue #30 may reuse the same broker prepare and commit protocol after it adds th
   Rejected because a sibling can rewrite the pointed-to path, address, or payload.
 - **Treat suffix rules as matching any IP returned for the bare suffix.**
   Rejected because a wildcard names an unbounded set of hosts and resolving the suffix apex does not represent that set.
+
+## Implementation amendment: namespace-root symlinks
+
+The `/` policy anchor uses `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS` without `RESOLVE_NO_SYMLINKS`.
+There is no path namespace outside `/` for an ordinary symlink to escape into, while `RESOLVE_NO_MAGICLINKS` still rejects `/proc` magic-link traversal.
+This permits normal distribution layouts such as `/lib` pointing into `/usr/lib`.
+Narrower non-workspace roots retain `RESOLVE_NO_SYMLINKS`.
