@@ -49,7 +49,7 @@ These carry no requirements yet and nothing in this table is promised; promoting
 |---|---|---|
 | F-8 | TUI timeline | Interactive browser for a run's steps and events, on top of F-5/F-6. Roadmap M3. |
 | F-9 | Policy-drafting helper | Generate a starter policy from a record-only trace (ADR-0010 makes the input available). |
-| F-10 | io_uring mediation | Replace SR-4's denial with equivalent mediation plus escape tests, if a real workload needs it. |
+| F-10 | io_uring mediation | Replace SR-4's `io_uring` denial with equivalent mediation plus escape tests, if a real workload needs it. |
 
 ## 6. Functional requirements
 
@@ -154,7 +154,7 @@ OQ-1..OQ-4 and OQ-6..OQ-8 were resolved on 2026-07-07 into FR-17..FR-21, SR-4, A
 | FR-20 (approval UX) | ADR-0010 | attended/unattended ask tests |
 | FR-21 (trace persistence) | ADR-0002 | state-dir isolation escape tests |
 | FR-22 (exit-code contract) | design (cli.md section 6) | exit-code contract tests |
-| SR-4 (io_uring denial) | design (syscalls.md section 5) | io_uring escape tests |
+| SR-4 (un-mediated I/O path denial: `io_uring_setup`, `pidfd_getfd`) | ADR-0019, design (syscalls.md section 5) | io_uring and `pidfd_getfd` escape tests |
 | FR-1/FR-4 (agent-agnostic coverage) | ADR-0006 | inheritance + coverage tests |
 | NFR-4 (footprint), FR-15 | ADR-0007, ADR-0014 | build/run on the VPS reference target |
 

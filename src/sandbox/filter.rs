@@ -147,6 +147,10 @@ pub const MEDIATED: &[u32] = &[
 
 /// the denied-and-recorded set (syscalls.md section 5): trapped like the mediated set,
 /// unconditionally denied by the supervisor after recording.
+///
+/// ADR-0019 added `pidfd_getfd` to that set; it is still trapped through `MEDIATED` above
+/// and decided in the loop, so it moves here with the issue #26 implementation PR. the
+/// gap is named in escapes.md section 4 until then.
 pub const DENIED_RECORDED: &[u32] = &[
     nr::IO_URING_SETUP,
     nr::IO_URING_ENTER,
