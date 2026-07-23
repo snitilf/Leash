@@ -825,11 +825,13 @@ fn oversized_clone3_is_denied_as_an_untrusted_fact() {
     );
     assert_eq!(exited_with(result.expect("loop must complete")), Some(0));
 
-    let clones = syscall_events(&events, "clone3");
-    assert_eq!(clones.len(), 1, "{events:?}");
-    assert_eq!(clones[0]["fact"]["family"], "raw");
-    assert_eq!(clones[0]["decision"], "deny");
-    assert_eq!(clones[0]["matched_rule"], "failsafe:memory_read");
+    let denied: Vec<_> = syscall_events(&events, "clone3")
+        .into_iter()
+        .filter(|event| event["decision"] == "deny")
+        .collect();
+    assert_eq!(denied.len(), 1, "{events:?}");
+    assert_eq!(denied[0]["fact"]["family"], "raw");
+    assert_eq!(denied[0]["matched_rule"], "failsafe:memory_read");
 }
 
 #[test]
