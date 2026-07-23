@@ -156,8 +156,10 @@ the denied-and-recorded set of section 5 rather than treating it as a mode-scope
 An imported fd names a resource no mediated syscall decided, so every later read or write on it is
 I/O the **trace** cannot attribute to anything: the SR-4 test, and the one exception FR-19 carves
 out of record-only non-enforcement.
-The shipped M2 build still allows it in record-only; that gap is named in
-[`escapes.md`](escapes.md) section 4 and is corrected in the issue #26 implementation PR.
+The shipped M2 build diverges in both modes: record-only allows it, and enforce denies it under a
+`failsafe:pidfd_getfd` id predating the decision rather than the `sr4:pidfd_getfd` of section 5.
+The issue #26 implementation PR moves both legs onto the one vocabulary; the gap is named in
+[`escapes.md`](escapes.md) section 4 until it does.
 
 ### 3.5 Network
 
@@ -256,9 +258,10 @@ operator, especially in record-only, wants to see that the agent reached for the
   later read or write on it is I/O the **trace** cannot attribute. That is the same silent
   incompleteness the `io_uring_setup` denial prevents, which is why it is denied in **both** modes
   and not scoped by mode: refusing it is not policy enforcement, it is refusing to let the agent
-  make the trace lie. The recorded id is `sr4:pidfd_getfd`. The shipped M2 build still allows it in
-  record-only, a gap named in [`escapes.md`](escapes.md) section 4 and corrected in the issue #26
-  implementation PR.
+  make the trace lie. The recorded id is `sr4:pidfd_getfd`, in both modes, replacing the
+  enforce-only `failsafe:pidfd_getfd` the M2 code defines. Neither leg matches yet: the shipped
+  build allows it in record-only and denies it under the old id in enforce. Both move together in
+  the issue #26 implementation PR, a gap named in [`escapes.md`](escapes.md) section 4 until then.
 - Foreign-ABI entry. The filter pins the architecture (`AUDIT_ARCH_X86_64` or `AUDIT_ARCH_AARCH64`)
   and routes any mismatch to deny-and-record. Pinning the arch alone does **not** close the x32 ABI:
   x32 syscalls arrive with `arch == AUDIT_ARCH_X86_64` but with `__X32_SYSCALL_BIT` (bit 30) set in

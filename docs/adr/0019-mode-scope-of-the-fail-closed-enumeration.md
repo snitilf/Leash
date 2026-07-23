@@ -53,8 +53,10 @@ The v1 design already said `pidfd_getfd` is denied outright, with no mode qualif
 ([`../design/syscalls.md`](../design/syscalls.md) section 3.4,
 [`../design/escapes.md`](../design/escapes.md) section 3), so the record-only allow in the shipped
 code is a defect against the design rather than a decision this ADR reverses.
-The runtime correction lands in the issue #26 implementation PR; until it does, the shipped build
-allows `pidfd_getfd` in record-only, and that gap is named in
+The runtime correction lands in the issue #26 implementation PR, and it moves both legs onto this
+one vocabulary: record-only stops allowing the syscall, and the enforce denial moves from the
+`failsafe:pidfd_getfd` id the M2 code defines to `sr4:pidfd_getfd`.
+Until it does, the shipped build matches neither leg, and that gap is named in
 [`../design/escapes.md`](../design/escapes.md) section 4.
 
 Everything else in the enumeration stays fail-closed in both modes.

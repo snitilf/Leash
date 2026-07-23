@@ -25,9 +25,10 @@ not edited casually. Three amendments have landed since:
   provenance where it lands, as an inline date or as the ADR-0019 citation.
 
 Two of those pins are ahead of the code on purpose, and both land in the issue #26 implementation
-PR: the IPv4-mapped normalization at the `sockaddr` and policy-load seams, and the record-only leg
-of the `pidfd_getfd` denial. Each is flagged where a reader would otherwise be misled, and the
-second is carried in `escapes.md` section 4 until it closes.
+PR: the IPv4-mapped normalization at the `sockaddr` and policy-load seams, and the `pidfd_getfd`
+denial in both modes, record-only behaviour and enforce rule id alike. Each is flagged where a
+reader would otherwise be misled, and the second is carried in `escapes.md` section 4 until it
+closes.
 
 ## Reading order
 
