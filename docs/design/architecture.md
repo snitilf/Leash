@@ -73,10 +73,12 @@ by ID. ADR-0002 already refers to I2 by this number; the full list is fixed here
   mode, the same way I2 is: where the supervisor cannot decode a network address from the trapped
   `sockaddr`, **enforce** denies, while **record-only** records the attempt with no destination and
   continues, because record-only enforces nothing outside the denied-and-recorded set (ADR-0010,
-  ADR-0019, and FR-9 as it scopes this arc). Every other arc denies in both modes: an undecodable
-  filesystem or process-creation fact, a recorder-write failure, a crash, a decision timeout, and
-  the denied-and-recorded set (SR-4). The residual is named in [`escapes.md`](escapes.md).
-  (FR-9, NFR-1.)
+  ADR-0019, and FR-9 as it scopes this arc). That arc is the only one scoped by mode. Every other
+  arc denies in both modes: an undecodable filesystem or process-creation fact, a recorder-write
+  failure, a crash, a decision timeout, and the denied-and-recorded set (SR-4, whose members are
+  `io_uring_setup` and `pidfd_getfd`; the latter imports an fd the trace could not otherwise
+  attribute, so it denies in record-only too). The residuals are named in
+  [`escapes.md`](escapes.md). (FR-9, NFR-1.)
 - **I4** - Decisions are made against kernel-trusted data, never against child-controlled memory
   read naively. Pointer arguments are resolved by the supervisor itself, not trusted as the child
   presented them. (SR-2; TOCTOU handling in [`notify-loop.md`](notify-loop.md).)

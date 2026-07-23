@@ -57,6 +57,7 @@ The child's pointer arguments are the whole TOCTOU problem (SR-2, I4). The rules
   An unbounded or attacker-chosen length is a denial-of-service on the single decision thread.
   A malformed or over-cap path or `clone_args` resolves to deny (section 4, case C), because the trusted fact cannot be built.
   A malformed or over-cap network address is the one arc in the section 4 enumeration that is scoped by mode, per ADR-0019 (recorded 2026-07-23, the issue #26 hygiene pass), matching the network-fact rule already fixed in [`trace.md`](trace.md) section 2: record-only records a raw allow, while enforce records a raw fail-closed deny.
+  The same ADR settled the arc it is most easily confused with the other way: `pidfd_getfd` is denied and recorded in both modes, because an imported fd leaves the trace unable to attribute later I/O ([`syscalls.md`](syscalls.md) section 5, SR-4).
   This is not a softening of I3 or FR-9; both now carry that mode scope explicitly, because record-only enforces nothing outside the denied-and-recorded set (ADR-0010) and denying there would deny an action the mode never claimed to constrain.
 - The value read is used once, to build the typed fact, and for a pointer-argument allow it is never
   handed back to the child as a re-editable argument. That is why the allow-realization rule

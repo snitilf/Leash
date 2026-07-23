@@ -18,10 +18,16 @@ not edited casually. Three amendments have landed since:
   inline).
 - 2026-07-23, from the issue #26 hygiene pass, carrying ADR-0019 and spec v0.8: the IPv4-mapped
   normalization in `policy.md` sections 2.2 and 7, the mode-scoped network arc in
-  `notify-loop.md` sections 2 and 4 and `syscalls.md` section 4, the `host` field and raw-fact
-  wording in `trace.md` section 2, invariant I3 in `architecture.md` section 3, and the new
-  residual in `escapes.md` section 4. Each carries its provenance where it lands, as an inline date
-  or as the ADR-0019 citation.
+  `notify-loop.md` sections 2 and 4 and `syscalls.md` section 4, `pidfd_getfd` joining the
+  denied-and-recorded set in `syscalls.md` sections 3.4 and 5, the `host` field, the cross-process
+  fact, and the raw-fact wording in `trace.md` section 2, invariant I3 in `architecture.md`
+  section 3, and the escape row and two entries in `escapes.md` sections 3 and 4. Each carries its
+  provenance where it lands, as an inline date or as the ADR-0019 citation.
+
+Two of those pins are ahead of the code on purpose, and both land in the issue #26 implementation
+PR: the IPv4-mapped normalization at the `sockaddr` and policy-load seams, and the record-only leg
+of the `pidfd_getfd` denial. Each is flagged where a reader would otherwise be misled, and the
+second is carried in `escapes.md` section 4 until it closes.
 
 ## Reading order
 

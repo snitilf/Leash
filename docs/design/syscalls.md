@@ -134,7 +134,7 @@ the decision is whether the target pid is in that set.
 |---|---|---|---|---|
 | `ptrace` | yes | target pid (scalar) | `CONTINUE` | target is outside the tree |
 | `process_vm_readv`, `process_vm_writev` | yes | target pid (scalar) | `CONTINUE` | target is outside the tree |
-| `pidfd_getfd` | yes | target pidfd (an fd, not a scalar pid) | denied in v1 | always (see below) |
+| `pidfd_getfd` | yes | target pidfd (an fd, not a scalar pid) | denied in v1 | always, in both modes (section 5, see below) |
 
 For `ptrace` and `process_vm_*` the target pid *is* a scalar register argument, kernel-trusted at trap
 time, so the decision is `CONTINUE`-safe (section 4): in-tree use (an agent running `strace` on its own
@@ -150,6 +150,14 @@ number after the check, which is exactly the TOCTOU class rule 1 exists to exclu
 alternative, supervisor-side execution (the supervisor holds the child's pidfd, checks the referent,
 performs the `pidfd_getfd` itself, and injects the result with `ADDFD`), is deferred until a real
 workload needs it.
+
+"Outright" means in both modes, and ADR-0019 pinned that on 2026-07-23 by placing `pidfd_getfd` in
+the denied-and-recorded set of section 5 rather than treating it as a mode-scoped arc.
+An imported fd names a resource no mediated syscall decided, so every later read or write on it is
+I/O the **trace** cannot attribute to anything: the SR-4 test, and the one exception FR-19 carves
+out of record-only non-enforcement.
+The shipped M2 build still allows it in record-only; that gap is named in
+[`escapes.md`](escapes.md) section 4 and is corrected in the issue #26 implementation PR.
 
 ### 3.5 Network
 
@@ -243,6 +251,14 @@ operator, especially in record-only, wants to see that the agent reached for the
   operator sees. The cost, that an agent genuinely needing `io_uring` fails in record-only rather than
   running with a partial trace, is the accepted trade (slate 2). Relaxing SR-4 for a path
   requires a spec change adding equivalent mediation and its escape tests first.
+- `pidfd_getfd`, placed here by ADR-0019 on 2026-07-23. It imports a file descriptor out of another
+  process (section 3.4), so the resource that fd names was decided by no mediated syscall and every
+  later read or write on it is I/O the **trace** cannot attribute. That is the same silent
+  incompleteness the `io_uring_setup` denial prevents, which is why it is denied in **both** modes
+  and not scoped by mode: refusing it is not policy enforcement, it is refusing to let the agent
+  make the trace lie. The recorded id is `sr4:pidfd_getfd`. The shipped M2 build still allows it in
+  record-only, a gap named in [`escapes.md`](escapes.md) section 4 and corrected in the issue #26
+  implementation PR.
 - Foreign-ABI entry. The filter pins the architecture (`AUDIT_ARCH_X86_64` or `AUDIT_ARCH_AARCH64`)
   and routes any mismatch to deny-and-record. Pinning the arch alone does **not** close the x32 ABI:
   x32 syscalls arrive with `arch == AUDIT_ARCH_X86_64` but with `__X32_SYSCALL_BIT` (bit 30) set in

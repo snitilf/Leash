@@ -51,6 +51,6 @@ Numbering: scan this directory for the highest number, increment by one.
 | [0016](0016-raw-libc-for-the-seccomp-boundary.md) | Raw libc syscalls for the seccomp boundary | accepted (Landlock question closed by ADR-0018) |
 | [0017](0017-record-only-allows-use-continue.md) | Record-only allows are realized with CONTINUE | accepted (case-C clause refined by ADR-0019) |
 | [0018](0018-enforcement-path-dependency-decisions.md) | Enforcement-path dependency decisions for M2 (raw-libc Landlock, toml crate, hand-rolled glob matcher) | accepted |
-| [0019](0019-record-only-malformed-network-facts-record-raw.md) | A network address the supervisor cannot decode records raw and continues in record-only | accepted |
+| [0019](0019-mode-scope-of-the-fail-closed-enumeration.md) | Which fail-closed arcs are scoped by mode, and which are not | accepted |
 
 These encode the project's load-bearing decisions. They are the committed, authoritative source.
