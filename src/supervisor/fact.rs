@@ -25,7 +25,7 @@ pub mod flags {
     /// truncate on open; a write effect regardless of access mode
     pub const O_TRUNC: u64 = 0o1000;
     /// the dirfd value meaning "relative to the caller's cwd" (fcntl.h AT_FDCWD)
-    pub const AT_FDCWD: u64 = -100i64 as u64;
+    pub const AT_FDCWD: u64 = (-100_i32 as u32) as u64;
 }
 
 /// one path-pointer argument of a trapped syscall.
@@ -447,6 +447,6 @@ mod tests {
         assert_eq!(flags::O_RDWR, libc::O_RDWR as u64);
         assert_eq!(flags::O_CREAT, libc::O_CREAT as u64);
         assert_eq!(flags::O_TRUNC, libc::O_TRUNC as u64);
-        assert_eq!(flags::AT_FDCWD, libc::AT_FDCWD as u64);
+        assert_eq!(flags::AT_FDCWD, u64::from(libc::AT_FDCWD as u32));
     }
 }

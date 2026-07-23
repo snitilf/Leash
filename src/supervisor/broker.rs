@@ -98,6 +98,55 @@ pub enum NetworkOperation {
     SendTo,
 }
 
+/// Filesystem mutation committed against one or two prepared paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MutationOperation {
+    /// `truncate(2)`.
+    Truncate {
+        /// New byte length.
+        length: i64,
+    },
+    /// `renameat2(2)` with zero, NOREPLACE, or EXCHANGE flags.
+    Rename {
+        /// Kernel rename flags.
+        flags: u32,
+    },
+    /// `mkdirat(2)`.
+    Mkdir {
+        /// Requested creation mode.
+        mode: u32,
+    },
+    /// `unlinkat(2)`, optionally with `AT_REMOVEDIR`.
+    Unlink {
+        /// Kernel unlink flags.
+        flags: i32,
+    },
+    /// `linkat(2)`.
+    Link {
+        /// Kernel link flags.
+        flags: i32,
+    },
+    /// `symlinkat(2)` where the target is stored text.
+    Symlink {
+        /// Verbatim symlink target.
+        target: Vec<u8>,
+    },
+    /// Path-based chmod realized against the pinned target.
+    Chmod {
+        /// Requested mode.
+        mode: u32,
+    },
+    /// Path-based chown.
+    Chown {
+        /// Requested uid, including `u32::MAX` for unchanged.
+        uid: u32,
+        /// Requested gid, including `u32::MAX` for unchanged.
+        gid: u32,
+        /// `fchownat` flags.
+        flags: i32,
+    },
+}
+
 /// Parent-side handle for one per-run broker process.
 #[derive(Debug)]
 pub struct Broker {
@@ -219,6 +268,24 @@ impl Broker {
                 token: prepared.token,
                 flags,
                 mode,
+            },
+            None,
+        )?;
+        self.decode_result()
+    }
+
+    /// Commit a filesystem mutation against prepared operands.
+    pub fn commit_mutation(
+        &mut self,
+        primary: PreparedPath,
+        secondary: Option<PreparedPath>,
+        operation: MutationOperation,
+    ) -> Result<BrokerResult, BrokerError> {
+        self.send_request(
+            &Request::CommitMutation {
+                primary: primary.token,
+                secondary: secondary.map(|path| path.token),
+                operation,
             },
             None,
         )?;
@@ -374,6 +441,11 @@ enum Request {
         flags: u64,
         mode: u32,
     },
+    CommitMutation {
+        primary: u64,
+        secondary: Option<u64>,
+        operation: MutationOperation,
+    },
     Release {
         token: u64,
     },
@@ -479,6 +551,11 @@ impl BrokerState<'_> {
                 Request::CommitOpen { token, flags, mode } => {
                     self.commit_open(token, flags, mode)?
                 }
+                Request::CommitMutation {
+                    primary,
+                    secondary,
+                    operation,
+                } => self.commit_mutation(primary, secondary, operation)?,
                 Request::Release { token } => {
                     self.held.remove(&token);
                     self.respond(&Response::Released, None)?;
@@ -510,9 +587,10 @@ impl BrokerState<'_> {
         let relative_c =
             CString::new(relative).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         let workspace_anchor = anchor.root() == self.workspace;
+        let namespace_root = anchor.root() == Path::new("/");
         let resolve = RESOLVE_BENEATH
             | RESOLVE_NO_MAGICLINKS
-            | if workspace_anchor {
+            | if workspace_anchor || namespace_root {
                 0
             } else {
                 RESOLVE_NO_SYMLINKS
@@ -552,7 +630,15 @@ impl BrokerState<'_> {
         };
         let identity = match &target {
             Some(fd) => fd_identity(fd.as_fd())?,
-            None => anchor.root().join(std::ffi::OsStr::from_bytes(relative)),
+            None => {
+                let parent = parent
+                    .as_ref()
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+                let basename = basename
+                    .as_deref()
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+                fd_identity(parent.as_fd())?.join(std::ffi::OsStr::from_bytes(basename.to_bytes()))
+            }
         };
         if !identity.starts_with(anchor.root()) {
             return self.errno(libc::EXDEV);
@@ -662,6 +748,49 @@ impl BrokerState<'_> {
         }
     }
 
+    fn commit_mutation(
+        &mut self,
+        primary_token: u64,
+        secondary_token: Option<u64>,
+        operation: MutationOperation,
+    ) -> io::Result<()> {
+        let Some(primary) = self.held.remove(&primary_token) else {
+            return self.errno(libc::EBADF);
+        };
+        let secondary = match secondary_token {
+            Some(token) => match self.held.remove(&token) {
+                Some(path) => Some(path),
+                None => return self.errno(libc::EBADF),
+            },
+            None => None,
+        };
+
+        let result = match operation {
+            MutationOperation::Truncate { length } => truncate_held(&primary, length),
+            MutationOperation::Rename { flags } => {
+                let Some(secondary) = secondary.as_ref() else {
+                    return self.errno(libc::EINVAL);
+                };
+                rename_held(&primary, secondary, flags)
+            }
+            MutationOperation::Mkdir { mode } => mkdir_held(&primary, mode),
+            MutationOperation::Unlink { flags } => unlink_held(&primary, flags),
+            MutationOperation::Link { flags } => {
+                let Some(secondary) = secondary.as_ref() else {
+                    return self.errno(libc::EINVAL);
+                };
+                link_held(&primary, secondary, flags)
+            }
+            MutationOperation::Symlink { target } => symlink_held(&primary, &target),
+            MutationOperation::Chmod { mode } => chmod_held(&primary, mode),
+            MutationOperation::Chown { uid, gid, flags } => chown_held(&primary, uid, gid, flags),
+        };
+        match result {
+            Ok(value) => self.respond(&Response::Result { value }, None),
+            Err(error) => self.errno(error.raw_os_error().unwrap_or(libc::EACCES)),
+        }
+    }
+
     fn errno(&self, errno: i32) -> io::Result<()> {
         self.respond(&Response::Errno { errno }, None)
     }
@@ -679,6 +808,16 @@ fn open_existing(target: BorrowedFd<'_>, flags: u64, _mode: u32) -> io::Result<O
         return Err(io::Error::from_raw_os_error(libc::EEXIST));
     }
     if flags & u64::try_from(libc::O_PATH).unwrap_or_default() != 0 {
+        if flags & u64::try_from(libc::O_DIRECTORY).unwrap_or_default() != 0 {
+            let mut stat: libc::stat = unsafe { zeroed() };
+            // SAFETY: target is a live descriptor and stat points to writable local storage.
+            if unsafe { libc::fstat(target.as_raw_fd(), &raw mut stat) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+            }
+        }
         return dup_fd(target);
     }
     let path = CString::new(format!("/proc/self/fd/{}", target.as_raw_fd()))
@@ -688,6 +827,147 @@ fn open_existing(target: BorrowedFd<'_>, flags: u64, _mode: u32) -> io::Result<O
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
     // SAFETY: path names the retained descriptor and flags were range-checked.
     owned_fd(unsafe { libc::open(path.as_ptr(), clean_flags) })
+}
+
+fn truncate_held(path: &HeldPath, length: i64) -> io::Result<i64> {
+    if length < 0 {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let target = required_target(path)?;
+    let opened = open_existing(
+        target,
+        u64::try_from(libc::O_WRONLY | libc::O_CLOEXEC).unwrap_or_default(),
+        0,
+    )?;
+    // SAFETY: opened is a live writable descriptor and length was validated.
+    rc_zero(unsafe { libc::ftruncate(opened.as_raw_fd(), length) })
+}
+
+fn rename_held(source: &HeldPath, destination: &HeldPath, flags: u32) -> io::Result<i64> {
+    const RENAME_NOREPLACE: u32 = 1;
+    const RENAME_EXCHANGE: u32 = 2;
+    if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0
+        || flags == RENAME_NOREPLACE | RENAME_EXCHANGE
+    {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let (source_parent, source_name) = required_parent_name(source)?;
+    let (destination_parent, destination_name) = required_parent_name(destination)?;
+    // SAFETY: both names are retained C strings relative to live parent descriptors.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            flags,
+        )
+    };
+    rc_zero(rc as i32)
+}
+
+fn mkdir_held(path: &HeldPath, mode: u32) -> io::Result<i64> {
+    let (parent, name) = required_parent_name(path)?;
+    // SAFETY: name is retained and parent is a live directory descriptor.
+    rc_zero(unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) })
+}
+
+fn unlink_held(path: &HeldPath, flags: i32) -> io::Result<i64> {
+    if !matches!(flags, 0 | libc::AT_REMOVEDIR) {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let (parent, name) = required_parent_name(path)?;
+    // SAFETY: name is retained and parent is a live directory descriptor.
+    rc_zero(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) })
+}
+
+fn link_held(source: &HeldPath, destination: &HeldPath, flags: i32) -> io::Result<i64> {
+    if flags != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    let (source_parent, source_name) = required_parent_name(source)?;
+    let (destination_parent, destination_name) = required_parent_name(destination)?;
+    // SAFETY: both names are retained C strings relative to live parent descriptors.
+    rc_zero(unsafe {
+        libc::linkat(
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            0,
+        )
+    })
+}
+
+fn symlink_held(destination: &HeldPath, target: &[u8]) -> io::Result<i64> {
+    let target = CString::new(target).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let (parent, name) = required_parent_name(destination)?;
+    // SAFETY: target and name are C strings and parent is a live directory descriptor.
+    rc_zero(unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), name.as_ptr()) })
+}
+
+fn chmod_held(path: &HeldPath, mode: u32) -> io::Result<i64> {
+    let target = required_target(path)?;
+    let proc_path = proc_fd_path(target)?;
+    // SAFETY: proc_path resolves to the retained target descriptor.
+    rc_zero(unsafe { libc::chmod(proc_path.as_ptr(), mode) })
+}
+
+fn chown_held(path: &HeldPath, uid: u32, gid: u32, flags: i32) -> io::Result<i64> {
+    if flags & !libc::AT_SYMLINK_NOFOLLOW != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    if flags == libc::AT_SYMLINK_NOFOLLOW {
+        let (parent, name) = required_parent_name(path)?;
+        // SAFETY: name is retained and parent is a live directory descriptor.
+        return rc_zero(unsafe {
+            libc::fchownat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                uid,
+                gid,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        });
+    }
+    let target = required_target(path)?;
+    let proc_path = proc_fd_path(target)?;
+    // SAFETY: proc_path resolves to the retained target descriptor.
+    rc_zero(unsafe { libc::chown(proc_path.as_ptr(), uid, gid) })
+}
+
+fn required_target(path: &HeldPath) -> io::Result<BorrowedFd<'_>> {
+    path.target
+        .as_ref()
+        .map(AsFd::as_fd)
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
+}
+
+fn required_parent_name(path: &HeldPath) -> io::Result<(BorrowedFd<'_>, &CStr)> {
+    let parent = path
+        .parent
+        .as_ref()
+        .map(AsFd::as_fd)
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EBUSY))?;
+    let name = path
+        .basename
+        .as_deref()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EBUSY))?;
+    Ok((parent, name))
+}
+
+fn proc_fd_path(fd: BorrowedFd<'_>) -> io::Result<CString> {
+    CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+fn rc_zero(rc: i32) -> io::Result<i64> {
+    if rc == 0 {
+        Ok(0)
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 fn open_missing(

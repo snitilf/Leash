@@ -264,13 +264,19 @@ mod linux {
         /// copy `srcfd` into the blocked target. with `SECCOMP_ADDFD_FLAG_SEND` the
         /// kernel also completes the trapped syscall with the new fd number as its
         /// return, atomically with the injection. returns the fd number in the target.
-        pub fn send_addfd(&self, id: u64, srcfd: BorrowedFd<'_>, flags: u32) -> io::Result<i32> {
+        pub fn send_addfd(
+            &self,
+            id: u64,
+            srcfd: BorrowedFd<'_>,
+            flags: u32,
+            newfd_flags: u32,
+        ) -> io::Result<i32> {
             let req = SeccompNotifAddfd {
                 id,
                 flags,
                 srcfd: srcfd.as_raw_fd() as u32,
                 newfd: 0,
-                newfd_flags: 0,
+                newfd_flags,
             };
             // SAFETY: ADDFD reads exactly a seccomp_notif_addfd from the pointed-to
             // struct, which we own and outlives the call; srcfd is borrowed for the
