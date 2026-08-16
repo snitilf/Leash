@@ -55,6 +55,33 @@ const FS_CREATE_RIGHTS: u64 = ACCESS_FS_MAKE_CHAR
 const FS_DELETE_RIGHTS: u64 =
     ACCESS_FS_REMOVE_DIR | ACCESS_FS_REMOVE_FILE | ACCESS_FS_REFER | ACCESS_FS_TRUNCATE;
 
+/// rights that are only meaningful beneath a directory. the kernel rejects
+/// landlock_add_rule with EINVAL when the anchor's file type does not match the rights,
+/// so a grant rooted at a plain file must drop these (an exact-path read rule derives
+/// READ_FILE | READ_DIR, and the READ_DIR half is meaningless on a file).
+#[cfg(any(target_os = "linux", test))]
+const FS_DIRECTORY_ONLY_RIGHTS: u64 = ACCESS_FS_READ_DIR
+    | ACCESS_FS_REMOVE_DIR
+    | ACCESS_FS_MAKE_CHAR
+    | ACCESS_FS_MAKE_DIR
+    | ACCESS_FS_MAKE_REG
+    | ACCESS_FS_MAKE_SOCK
+    | ACCESS_FS_MAKE_FIFO
+    | ACCESS_FS_MAKE_BLOCK
+    | ACCESS_FS_MAKE_SYM
+    | ACCESS_FS_REFER;
+
+/// the rights a grant keeps for its anchor's actual file type. masking never widens a
+/// grant, so the hull stays a superset of what the policy permits (policy.md section 6).
+#[cfg(any(target_os = "linux", test))]
+fn anchor_rights(rights: u64, is_directory: bool) -> u64 {
+    if is_directory {
+        rights
+    } else {
+        rights & !FS_DIRECTORY_ONLY_RIGHTS
+    }
+}
+
 /// A derived Landlock hull, before Linux fds are opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LandlockHull {
@@ -380,7 +407,12 @@ mod linux {
         let ruleset = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
 
         for anchor in &anchors {
-            add_path_rule(&ruleset, anchor)?;
+            // an anchor whose rights were fully masked by its file type (e.g. a
+            // create-only rule on an exact file path) grants nothing; skipping it is
+            // the same ruleset with one fewer no-op rule
+            if anchor.allowed_access != 0 {
+                add_path_rule(&ruleset, anchor)?;
+            }
         }
         if hull.handled_access_net != 0 {
             add_net_rules(&ruleset, &hull.net)?;
@@ -412,9 +444,22 @@ mod linux {
         }
         // SAFETY: open returned a new descriptor owned by this process.
         let fd = unsafe { OwnedFd::from_raw_fd(parent_fd) };
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: stat is a valid out-buffer and fd is a valid open descriptor; fstat
+        // works on O_PATH descriptors.
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } < 0 {
+            return Err(LandlockError::OpenHierarchy {
+                path: resolved,
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        let allowed_access = anchor_rights(
+            grant.allowed_access,
+            stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+        );
         Ok(RootAnchor {
             root: resolved,
-            allowed_access: grant.allowed_access,
+            allowed_access,
             fd,
         })
     }
@@ -608,6 +653,22 @@ mod tests {
             grant(&hull, "/usr/bin/git").allowed_access & ACCESS_FS_EXECUTE,
             ACCESS_FS_EXECUTE
         );
+    }
+
+    #[test]
+    fn anchor_rights_drops_directory_only_rights_for_a_file_anchor() {
+        // a directory anchor keeps everything
+        assert_eq!(anchor_rights(FS_READ_RIGHTS, true), FS_READ_RIGHTS);
+        assert_eq!(anchor_rights(FS_CREATE_RIGHTS, true), FS_CREATE_RIGHTS);
+        // a file anchor keeps the file-meaningful rights and drops the directory half
+        assert_eq!(anchor_rights(FS_READ_RIGHTS, false), ACCESS_FS_READ_FILE);
+        assert_eq!(anchor_rights(FS_WRITE_RIGHTS, false), FS_WRITE_RIGHTS);
+        assert_eq!(
+            anchor_rights(FS_DELETE_RIGHTS, false),
+            ACCESS_FS_REMOVE_FILE | ACCESS_FS_TRUNCATE
+        );
+        // a create-only grant is fully masked on a file: the caller skips the no-op rule
+        assert_eq!(anchor_rights(FS_CREATE_RIGHTS, false), 0);
     }
 
     #[test]

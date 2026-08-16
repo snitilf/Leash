@@ -36,6 +36,7 @@ use crate::recorder::{
     SyscallEvent, TraceSink, TraceWriter,
 };
 use crate::sandbox::filter::{AUDIT_ARCH_X86_64, DENIED_RECORDED, X32_SYSCALL_BIT, nr};
+use crate::supervisor::ask;
 #[cfg(target_os = "linux")]
 use crate::supervisor::broker::{
     BrokerResult, BrokerResultOrPath, MutationOperation, NetworkOperation,
@@ -46,7 +47,8 @@ use crate::supervisor::mem::MemReadError;
 use crate::supervisor::notify::SECCOMP_ADDFD_FLAG_SEND;
 use crate::supervisor::notify::SeccompNotif;
 
-const ASK_TIMEOUT: Duration = Duration::from_secs(60);
+/// the attended-ask timeout when `--ask-timeout` is not given (notify-loop.md section 5).
+pub const DEFAULT_ASK_TIMEOUT: Duration = Duration::from_secs(60);
 const CLONE_ARGS_MIN_SIZE: u64 = 8;
 const CLONE_ARGS_MAX_SIZE: u64 = 88;
 const OPEN_HOW_SIZE: usize = 24;
@@ -126,7 +128,7 @@ pub enum RunError {
 }
 
 /// immutable inputs for one notify-loop run.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct RunConfig<'a> {
     /// record-only or enforce
     pub mode: crate::recorder::Mode,
@@ -136,6 +138,9 @@ pub struct RunConfig<'a> {
     pub attendance: Attendance,
     /// maximum wait for an attended ask
     pub ask_timeout: Duration,
+    /// resolves the asks of one held syscall in an attended run (FR-10). production
+    /// prompts on the controlling terminal (ask::tty_prompt); tests script the answer.
+    pub prompter: &'a dyn Fn(&[ask::PendingAsk], Duration) -> AskResolution,
     /// root of the supervised process tree
     pub root_pid: u32,
     /// confined side-effect broker; required in enforce mode
@@ -145,6 +150,18 @@ pub struct RunConfig<'a> {
     pub resolved_hosts: Option<&'a HashMap<String, Vec<IpAddr>>>,
 }
 
+impl std::fmt::Debug for RunConfig<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // the prompter is a behavior, not data; it prints as present-or-absent nothing
+        f.debug_struct("RunConfig")
+            .field("mode", &self.mode)
+            .field("attendance", &self.attendance)
+            .field("ask_timeout", &self.ask_timeout)
+            .field("root_pid", &self.root_pid)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> RunConfig<'a> {
     /// current policy-less record-only behavior.
     pub fn record_only(root_pid: u32, attendance: Attendance) -> Self {
@@ -152,7 +169,8 @@ impl<'a> RunConfig<'a> {
             mode: crate::recorder::Mode::RecordOnly,
             policy: None,
             attendance,
-            ask_timeout: ASK_TIMEOUT,
+            ask_timeout: DEFAULT_ASK_TIMEOUT,
+            prompter: &ask::tty_prompt,
             root_pid,
             #[cfg(target_os = "linux")]
             broker: None,
@@ -166,7 +184,8 @@ impl<'a> RunConfig<'a> {
             mode: crate::recorder::Mode::Enforce,
             policy: Some(policy),
             attendance,
-            ask_timeout: ASK_TIMEOUT,
+            ask_timeout: DEFAULT_ASK_TIMEOUT,
+            prompter: &ask::tty_prompt,
             root_pid,
             #[cfg(target_os = "linux")]
             broker: None,
@@ -187,11 +206,18 @@ impl<'a> RunConfig<'a> {
             mode: crate::recorder::Mode::Enforce,
             policy: Some(policy),
             attendance,
-            ask_timeout: ASK_TIMEOUT,
+            ask_timeout: DEFAULT_ASK_TIMEOUT,
+            prompter: &ask::tty_prompt,
             root_pid,
             broker: Some(broker),
             resolved_hosts: Some(resolved_hosts),
         }
+    }
+
+    /// set the attended-ask timeout (FR-10); the CLI passes `--ask-timeout` through here.
+    pub fn with_ask_timeout(mut self, timeout: Duration) -> Self {
+        self.ask_timeout = timeout;
+        self
     }
 
     fn validate(self) -> Result<Self, RunError> {
@@ -349,6 +375,20 @@ fn mutation_invocation(
 }
 
 fn resolve_decision(config: &RunConfig<'_>, request: &Request<'_>) -> ResolvedDecision {
+    let mut asks = Vec::new();
+    let eval = evaluate_tracked(config, request, &mut asks);
+    let resolution = settle_asks(config, &asks);
+    finalize_decision(eval, resolution)
+}
+
+/// pure evaluation (ADR-0004); an ask-matched request is collected for the syscall's
+/// shared prompt instead of being settled here, so one held syscall prompts once even
+/// when several of its accesses match ask rules (notify-loop.md section 5).
+fn evaluate_tracked(
+    config: &RunConfig<'_>,
+    request: &Request<'_>,
+    asks: &mut Vec<ask::PendingAsk>,
+) -> Evaluation {
     let eval = match config.policy {
         Some(policy) => policy.evaluate(request, config.mode),
         None => Evaluation {
@@ -357,6 +397,29 @@ fn resolve_decision(config: &RunConfig<'_>, request: &Request<'_>) -> ResolvedDe
             would_deny: None,
         },
     };
+    if eval.decision == Decision::Ask {
+        asks.push(ask::PendingAsk::new(request, eval.matched.to_string()));
+    }
+    eval
+}
+
+/// settle one held syscall's asks with a single prompt (notify-loop.md section 5):
+/// every ask-matched item is listed and one answer covers them all. an unattended run
+/// never prompts; the ask denies immediately (FR-20).
+fn settle_asks(config: &RunConfig<'_>, asks: &[ask::PendingAsk]) -> Option<AskResolution> {
+    if asks.is_empty() {
+        return None;
+    }
+    Some(match config.attendance {
+        Attendance::Unattended => AskResolution::Unattended,
+        Attendance::Attended => (config.prompter)(asks, config.ask_timeout),
+    })
+}
+
+/// turn a pure evaluation into the recorded and answered decision. an ask keeps `ask` as
+/// the event decision; the response follows the shared resolution, and only an approval
+/// realizes the allow (FR-10).
+fn finalize_decision(eval: Evaluation, resolution: Option<AskResolution>) -> ResolvedDecision {
     if eval.decision != Decision::Ask {
         return ResolvedDecision {
             event_decision: eval.decision,
@@ -366,9 +429,10 @@ fn resolve_decision(config: &RunConfig<'_>, request: &Request<'_>) -> ResolvedDe
             would_deny: eval.would_deny,
         };
     }
-
-    let ask_resolution = resolve_ask(config);
-    let response_decision = match ask_resolution {
+    // settle_asks ran for every ask; an absent resolution here is unreachable, and deny
+    // is the only safe reading of unreachable (I3).
+    let resolution = resolution.unwrap_or(AskResolution::Denied);
+    let response_decision = match resolution {
         AskResolution::Approved => Decision::Allow,
         AskResolution::Denied | AskResolution::TimedOut | AskResolution::Unattended => {
             Decision::Deny
@@ -377,18 +441,10 @@ fn resolve_decision(config: &RunConfig<'_>, request: &Request<'_>) -> ResolvedDe
     ResolvedDecision {
         event_decision: Decision::Ask,
         response_decision,
-        ask_resolution: Some(ask_resolution),
+        ask_resolution: Some(resolution),
         matched_rule: eval.matched.to_string(),
         would_deny: eval.would_deny,
     }
-}
-
-fn resolve_ask(config: &RunConfig<'_>) -> AskResolution {
-    if config.attendance == Attendance::Unattended {
-        return AskResolution::Unattended;
-    }
-    let _ = config.ask_timeout;
-    AskResolution::Denied
 }
 
 /// a `send` that tolerates the target dying first: ENOENT means the child is gone and
@@ -705,12 +761,16 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
     } else {
         FsOperand::Path
     };
-    let primary_decision =
-        resolve_required_fs(config, &primary_identity, &primary_access, primary_operand);
-    let secondary_decision = secondary.as_ref().map(|path| {
+    let mut asks = Vec::new();
+    let primary_evals = evaluate_required_fs(config, &primary_identity, &primary_access, &mut asks);
+    let secondary_evals = secondary.as_ref().map(|path| {
         let required = secondary_access(&invocation, path.exists());
-        resolve_required_fs(config, path.identity(), &required, FsOperand::Dest)
+        evaluate_required_fs(config, path.identity(), &required, &mut asks)
     });
+    let ask_resolution = settle_asks(config, &asks);
+    let primary_decision = finalize_operand(primary_operand, primary_evals, ask_resolution);
+    let secondary_decision =
+        secondary_evals.map(|evals| finalize_operand(FsOperand::Dest, evals, ask_resolution));
     let operand_decisions = if symlink_target {
         Some(primary_decision.evidence.clone())
     } else {
@@ -864,27 +924,43 @@ fn secondary_access(
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_required_fs(
+fn evaluate_required_fs(
     config: &RunConfig<'_>,
     path: &std::path::Path,
     access: &[crate::recorder::FsAccess],
-    operand: FsOperand,
-) -> ResolvedOperand {
+    asks: &mut Vec<ask::PendingAsk>,
+) -> Vec<(crate::recorder::FsAccess, Evaluation)> {
     let path_text = path.to_string_lossy();
+    access
+        .iter()
+        .map(|required| {
+            let eval = evaluate_tracked(
+                config,
+                &Request::Fs {
+                    path: &path_text,
+                    access: std::slice::from_ref(required),
+                },
+                asks,
+            );
+            (*required, eval)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn finalize_operand(
+    operand: FsOperand,
+    evals: Vec<(crate::recorder::FsAccess, Evaluation)>,
+    resolution: Option<AskResolution>,
+) -> ResolvedOperand {
     let mut first_allow = None;
     let mut first_deny = None;
-    let mut evidence = Vec::with_capacity(access.len());
-    for required in access {
-        let decision = resolve_decision(
-            config,
-            &Request::Fs {
-                path: &path_text,
-                access: std::slice::from_ref(required),
-            },
-        );
+    let mut evidence = Vec::with_capacity(evals.len());
+    for (required, eval) in evals {
+        let decision = finalize_decision(eval, resolution);
         evidence.push(FsOperandDecision {
             operand,
-            access: *required,
+            access: required,
             decision: decision.event_decision,
             ask_resolution: decision.ask_resolution,
             matched_rule: decision.matched_rule.clone(),
@@ -2418,6 +2494,142 @@ mod tests {
         assert_eq!(decision.response_decision, Decision::Deny);
         assert_eq!(decision.ask_resolution, Some(AskResolution::Unattended));
         assert_eq!(decision.matched_rule, "fs.1");
+    }
+
+    fn attended_config<'a>(
+        policy: &'a Policy,
+        prompter: &'a dyn Fn(&[crate::supervisor::ask::PendingAsk], Duration) -> AskResolution,
+    ) -> RunConfig<'a> {
+        let mut config = RunConfig::enforce(4242, Attendance::Attended, policy);
+        config.prompter = prompter;
+        config
+    }
+
+    #[test]
+    fn an_approved_ask_realizes_the_allow() {
+        let p = policy(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/etc/**\"\nmode=[\"read\"]\naction=\"ask\"\n",
+        );
+        let config = attended_config(&p, &|_asks, _timeout| AskResolution::Approved);
+        let decision = resolve_decision(
+            &config,
+            &Request::Fs {
+                path: "/etc/hosts",
+                access: &[crate::recorder::FsAccess::Read],
+            },
+        );
+
+        assert_eq!(decision.event_decision, Decision::Ask);
+        assert_eq!(decision.response_decision, Decision::Allow);
+        assert_eq!(decision.ask_resolution, Some(AskResolution::Approved));
+        assert_eq!(decision.matched_rule, "fs.1");
+    }
+
+    #[test]
+    fn a_denied_ask_and_a_timed_out_ask_both_deny() {
+        let p = policy(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/etc/**\"\nmode=[\"read\"]\naction=\"ask\"\n",
+        );
+        for resolution in [AskResolution::Denied, AskResolution::TimedOut] {
+            let prompter = move |_asks: &[crate::supervisor::ask::PendingAsk], _timeout| resolution;
+            let config = attended_config(&p, &prompter);
+            let decision = resolve_decision(
+                &config,
+                &Request::Fs {
+                    path: "/etc/hosts",
+                    access: &[crate::recorder::FsAccess::Read],
+                },
+            );
+
+            assert_eq!(decision.event_decision, Decision::Ask);
+            assert_eq!(decision.response_decision, Decision::Deny);
+            assert_eq!(decision.ask_resolution, Some(resolution));
+        }
+    }
+
+    #[test]
+    fn one_held_syscall_prompts_once_for_every_ask_matched_access() {
+        let p = policy(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/etc/**\"\nmode=[\"read\",\"write\"]\naction=\"ask\"\n",
+        );
+        let calls = std::cell::Cell::new(0);
+        let prompter = &|asks: &[crate::supervisor::ask::PendingAsk], _timeout| {
+            calls.set(calls.get() + 1);
+            assert_eq!(asks.len(), 2, "both ask-matched accesses listed together");
+            assert!(asks.iter().all(|a| a.rule == "fs.1"));
+            AskResolution::Approved
+        };
+        let config = attended_config(&p, prompter);
+
+        // an O_RDWR open evaluates read and write for one held syscall; both land in the
+        // same prompt and one answer settles both (notify-loop.md section 5)
+        let mut asks = Vec::new();
+        let read = evaluate_tracked(
+            &config,
+            &Request::Fs {
+                path: "/etc/hosts",
+                access: &[crate::recorder::FsAccess::Read],
+            },
+            &mut asks,
+        );
+        let write = evaluate_tracked(
+            &config,
+            &Request::Fs {
+                path: "/etc/hosts",
+                access: &[crate::recorder::FsAccess::Write],
+            },
+            &mut asks,
+        );
+        let resolution = settle_asks(&config, &asks);
+        let read = finalize_decision(read, resolution);
+        let write = finalize_decision(write, resolution);
+
+        assert_eq!(calls.get(), 1, "one prompt per syscall");
+        for decision in [read, write] {
+            assert_eq!(decision.event_decision, Decision::Ask);
+            assert_eq!(decision.response_decision, Decision::Allow);
+            assert_eq!(decision.ask_resolution, Some(AskResolution::Approved));
+        }
+    }
+
+    #[test]
+    fn an_unattended_run_never_calls_the_prompter() {
+        let p = policy(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/etc/**\"\nmode=[\"read\"]\naction=\"ask\"\n",
+        );
+        let mut config = RunConfig::enforce(4242, Attendance::Unattended, &p);
+        config.prompter = &|_asks, _timeout| panic!("unattended runs must not prompt");
+        let decision = resolve_decision(
+            &config,
+            &Request::Fs {
+                path: "/etc/hosts",
+                access: &[crate::recorder::FsAccess::Read],
+            },
+        );
+
+        assert_eq!(decision.response_decision, Decision::Deny);
+        assert_eq!(decision.ask_resolution, Some(AskResolution::Unattended));
+    }
+
+    #[test]
+    fn no_ask_means_no_prompt() {
+        let p = policy("schema_version = 1\n");
+        let mut config = RunConfig::enforce(4242, Attendance::Attended, &p);
+        config.prompter = &|_asks, _timeout| panic!("a run without asks must not prompt");
+        let decision = resolve_decision(
+            &config,
+            &Request::Fs {
+                path: "/etc/hosts",
+                access: &[crate::recorder::FsAccess::Read],
+            },
+        );
+
+        assert_eq!(decision.event_decision, Decision::Deny);
+        assert_eq!(decision.ask_resolution, None);
     }
 
     #[test]

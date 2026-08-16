@@ -43,7 +43,8 @@ Each layer references the ones above it by **stable ID** (requirement IDs like `
   Policy parsing and pure evaluation, Landlock ruleset derivation and application, typed process, network, and cross-process trace/report facts, and confined pointer-argument allow realization are complete.
   Issue #25's Linux escape suite covers deny-by-default behavior, anchored path resolution, symlink swaps, magic links, two-path destinations, the Landlock backstop, network payload delivery, and setup failure before exec.
   FR-2 family completeness has landed through issue #26.
-  Interactive attended approval remains separate in issue #30; until it lands, every `ask` decision resolves to deny.
+  Interactive attended approval has landed through issue #30: an ask rule in an attended run prompts on the controlling terminal with every ask-matched action of the held syscall listed, an approval realizes the allow through the same broker path as a policy allow, and denial, timeout, and unattended runs all deny, each recorded with its `ask_resolution`.
+  The pty-backed end-to-end suite covers approve, deny, timeout, unattended, signal delivery during a pending ask, prompt input hygiene, and one prompt per multi-access syscall.
 - One spec item remains deferred on purpose: OQ-9 (the ARM64 target), closing on a real ARM64 need.
   OQ-5 closed on 2026-07-13 into NFR-2's concrete budget from the M1 measurements.
 - No design parameter remains open.

@@ -98,6 +98,33 @@ fn landlock_denies_write_outside_hull_even_when_seccomp_continues() {
     );
 }
 
+/// a read rule on an exact file path derives READ_FILE | READ_DIR, and the kernel
+/// rejects directory rights on a file anchor (EINVAL). the anchor-time mask must drop
+/// the directory half so the ruleset builds (issue #30 review: this fixture was the
+/// first to grant on an exact file path).
+#[test]
+fn ruleset_builds_for_a_grant_rooted_at_a_file() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let file = outside.path().join("secret.txt");
+    std::fs::write(&file, b"secret").unwrap();
+
+    let policy = Policy::parse(
+        &format!(
+            "schema_version = 1\n\
+             [[fs]]\npath={:?}\nmode=[\"read\"]\naction=\"ask\"\n",
+            file.to_string_lossy()
+        ),
+        &ExpandContext {
+            workspace: workspace.path().to_str().unwrap(),
+            home: "/tmp",
+        },
+    )
+    .unwrap();
+    let hull = landlock::derive_hull(&policy, 4);
+    landlock::prepare_ruleset(&hull).expect("a file-anchored grant must build");
+}
+
 fn self_exe() -> String {
     std::env::current_exe()
         .unwrap()

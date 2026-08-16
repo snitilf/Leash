@@ -147,6 +147,16 @@ syscall. The timeout is what bounds the stall and what makes case F above a fini
 indefinite hang. In an unattended **run** the ask does not queue at all; it denies immediately
 (FR-20), so the stall is an attended-run phenomenon only.
 
+One held syscall prompts once, however many of its accesses or operands matched ask rules: an O_RDWR
+open evaluated for read and for write, or a rename evaluated on source and destination, lists every
+ask-matched item with its matched rule and one answer settles them all (recorded 2026-08 for #30).
+The prompt goes to the controlling terminal (`/dev/tty`), never to stdout, which belongs to the
+child; the whole answer line is consumed so no answer bytes wait in the child's stdin. The timeout
+is a single deadline for the wait, retried against after EINTR, so a signal stream cannot stretch
+the stall. A prompt the supervisor cannot complete - an unreadable terminal, a failed write, a
+failed read - denies (case F's fail-closed reading); only an explicit `y`/`yes` approves, anything
+else denies.
+
 If M1 measurements show the ask stall is a real problem on agent workloads (NFR-2, OQ-5), the
 recorded next step is the async-ask refinement named in ADR-0011's alternatives, which supersedes
 that ADR rather than quietly threading this loop. The async-ask path reintroduces out-of-order

@@ -17,14 +17,16 @@ is announced and torn down, and what the shell sees when it finishes. Terms in *
 The one implemented subcommand is `run`:
 
 ```
-leash run [--unattended] [--state-dir <dir>] [--policy <path>] -- <command...>
+leash run [--unattended] [--state-dir <dir>] [--policy <path>] [--ask-timeout <seconds>] -- <command...>
 ```
 
 The `--` separator is required. Everything after it is the child command and passes to the child
 verbatim, including arguments that look like flags: `leash run -- rm -rf ./build` runs `rm` with
 `-rf ./build`, and the `-rf` is never parsed by Leash. Both `--state-dir <dir>` and
 `--state-dir=<dir>` forms are accepted. Both `--policy <path>` and `--policy=<path>` forms are
-accepted. `--unattended` takes no value.
+accepted. `--unattended` takes no value. `--ask-timeout <seconds>` sets the FR-10 attended-ask
+timeout (both `--ask-timeout <n>` and `--ask-timeout=<n>` forms; whole seconds in 1..=3600,
+default 60).
 
 Every usage error exits 2 (section 6) and prints a message to stderr naming the mistake. The
 normative set:
@@ -35,9 +37,11 @@ normative set:
 | unknown subcommand or flag | a subcommand that is not `run` (and not a reserved name below), or a flag `run` does not accept |
 | `run` without `--` | `run` invoked with no `--` separator |
 | empty command after `--` | `--` present but nothing follows it |
-| a flag given twice | `--unattended`, `--state-dir`, or `--policy` repeated |
+| a flag given twice | `--unattended`, `--state-dir`, `--policy`, or `--ask-timeout` repeated |
 | `--state-dir` missing its value | `--state-dir` is the last token before `--`, or is immediately followed by `--` |
 | `--policy` missing its value | `--policy` is the last token before `--`, is immediately followed by `--`, or is given as `--policy=` |
+| `--ask-timeout` missing its value | `--ask-timeout` is immediately followed by `--`, or is given as `--ask-timeout=` |
+| `--ask-timeout` invalid | the value is not a whole number of seconds in 1..=3600 |
 
 Reserved subcommands parse but are not implemented in this slice. `diff` and `rewind` are the M3
 time-travel milestone (FR-12, FR-13); `runs` is the FR-21 listing and pruning subcommand. Each exits
@@ -64,7 +68,7 @@ A run is attended if and only if both stdin and stderr are terminals, tested wit
 descriptors 0 and 2. `--unattended` forces unattended regardless of the terminal state (FR-20).
 Attendance is stamped into the trace and `meta.json`.
 The notify-loop ask resolution path treats an unattended **ask** as an immediate deny and records `ask_resolution: "unattended"`.
-The attended prompt and timeout path remains tracked by the M2 interactive-ask work until a supported enforce run reaches it with E2E coverage.
+An attended **ask** prompts on the controlling terminal (`/dev/tty`), listing every ask-matched action of the held syscall with its matched rule; an approval realizes the allow, and a denial, an unreadable terminal, or the FR-10 timeout denies (notify-loop.md section 5).
 
 ## 4. State directory
 
