@@ -2,6 +2,7 @@
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
   "runArgs": ["--cap-add=SYS_ADMIN", "--security-opt", "seccomp=unconfined"],
   "features": {
-    "ghcr.io/devcontainers/features/rust:1": {}
+    "ghcr.io/devcontainers/features/rust:1": {},
+    "ghcr.io/devcontainers/features/sshd:1": {}
   }
 }
