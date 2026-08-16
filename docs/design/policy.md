@@ -213,6 +213,11 @@ handled rights masked to it. Where the ABI cannot back a dimension the policy us
 in [`architecture.md`](architecture.md) section 5.1 governs: the seccomp layer enforces that dimension
 and the missing backstop is stamped into the trace, rather than the run being refused (ADR-0013). The
 only hard refusal is below the kernel floor (ADR-0012).
+A grant rooted at an exact file path keeps only the rights meaningful for a file: the directory-only
+rights a mode derives (the `read` mode's `FS_READ_DIR`, the `create` mode's `FS_MAKE_*`) are dropped
+at ruleset build time, because the kernel rejects directory rights on a non-directory anchor
+(recorded 2026-08, #30). Masking never widens a grant, so the hull stays a superset of what the
+policy permits.
 
 ## 7. Parameters fixed at slate 2
 
