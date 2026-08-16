@@ -871,6 +871,7 @@ fn enforce_mode_without_policy_is_refused() {
         policy: None,
         attendance: Attendance::Unattended,
         ask_timeout: Duration::from_secs(60),
+        prompter: &leash::supervisor::ask::tty_prompt,
         root_pid: pid as u32,
         broker: None,
         resolved_hosts: None,
