@@ -960,6 +960,7 @@ fn trace_failure_mid_run_aborts_without_run_end_or_report() {
         state_root: state.path().to_path_buf(),
         workspace: ws.path().to_path_buf(),
         policy_path: None,
+        ask_timeout: Duration::from_secs(60),
     };
     // run_start is write 1 and succeeds; the child's execve event is write 2 and dies
     let mut writer = TraceWriter::new(FailingSink {

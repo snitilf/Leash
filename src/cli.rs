@@ -22,6 +22,8 @@ pub struct RunArgs {
     pub state_dir: Option<PathBuf>,
     /// path to the policy file; present means enforce mode
     pub policy_path: Option<PathBuf>,
+    /// the attended-ask timeout in seconds (FR-10); absent means the default of 60
+    pub ask_timeout: Option<u64>,
 }
 
 /// the parsed command line: either the one implemented subcommand, or a reserved name that
@@ -68,6 +70,12 @@ pub enum UsageError {
     /// `--policy` is the last token before `--`, immediately followed by `--`, or empty
     #[error("leash: '--policy' is missing its value")]
     MissingPolicyValue,
+    /// `--ask-timeout` is the last token before `--`, immediately followed by `--`, or empty
+    #[error("leash: '--ask-timeout' is missing its value")]
+    MissingAskTimeoutValue,
+    /// `--ask-timeout` is not a whole number of seconds in 1..=3600
+    #[error("leash: '--ask-timeout' must be a whole number of seconds in 1..=3600")]
+    InvalidAskTimeoutValue,
 }
 
 /// parse argv (excluding argv\[0\]) into a [`Command`] per docs/design/cli.md section 1.
@@ -107,6 +115,7 @@ fn parse_run(rest: &[String]) -> Result<RunArgs, UsageError> {
     let mut unattended = false;
     let mut state_dir: Option<PathBuf> = None;
     let mut policy_path: Option<PathBuf> = None;
+    let mut ask_timeout: Option<u64> = None;
     let mut i = 0;
 
     let separator = loop {
@@ -164,6 +173,28 @@ fn parse_run(rest: &[String]) -> Result<RunArgs, UsageError> {
                 policy_path = Some(PathBuf::from(value));
                 i += 1;
             }
+            Some(tok) if tok == "--ask-timeout" => {
+                if ask_timeout.is_some() {
+                    return Err(UsageError::DuplicateFlag("--ask-timeout"));
+                }
+                let value = rest.get(i + 1).ok_or(UsageError::MissingAskTimeoutValue)?;
+                if value == "--" {
+                    return Err(UsageError::MissingAskTimeoutValue);
+                }
+                ask_timeout = Some(parse_ask_timeout(value)?);
+                i += 2;
+            }
+            Some(tok) if tok.starts_with("--ask-timeout=") => {
+                if ask_timeout.is_some() {
+                    return Err(UsageError::DuplicateFlag("--ask-timeout"));
+                }
+                let value = &tok["--ask-timeout=".len()..];
+                if value.is_empty() {
+                    return Err(UsageError::MissingAskTimeoutValue);
+                }
+                ask_timeout = Some(parse_ask_timeout(value)?);
+                i += 1;
+            }
             Some(tok) => return Err(UsageError::UnknownFlag(tok.clone())),
         }
     };
@@ -178,7 +209,18 @@ fn parse_run(rest: &[String]) -> Result<RunArgs, UsageError> {
         unattended,
         state_dir,
         policy_path,
+        ask_timeout,
     })
+}
+
+/// the `--ask-timeout` value: whole seconds in 1..=3600 (cli.md section 1). zero would
+/// deny every ask on sight; the ceiling keeps the whole-tree stall (notify-loop.md
+/// section 5) bounded by a span an operator can actually reason about.
+fn parse_ask_timeout(value: &str) -> Result<u64, UsageError> {
+    match value.parse::<u64>() {
+        Ok(secs) if (1..=3600).contains(&secs) => Ok(secs),
+        _ => Err(UsageError::InvalidAskTimeoutValue),
+    }
 }
 
 /// compute attendance (docs/design/cli.md section 3): attended iff both stdin and stderr are
@@ -357,6 +399,10 @@ pub fn run() -> ExitCode {
         state_root,
         workspace,
         policy_path: run_args.policy_path,
+        ask_timeout: run_args
+            .ask_timeout
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(crate::supervisor::run::DEFAULT_ASK_TIMEOUT),
     })
 }
 
@@ -407,6 +453,7 @@ mod tests {
                 unattended: false,
                 state_dir: None,
                 policy_path: None,
+                ask_timeout: None,
             })
         );
     }
@@ -430,6 +477,7 @@ mod tests {
                 unattended: true,
                 state_dir: Some(PathBuf::from("/tmp/state")),
                 policy_path: None,
+                ask_timeout: None,
             })
         );
     }
@@ -451,6 +499,7 @@ mod tests {
                 unattended: true,
                 state_dir: Some(PathBuf::from("/tmp/state")),
                 policy_path: None,
+                ask_timeout: None,
             })
         );
     }
@@ -472,6 +521,7 @@ mod tests {
                 unattended: false,
                 state_dir: None,
                 policy_path: Some(PathBuf::from("/tmp/policy.toml")),
+                ask_timeout: None,
             })
         );
 
@@ -483,8 +533,62 @@ mod tests {
                 unattended: false,
                 state_dir: None,
                 policy_path: Some(PathBuf::from("/tmp/policy.toml")),
+                ask_timeout: None,
             })
         );
+    }
+
+    #[test]
+    fn parse_run_accepts_ask_timeout_space_and_equals_forms() {
+        for form in [
+            args(&["run", "--ask-timeout", "30", "--", "echo"]),
+            args(&["run", "--ask-timeout=30", "--", "echo"]),
+        ] {
+            let cmd = parse(&form).unwrap();
+            assert_eq!(
+                cmd,
+                Command::Run(RunArgs {
+                    command: vec!["echo".into()],
+                    unattended: false,
+                    state_dir: None,
+                    policy_path: None,
+                    ask_timeout: Some(30),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn parse_run_rejects_ask_timeout_errors() {
+        // repeated
+        assert_eq!(
+            parse(&args(&[
+                "run",
+                "--ask-timeout",
+                "30",
+                "--ask-timeout=10",
+                "--",
+                "echo",
+            ])),
+            Err(UsageError::DuplicateFlag("--ask-timeout"))
+        );
+        // missing value: immediately followed by `--`, or empty after `=`
+        assert_eq!(
+            parse(&args(&["run", "--ask-timeout", "--", "echo"])),
+            Err(UsageError::MissingAskTimeoutValue)
+        );
+        assert_eq!(
+            parse(&args(&["run", "--ask-timeout=", "--", "echo"])),
+            Err(UsageError::MissingAskTimeoutValue)
+        );
+        // invalid value: zero, past the ceiling, or not a whole number
+        for bad in ["0", "3601", "abc", "-5", "1.5"] {
+            assert_eq!(
+                parse(&args(&["run", "--ask-timeout", bad, "--", "echo"])),
+                Err(UsageError::InvalidAskTimeoutValue),
+                "{bad} is invalid"
+            );
+        }
     }
 
     #[test]
@@ -514,6 +618,7 @@ mod tests {
                 unattended: false,
                 state_dir: None,
                 policy_path: None,
+                ask_timeout: None,
             })
         );
     }

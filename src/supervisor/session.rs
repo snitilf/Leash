@@ -82,6 +82,8 @@ pub struct SessionSpec {
     pub workspace: PathBuf,
     /// optional policy path; present means enforce mode and is loaded during preflight.
     pub policy_path: Option<PathBuf>,
+    /// the attended-ask timeout (FR-10), from `--ask-timeout` or the 60 s default.
+    pub ask_timeout: std::time::Duration,
 }
 
 /// how a completed run ended.
@@ -373,7 +375,8 @@ mod linux {
                     .ok_or(crate::supervisor::run::RunError::MissingBroker)?,
                 resolved_hosts,
             ),
-        };
+        }
+        .with_ask_timeout(spec.ask_timeout);
         let outcome = run_loop(child, config, writer)?;
 
         // step 7: an undecodable status stamps nothing (an untruthful exit is worse
