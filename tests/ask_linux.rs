@@ -147,9 +147,24 @@ impl Driver {
     }
 
     /// collect whatever the child printed after the answer until its side closes.
+    /// bounded: a leaked slave fd would otherwise hang the test.
     fn drain(&mut self) {
+        let start = Instant::now();
         let mut buf = [0u8; 4096];
         loop {
+            let mut pfd = libc::pollfd {
+                fd: self.master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pfd points at a valid one-element array; master is a valid fd.
+            let ready = unsafe { libc::poll(&mut pfd, 1, 100) };
+            if ready < 0 || start.elapsed() > Duration::from_secs(3) {
+                return;
+            }
+            if ready == 0 {
+                continue;
+            }
             // SAFETY: master is valid; buf is writable for its length. EIO means the
             // child's side of the pty is gone, i.e. end of output.
             let n =
@@ -162,16 +177,24 @@ impl Driver {
     }
 }
 
-/// wait for the child with a deadline; SIGKILL it if it outlives the budget.
-fn wait_deadline(child: &mut Child) -> ExitStatus {
+/// wait for the run to end; on timeout, kill it and fail with the full operator output
+/// and the trace so far, because a wedged run is only debuggable from what it left behind.
+fn wait_or_dump(run: &mut AskRun) -> ExitStatus {
     let start = Instant::now();
     loop {
-        match child.try_wait().expect("try_wait") {
+        match run.child.try_wait().expect("try_wait") {
             Some(status) => return status,
             None if start.elapsed() > DEADLINE => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("leash exceeded the deadline");
+                let _ = run.child.kill();
+                let _ = run.child.wait();
+                run.driver.drain();
+                let trace = only_run_dir(run.state.path()).join("trace.jsonl");
+                panic!(
+                    "leash exceeded the deadline; output:\n{}\ntrace:\n{}",
+                    run.driver.text(),
+                    std::fs::read_to_string(&trace)
+                        .unwrap_or_else(|e| format!("(unreadable: {e})"))
+                );
             }
             None => std::thread::sleep(Duration::from_millis(25)),
         }
@@ -248,7 +271,7 @@ fn answer_prompt(run: &mut AskRun, answer: &str) -> (ExitStatus, String) {
     run.driver
         .read_until("allow? [y/N]", Duration::from_secs(10));
     run.driver.answer(answer);
-    let status = wait_deadline(&mut run.child);
+    let status = wait_or_dump(run);
     run.driver.drain();
     (status, run.driver.text())
 }
@@ -301,7 +324,7 @@ fn approved_ask_realizes_the_allow() {
         "the prompt names the rule: {prompt_text}"
     );
     run.driver.answer("y\n");
-    let status = wait_deadline(&mut run.child);
+    let status = wait_or_dump(&mut run);
     run.driver.drain();
     let output = run.driver.text();
 
@@ -362,7 +385,7 @@ fn an_unanswered_ask_times_out_to_deny() {
     run.driver
         .read_until("allow? [y/N]", Duration::from_secs(10));
     let start = Instant::now();
-    let status = wait_deadline(&mut run.child);
+    let status = wait_or_dump(&mut run);
     run.driver.drain();
     let output = run.driver.text();
 
@@ -460,9 +483,9 @@ fn held_syscall_survives_a_signal_during_the_ask() {
     run.driver
         .read_until("allow? [y/N]", Duration::from_secs(10));
     // let the alarm fire while the ask is still pending
-    std::thread::sleep(Duration::from_millis(1500));
+    std::thread::sleep(Duration::from_millis(2000));
     run.driver.answer("y\n");
-    let status = wait_deadline(&mut run.child);
+    let status = wait_or_dump(&mut run);
     run.driver.drain();
     let output = run.driver.text();
 
@@ -490,20 +513,24 @@ fn held_syscall_survives_a_signal_during_the_ask() {
 /// the trailing newline and the answer itself never reach the child's stdin.
 #[test]
 fn answer_bytes_do_not_leak_into_child_stdin() {
+    // the agent reads the secret (the ask), then checks its stdin without blocking:
+    // anything already queued would be the leaked answer bytes
+    let script = concat!(
+        "import os,select,sys\n",
+        "open(sys.argv[1]).read()\n",
+        "r,_,_=select.select([0],[],[],0.5)\n",
+        "print('leftover=%r' % (os.read(0,64) if r else b''))\n",
+    );
     let mut run = start_ask_run(
         "[\"read\"]",
-        &[
-            "/bin/sh",
-            "-c",
-            "/bin/cat {secret} >/dev/null; IFS= read -r -t 1 line; echo \"leftover=[$line]\"",
-        ],
+        &["/usr/bin/python3", "-c", script, "{secret}"],
         &[],
     );
     let (status, output) = answer_prompt(&mut run, "y\n");
 
     assert!(status.success(), "the run must exit 0: {output}");
     assert!(
-        output.contains("leftover=[]"),
+        output.contains("leftover=b''"),
         "no answer bytes may wait in the child's stdin: {output}"
     );
 }
@@ -513,9 +540,15 @@ fn answer_bytes_do_not_leak_into_child_stdin() {
 /// both, with per-access evidence recorded for each.
 #[test]
 fn one_prompt_covers_every_ask_matched_access_of_a_syscall() {
+    // a plain O_RDWR open (no O_CREAT) matches the ask rule for read and for write
+    let script = concat!(
+        "import sys\n",
+        "open(sys.argv[1],'r+')\n",
+        "print('opened-rw')\n",
+    );
     let mut run = start_ask_run(
         "[\"read\",\"write\"]",
-        &["/bin/sh", "-c", "exec 3<>{secret} && echo opened-rw"],
+        &["/usr/bin/python3", "-c", script, "{secret}"],
         &[],
     );
 
@@ -532,7 +565,7 @@ fn one_prompt_covers_every_ask_matched_access_of_a_syscall() {
         "both accesses are listed: {prompt_text}"
     );
     run.driver.answer("y\n");
-    let status = wait_deadline(&mut run.child);
+    let status = wait_or_dump(&mut run);
     run.driver.drain();
     let output = run.driver.text();
 
