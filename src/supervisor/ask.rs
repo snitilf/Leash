@@ -160,7 +160,12 @@ fn read_line(fd: BorrowedFd<'_>, deadline: Instant) -> Result<String, PromptErro
             events: libc::POLLIN,
             revents: 0,
         };
-        let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+        // round up: a truncated poll budget could fire just before the deadline, and
+        // the timeout must never deny a hair early
+        let millis = remaining
+            .as_millis()
+            .saturating_add(1)
+            .min(i32::MAX as u128) as i32;
         // SAFETY: pfd points at a valid one-element array; the fd outlives the call,
         // borrowed from the caller.
         let ready = unsafe { libc::poll(&mut pfd, 1, millis) };
