@@ -94,11 +94,11 @@ path: an unrecordable allow is not an allow.
 
 ## 4. Fail-closed enumeration
 
-Every way the loop can fail, and how each resolves to deny (FR-9, NFR-1, I3). The enumeration is
-finite and checkable precisely because the loop is single-threaded (ADR-0011); each arc is listed
-with the escape or fault test that proves it in [`escapes.md`](escapes.md) (I5). A deny is a decision
-and is written as an event (FR-2); a dropped notification (case B, case I) made no decision and its
-syscall never took effect, so it records none.
+Every failure path that the loop claims to handle fail-closed, and how each prevents an unapproved action (FR-9, NFR-1, I3).
+The enumeration is finite and checkable precisely because the loop is single-threaded (ADR-0011); each arc is listed with the escape or fault test that proves it in [`escapes.md`](escapes.md) (I5).
+A deny is a decision and is written as an event (FR-2).
+Only a notification dropped before any decision or realized effect records no event, because its syscall never took effect.
+The post-`SEND` reply-loss race accepted by [ADR-0021](../adr/0021-accept-wait-killable-recv-post-send-race.md) is explicitly outside this fail-closed claim: the decision, event, and supervisor side effect already exist, but an unfixed kernel may discard the reply and restart the syscall.
 
 | # | Fault | Resolution | Why it does not fail open |
 |---|---|---|---|
