@@ -136,7 +136,7 @@ The preflight probe could not catch that: it validates that the kernel accepts a
 The semantics are now pinned behaviorally by `tests/wait_killable_recv_linux.rs`, which signals the trapped thread itself before and after `RECV` and checks `ID_VALID`, `SEND`, and the child's exit status.
 Second, even with the correct flag, kernels before the upstream fix `cce436aafc2a` ("seccomp: Fix a race with `WAIT_KILLABLE_RECV` if the tracer replies too fast", merged 2025-07-25, first released after 6.17) keep a narrow residual race: if the signal wakes the tracee and the supervisor's `SEND` lands before the tracee re-acquires the notification lock, the tracee discards the delivered reply and restarts the syscall anyway.
 The window is the few microseconds between the wake and the lock, and the consequence is the double-execution case this section exists to prevent, so on unfixed kernels a supervisor-performed side effect can still run twice, rarely.
-Leash cannot close that race from userspace; the floor stays 5.19 and the residual risk is recorded here rather than claimed away.
+Leash cannot close that race from userspace; the floor stays 5.19 and [ADR-0021](../adr/0021-accept-wait-killable-recv-post-send-race.md) accepts the residual risk rather than claiming it away.
 
 Case G is the backstop under all the others and is the reason a supervisor bug cannot fail open: even
 an outright crash degrades to the kernel denying the child's next mediated syscall. It carries one

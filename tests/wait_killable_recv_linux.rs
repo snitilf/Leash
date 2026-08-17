@@ -165,6 +165,11 @@ impl Probe {
             }
             let n = self.child.notify.recv().expect("recv after poll");
             if saw_go {
+                assert_eq!(
+                    n.pid,
+                    announced_tid(&self.seen),
+                    "post-GO notification came from a different thread"
+                );
                 return n;
             }
             self.child.notify.send_continue(n.id).expect("continue");
@@ -287,14 +292,15 @@ fn self_exe() -> String {
 /// SIGUSR1 the trapped thread; tgkill returning 0 proves the signal was posted to it.
 /// process-directed kill could deliver to another thread of the child and prove nothing
 /// about the trapped wait, so every case aims at the trapped tid.
-fn post_signal(pid: libc::pid_t, tid: libc::pid_t) {
+fn post_signal(pid: libc::pid_t, tid: u32) {
+    let tid = libc::pid_t::try_from(tid).expect("notification tid fits pid_t");
     // SAFETY: pid/tid name the child's trapped thread, both live at call time.
     let rc = unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGUSR1) };
     assert_eq!(rc, 0, "tgkill: {}", std::io::Error::last_os_error());
 }
 
 /// the trapped thread's tid, parsed from the GO marker the child announced.
-fn announced_tid(output: &str) -> libc::pid_t {
+fn announced_tid(output: &str) -> u32 {
     let line = output
         .lines()
         .find(|l| l.starts_with(GO))
@@ -356,7 +362,7 @@ fn post_recv_signal_does_not_cancel_a_received_notification() {
         probe.pid()
     );
 
-    post_signal(probe.pid(), tid);
+    post_signal(probe.pid(), n.pid);
     std::thread::sleep(Duration::from_millis(200));
     probe.pump();
     println!(
@@ -451,7 +457,7 @@ fn post_recv_signal_with_sa_restart_also_does_not_cancel() {
     let mut probe = spawn_probe("restart");
     let n = probe.recv_target();
 
-    post_signal(probe.pid(), announced_tid(&probe.seen));
+    post_signal(probe.pid(), n.pid);
     std::thread::sleep(Duration::from_millis(200));
 
     assert_wait_held(probe, &n);
@@ -465,9 +471,8 @@ fn a_signal_storm_after_recv_still_does_not_cancel() {
     let mut probe = spawn_probe("held");
     let n = probe.recv_target();
 
-    let tid = announced_tid(&probe.seen);
     for _ in 0..5 {
-        post_signal(probe.pid(), tid);
+        post_signal(probe.pid(), n.pid);
         std::thread::sleep(Duration::from_millis(50));
     }
 
