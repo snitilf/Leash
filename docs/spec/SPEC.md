@@ -82,7 +82,11 @@ These carry no requirements yet and nothing in this table is promised; promoting
 - **FR-17** — A **step** is a coalesced burst of the child's mediated filesystem writes: writes closer together than a coalescing window (a design parameter) belong to one step; the boundary falls when write activity quiesces and MUST NOT fall inside a burst. Run start and end are always step boundaries. Steps MUST be derived solely from supervisor-observed events (ADR-0006).
 
 ### 6.4 Interface & portability
-- **FR-14** — Leash MUST run on Linux 5.19 or later (ADR-0012). This floor is set by the capabilities the supervisor depends on, not by either mechanism's earliest appearance: `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (5.19), so a signal-cancelled notification cannot double-execute a supervisor-performed action; `SECCOMP_ADDFD` and `SECCOMP_ADDFD_FLAG_SEND` (5.9, 5.14); and Landlock ABI 2 (5.19), so cross-directory rename and link the policy allows are not denied by the backstop. Preflight MUST verify the capabilities, not merely the version string; the version check is itself a hard gate alongside the probes (ADR-0015). Below the floor Leash MUST refuse to run with a clear message rather than silently degrade security. The Landlock ABI 2 leg of the floor applies to enforce mode only: record-only applies no Landlock ruleset (ADR-0010), so a host below that ABI MAY still run record-only; the version gate and the seccomp legs apply in both modes.
+- **FR-14** - Leash MUST run on Linux 5.19 or later (ADR-0012, refined by ADR-0021).
+  This floor is set by the capabilities the supervisor depends on, not by either mechanism's earliest appearance: `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (5.19), which prevents non-fatal signals from cancelling a received notification before `SEND`, while kernels without upstream fix `cce436aafc2a` retain the accepted post-`SEND` reply-loss race that can double-execute a supervisor-performed action (ADR-0021); `SECCOMP_ADDFD` and `SECCOMP_ADDFD_FLAG_SEND` (5.9, 5.14); and Landlock ABI 2 (5.19), so cross-directory rename and link the policy allows are not denied by the backstop.
+  Preflight MUST verify the capabilities, not merely the version string; the version check is itself a hard gate alongside the probes (ADR-0015).
+  Below the floor Leash MUST refuse to run with a clear message rather than silently degrade security.
+  The Landlock ABI 2 leg of the floor applies to enforce mode only: record-only applies no Landlock ruleset (ADR-0010), so a host below that ABI MAY still run record-only; the version gate and the seccomp legs apply in both modes.
 - **FR-15** — Leash MUST run on x86-64 (the VPS reference target). ARM64 support is deferred (OQ-9, ADR-0014).
 - **FR-16** — Traces MUST persist in a documented, machine-readable format (e.g. JSONL); the format SHOULD align with the draft agent-audit-trail schema where practical.
 - **FR-21** — Traces and snapshots MUST persist under a per-run directory in an operator-configurable state directory (default per XDG, e.g. `$XDG_STATE_HOME/leash/runs/<run-id>`). The state directory MUST lie outside the **workspace**, and in enforce mode the child MUST be denied access to it (FR-3). Leash MUST NOT delete run data automatically; retention is the operator's, assisted by a listing/pruning subcommand.
@@ -146,7 +150,7 @@ OQ-1..OQ-4 and OQ-6..OQ-8 were resolved on 2026-07-07 into FR-17..FR-21, SR-4, A
 | FR-6/FR-7 (policy) | ADR-0004 | policy-engine unit tests |
 | FR-2/FR-9 (ordered trace, fail-closed), NFR-6 | ADR-0011, ADR-0019 (mode scope of the undecodable-network arc) | fail-closed enumeration, notify-loop fault tests |
 | FR-11..13 (time travel) | ADR-0005, ADR-0009 | overlay-semantics tests, mechanism-equivalence tests |
-| FR-14 (kernel floor) | ADR-0012, ADR-0015 | preflight capability probes on 5.19+ |
+| FR-14 (kernel floor) | ADR-0012, ADR-0015, ADR-0021 | preflight capability probes on 5.19+, WAIT_KILLABLE_RECV signal probes |
 | FR-17 (step semantics) | ADR-0006, ADR-0009 | step-boundary tests |
 | NFR-2 (overhead budget) | OQ-5 closure, measurement 0001 | `benches/overhead.rs` on the reference environment |
 | FR-18 (policy format) | ADR-0004 | policy schema/rejection tests |

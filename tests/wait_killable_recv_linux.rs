@@ -12,7 +12,7 @@
 //! mechanics: the child is the re-exec'd test binary (or python3 for the CI replica)
 //! spawned through the production spawn path, so the filter under test carries the
 //! production flags. the child announces its target syscall with a GO marker carrying its
-//! tid, so the parent aims tgkill at the trapped thread itself (a process-directed
+//! tid, so the parent aims each signal at the trapped thread itself (a process-directed
 //! signal could land on another thread of the child and prove nothing). handler
 //! execution and the child's syscall result come back over the redirected stdout pipe
 //! with distinctive markers.
@@ -46,19 +46,19 @@ fn spawn_guard() -> MutexGuard<'static, ()> {
 
 /// the probe child's signal handler: prove the handler ran by writing a marker.
 /// write(2) is async-signal-safe; fd 1 is the redirected pipe.
-extern "C" fn usr1_handler(_sig: libc::c_int) {
+extern "C" fn signal_handler(_sig: libc::c_int) {
     // SAFETY: fd 1 is valid for the child's life; the buffer is static.
     unsafe { libc::write(1, HANDLER.as_ptr().cast(), HANDLER.len()) };
 }
 
-fn install_usr1_handler(sa_restart: bool) {
+fn install_signal_handler(signal: libc::c_int, sa_restart: bool) {
     let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
-    sa.sa_sigaction = usr1_handler as *const () as usize;
+    sa.sa_sigaction = signal_handler as *const () as usize;
     sa.sa_flags = if sa_restart { libc::SA_RESTART } else { 0 };
     // SAFETY: sa points at a valid zeroed mask we now empty.
     unsafe { libc::sigemptyset(&mut sa.sa_mask) };
     // SAFETY: sa is a fully-initialized sigaction for this process.
-    let rc = unsafe { libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut()) };
+    let rc = unsafe { libc::sigaction(signal, &sa, std::ptr::null_mut()) };
     assert_eq!(rc, 0, "sigaction: {}", std::io::Error::last_os_error());
 }
 
@@ -68,7 +68,12 @@ fn wkr_dispatch() {
     let Ok(variant) = std::env::var("LEASH_WKR_AGENT") else {
         return;
     };
-    install_usr1_handler(variant == "restart");
+    let signal = if variant == "storm" {
+        libc::SIGRTMIN()
+    } else {
+        libc::SIGUSR1
+    };
+    install_signal_handler(signal, variant == "restart");
     // announce with our thread id: a process-directed signal could land on the libtest
     // main thread instead of this trapped worker thread, so the parent aims by tid.
     // SAFETY: gettid takes no arguments and cannot fail.
@@ -299,6 +304,24 @@ fn post_signal(pid: libc::pid_t, tid: u32) {
     assert_eq!(rc, 0, "tgkill: {}", std::io::Error::last_os_error());
 }
 
+fn post_queued_signal(pid: libc::pid_t, tid: u32) {
+    let tid = libc::pid_t::try_from(tid).expect("notification tid fits pid_t");
+    let signal = libc::SIGRTMIN();
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    info.si_signo = signal;
+    info.si_code = libc::SI_QUEUE;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_rt_tgsigqueueinfo,
+            pid,
+            tid,
+            signal,
+            &info,
+        )
+    };
+    assert_eq!(rc, 0, "rt_tgsigqueueinfo: {}", std::io::Error::last_os_error());
+}
+
 /// the trapped thread's tid, parsed from the GO marker the child announced.
 fn announced_tid(output: &str) -> u32 {
     let line = output
@@ -312,7 +335,11 @@ fn announced_tid(output: &str) -> u32 {
 /// the handler must not run while the supervisor holds the notification, no re-trap
 /// may appear, the SEND must succeed, and the child must observe the spoofed errno,
 /// with the deferred handler running before its result report.
-fn assert_wait_held(mut probe: Probe, n: &leash::supervisor::notify::SeccompNotif) {
+fn assert_wait_held(
+    mut probe: Probe,
+    n: &leash::supervisor::notify::SeccompNotif,
+    expected_handlers: usize,
+) {
     probe.pump();
     assert!(
         !probe.seen.contains(HANDLER) && !probe.seen.contains("RESULT:"),
@@ -331,11 +358,12 @@ fn assert_wait_held(mut probe: Probe, n: &leash::supervisor::notify::SeccompNoti
         .expect("SEND must succeed on a live, protected notification");
 
     let output = probe.reap();
-    let handler_at = output.find(HANDLER);
+    let handler_count = output.matches(HANDLER).count();
+    let handler_at = output.rfind(HANDLER);
     let result_at = output.find("RESULT:errno-13");
-    assert!(
-        handler_at.is_some(),
-        "the deferred handler must run after the syscall returns:\n{output}"
+    assert_eq!(
+        handler_count, expected_handlers,
+        "every queued signal must reach the deferred handler:\n{output}"
     );
     assert!(
         result_at.is_some(),
@@ -460,23 +488,23 @@ fn post_recv_signal_with_sa_restart_also_does_not_cancel() {
     post_signal(probe.pid(), n.pid);
     std::thread::sleep(Duration::from_millis(200));
 
-    assert_wait_held(probe, &n);
+    assert_wait_held(probe, &n, 1);
 }
 
-/// case 4 (adversarial, NFR-5): a storm of non-fatal signals after RECV still must not
+/// case 4 (adversarial, NFR-5): a storm of queued real-time signals after RECV must not
 /// cancel the notification.
 #[test]
 fn a_signal_storm_after_recv_still_does_not_cancel() {
     let _g = spawn_guard();
-    let mut probe = spawn_probe("held");
+    let mut probe = spawn_probe("storm");
     let n = probe.recv_target();
 
     for _ in 0..5 {
-        post_signal(probe.pid(), n.pid);
+        post_queued_signal(probe.pid(), n.pid);
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    assert_wait_held(probe, &n);
+    assert_wait_held(probe, &n, 5);
 }
 
 /// case 5 (CI replica, reports rather than asserts): python arms a caught SIGALRM one

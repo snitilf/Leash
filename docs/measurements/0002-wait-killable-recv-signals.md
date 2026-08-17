@@ -24,8 +24,8 @@ One kernel behavior, in five cases (`tests/wait_killable_recv_linux.rs`):
    `RECV`; the documented pre-5.19-style behavior (EINTR, handler runs, notification dies) must
    still hold here.
 3. **Post-RECV, SA_RESTART**: same as case 1 with the handler installed with `SA_RESTART`.
-4. **Post-RECV signal storm**: five SIGUSR1 deliveries, 50 ms apart, while one notification is
-   pending.
+4. **Post-RECV signal storm**: five queued SIGRTMIN deliveries to the trapped thread, 50 ms apart,
+   while one notification is pending.
 5. **CI replica**: the exact anomaly shape from run 31973092653, a single-threaded python child
    that arms `setitimer(ITIMER_REAL, 1.0)` and opens a file while the supervisor holds the
    notification for 1.5 s.
