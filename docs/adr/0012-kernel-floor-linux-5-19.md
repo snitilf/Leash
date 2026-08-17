@@ -1,6 +1,6 @@
 # ADR-0012: Raise the kernel floor to Linux 5.19
 
-- Status: accepted (probe clauses refined by ADR-0015: the version check is a hard gate, and ADDFD support is derived from the WAIT_KILLABLE_RECV probe)
+- Status: accepted (probe clauses refined by ADR-0015; absolute signal-safety consequence refined by ADR-0021)
 - Date: 2026-07-08
 
 ## Context

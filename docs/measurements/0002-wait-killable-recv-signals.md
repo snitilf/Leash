@@ -5,7 +5,7 @@
 - Governs: the resolution of issue #36 and the correctness of the claims in
   `design/notify-loop.md` section 4.1 and ADR-0012 about signal cancellation of received
   notifications.
-- Cites: ADR-0012, ADR-0020; SPEC.md FR-3, FR-9, I3, I4; `design/notify-loop.md` section 4.1.
+- Cites: ADR-0012, ADR-0020, ADR-0021; SPEC.md FR-3, FR-9, I3, I4; `design/notify-loop.md` section 4.1.
 - Method recorded before any number, per the project's evidence discipline.
 
 This document records what a caught, non-fatal signal does to a seccomp user notification that the

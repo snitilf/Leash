@@ -310,16 +310,13 @@ fn post_queued_signal(pid: libc::pid_t, tid: u32) {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     info.si_signo = signal;
     info.si_code = libc::SI_QUEUE;
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_rt_tgsigqueueinfo,
-            pid,
-            tid,
-            signal,
-            &info,
-        )
-    };
-    assert_eq!(rc, 0, "rt_tgsigqueueinfo: {}", std::io::Error::last_os_error());
+    let rc = unsafe { libc::syscall(libc::SYS_rt_tgsigqueueinfo, pid, tid, signal, &info) };
+    assert_eq!(
+        rc,
+        0,
+        "rt_tgsigqueueinfo: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 /// the trapped thread's tid, parsed from the GO marker the child announced.

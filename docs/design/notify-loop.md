@@ -4,7 +4,7 @@
 - Governs: the protocol the supervisor runs on the seccomp notification fd, how it reads child
   memory safely, and how every error path resolves to deny.
 - Cites: FR-2, FR-3, FR-9, FR-10, FR-20; NFR-1, NFR-6; SR-2, SR-3; ADR-0002, ADR-0010, ADR-0011,
-  ADR-0012, ADR-0019.
+  ADR-0012, ADR-0019, ADR-0021.
   Invariants I2, I3, I4, I5 are defined in [`architecture.md`](architecture.md).
 
 This is the state machine that turns one `seccomp_notif` into one **decision** and one **event**. It
