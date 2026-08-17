@@ -110,7 +110,7 @@ syscall never took effect, so it records none.
 | F | an **ask** reaches its timeout (FR-10), or the run is unattended (FR-20) | deny | timeout-to-deny and unattended-to-deny are the specified behaviors |
 | G | the supervisor process crashes or is killed | the kernel closes the notification fd; every pending and subsequent mediated syscall in the child fails (documented as `-ENOSYS` for the no-listener case) and none executes | the boundary holds by the action not taking effect; fail-closed is enforced by the kernel, not by supervisor code that is no longer running |
 | H | the decision thread hangs on a non-ask step | prevented: every non-ask step is bounded (section 1); the only unbounded wait is the ask, which has a timeout (case F) | there is no unbounded blocking point outside the ask |
-| I | a non-fatal signal to the child cancels a received notification, restarting the syscall | prevented by `WAIT_KILLABLE_RECV` (section 4.1); only a fatal signal cancels, and a child being killed does not need its action completed | a supervisor-performed side effect cannot run twice, and no event is recorded for an action that then restarts |
+| I | a non-fatal signal to the child cancels a received notification before the supervisor's reply is delivered, restarting the syscall | prevented on the pre-`SEND` path by `WAIT_KILLABLE_RECV` (section 4.1); only a fatal signal cancels there, and a child being killed does not need its action completed | pre-`SEND` cancellation cannot duplicate a supervisor-performed side effect; the distinct post-`SEND` reply-loss race on unfixed kernels is an accepted residual ([ADR-0021](../adr/0021-accept-wait-killable-recv-post-send-race.md)) |
 
 ### 4.1 Signal cancellation and double execution
 
