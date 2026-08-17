@@ -462,12 +462,12 @@ fn unattended_ask_denies_without_prompting() {
 /// signal survival (issue #30): a signal whose disposition is ignore cannot disturb the
 /// wait at all, so the held syscall completes exactly once after the approval.
 ///
-/// note: this test originally armed a *caught* SIGALRM to prove the notify-loop.md
-/// section 4.1 claim that WAIT_KILLABLE_RECV shields a received notification from
-/// non-fatal signals. on the CI kernel (6.17.0-1022-azure) the pending notification was
-/// cancelled anyway (EINTR, handler ran, python retried, a second prompt appeared), so
-/// that documented semantics did not hold as written. the caught-signal question is a
-/// design-level finding tracked separately; this test pins the guarantee that does hold.
+/// note: an earlier caught-signal version of this scenario exposed issue #36 on the
+/// CI kernel (6.17.0-1022-azure): the pending notification was cancelled (EINTR,
+/// handler ran, python retried, a second prompt appeared) even though the filter was
+/// installed with WAIT_KILLABLE_RECV. the root cause was the flag constant itself
+/// (bit 4 instead of bit 5, src/supervisor/notify.rs), and the caught-signal guarantee
+/// is pinned again by the test below and by tests/wait_killable_recv_linux.rs.
 #[test]
 fn an_ignored_signal_during_the_ask_does_not_disturb_the_held_syscall() {
     // the agent ignores SIGALRM, arms a 1 s alarm, then opens the secret. the alarm
@@ -499,6 +499,60 @@ fn an_ignored_signal_during_the_ask_does_not_disturb_the_held_syscall() {
         output.matches(SECRET_CONTENT).count(),
         1,
         "the held open completes exactly once: {output}"
+    );
+
+    let events = secret_events(&only_run_dir(run.state.path()));
+    assert_eq!(
+        events.len(),
+        1,
+        "no cancelled-and-restarted open may appear: {events:?}"
+    );
+    assert_eq!(events[0]["ask_resolution"], "approved");
+}
+
+/// signal survival (issue #36): a caught, non-fatal signal must not cancel a
+/// notification the supervisor has already received. the handler runs only after the
+/// approved syscall completes; the open happens exactly once, with exactly one prompt.
+#[test]
+fn a_caught_signal_during_the_ask_does_not_disturb_the_held_syscall() {
+    // the agent installs a real SIGALRM handler, arms a 1 s alarm, then opens the
+    // secret. the alarm fires while the ask is pending; WAIT_KILLABLE_RECV keeps the
+    // received notification alive, so the approval completes the open exactly once.
+    let script = concat!(
+        "import signal,sys\n",
+        "signal.signal(signal.SIGALRM,lambda s,f: print('ALARM_HANDLED'))\n",
+        "signal.setitimer(signal.ITIMER_REAL,1.0)\n",
+        "print(open(sys.argv[1]).read(),end='')\n",
+    );
+    let mut run = start_ask_run(
+        "[\"read\"]",
+        &["/usr/bin/python3", "-c", script, "{secret}"],
+        &[],
+    );
+
+    run.driver
+        .read_until("allow? [y/N]", Duration::from_secs(10));
+    // let the alarm fire while the ask is still pending
+    std::thread::sleep(Duration::from_millis(2000));
+    run.driver.answer("y\n");
+    let status = wait_or_dump(&mut run);
+    run.driver.drain();
+    let output = run.driver.text();
+
+    assert!(status.success(), "approved run must exit 0: {output}");
+    assert_eq!(
+        output.matches("allow? [y/N]").count(),
+        1,
+        "a cancelled notification would re-trap and prompt again: {output}"
+    );
+    assert_eq!(
+        output.matches(SECRET_CONTENT).count(),
+        1,
+        "the held open completes exactly once: {output}"
+    );
+    assert!(
+        output.contains("ALARM_HANDLED"),
+        "the caught handler still runs, after the syscall completes: {output}"
     );
 
     let events = secret_events(&only_run_dir(run.state.path()));

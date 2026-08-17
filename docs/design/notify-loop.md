@@ -4,7 +4,7 @@
 - Governs: the protocol the supervisor runs on the seccomp notification fd, how it reads child
   memory safely, and how every error path resolves to deny.
 - Cites: FR-2, FR-3, FR-9, FR-10, FR-20; NFR-1, NFR-6; SR-2, SR-3; ADR-0002, ADR-0010, ADR-0011,
-  ADR-0012, ADR-0019.
+  ADR-0012, ADR-0019, ADR-0021.
   Invariants I2, I3, I4, I5 are defined in [`architecture.md`](architecture.md).
 
 This is the state machine that turns one `seccomp_notif` into one **decision** and one **event**. It
@@ -94,11 +94,11 @@ path: an unrecordable allow is not an allow.
 
 ## 4. Fail-closed enumeration
 
-Every way the loop can fail, and how each resolves to deny (FR-9, NFR-1, I3). The enumeration is
-finite and checkable precisely because the loop is single-threaded (ADR-0011); each arc is listed
-with the escape or fault test that proves it in [`escapes.md`](escapes.md) (I5). A deny is a decision
-and is written as an event (FR-2); a dropped notification (case B, case I) made no decision and its
-syscall never took effect, so it records none.
+Every failure path that the loop claims to handle fail-closed, and how each prevents an unapproved action (FR-9, NFR-1, I3).
+The enumeration is finite and checkable precisely because the loop is single-threaded (ADR-0011); each arc is listed with the escape or fault test that proves it in [`escapes.md`](escapes.md) (I5).
+A deny is a decision and is written as an event (FR-2).
+Only a notification dropped before any decision or realized effect records no event, because its syscall never took effect.
+The post-`SEND` reply-loss race accepted by [ADR-0021](../adr/0021-accept-wait-killable-recv-post-send-race.md) is explicitly outside this fail-closed claim: the decision, event, and supervisor side effect already exist, but an unfixed kernel may discard the reply and restart the syscall.
 
 | # | Fault | Resolution | Why it does not fail open |
 |---|---|---|---|
@@ -110,7 +110,7 @@ syscall never took effect, so it records none.
 | F | an **ask** reaches its timeout (FR-10), or the run is unattended (FR-20) | deny | timeout-to-deny and unattended-to-deny are the specified behaviors |
 | G | the supervisor process crashes or is killed | the kernel closes the notification fd; every pending and subsequent mediated syscall in the child fails (documented as `-ENOSYS` for the no-listener case) and none executes | the boundary holds by the action not taking effect; fail-closed is enforced by the kernel, not by supervisor code that is no longer running |
 | H | the decision thread hangs on a non-ask step | prevented: every non-ask step is bounded (section 1); the only unbounded wait is the ask, which has a timeout (case F) | there is no unbounded blocking point outside the ask |
-| I | a non-fatal signal to the child cancels a received notification, restarting the syscall | prevented by `WAIT_KILLABLE_RECV` (section 4.1); only a fatal signal cancels, and a child being killed does not need its action completed | a supervisor-performed side effect cannot run twice, and no event is recorded for an action that then restarts |
+| I | a non-fatal signal to the child cancels a received notification before the supervisor's reply is delivered, restarting the syscall | prevented on the pre-`SEND` path by `WAIT_KILLABLE_RECV` (section 4.1); only a fatal signal cancels there, and a child being killed does not need its action completed | pre-`SEND` cancellation cannot duplicate a supervisor-performed side effect; the distinct post-`SEND` reply-loss race on unfixed kernels is an accepted residual ([ADR-0021](../adr/0021-accept-wait-killable-recv-post-send-race.md)) |
 
 ### 4.1 Signal cancellation and double execution
 
@@ -128,6 +128,15 @@ notification will not be cancelled by an ordinary signal, so the perform-then-`S
 completes; the only interruption left is a fatal signal, in which case the child is being killed and
 its syscall correctly does not complete (case B). This is why the kernel floor is 5.19: the
 supervisor-executed allow is unsound below the kernel that provides this flag.
+
+Two qualifications, both earned the hard way (issue #36,
+[`../measurements/0002-wait-killable-recv-signals.md`](../measurements/0002-wait-killable-recv-signals.md)).
+First, this paragraph described the intended semantics for months while the code passed the wrong flag bit (`TSYNC_ESRCH` instead of `WAIT_KILLABLE_RECV`), so the protection was silently absent and a caught signal cancelled received notifications exactly as the unprotected path describes.
+The preflight probe could not catch that: it validates that the kernel accepts a flag mask, not that the semantics hold.
+The semantics are now pinned behaviorally by `tests/wait_killable_recv_linux.rs`, which signals the trapped thread itself before and after `RECV` and checks `ID_VALID`, `SEND`, and the child's exit status.
+Second, even with the correct flag, kernels before the upstream fix `cce436aafc2a` ("seccomp: Fix a race with `WAIT_KILLABLE_RECV` if the tracer replies too fast", merged 2025-07-25, first released after 6.17) keep a narrow residual race: if the signal wakes the tracee and the supervisor's `SEND` lands before the tracee re-acquires the notification lock, the tracee discards the delivered reply and restarts the syscall anyway.
+The window is the few microseconds between the wake and the lock, and the consequence is the double-execution case this section exists to prevent, so on unfixed kernels a supervisor-performed side effect can still run twice, rarely.
+Leash cannot close that race from userspace; the floor stays 5.19 and [ADR-0021](../adr/0021-accept-wait-killable-recv-post-send-race.md) accepts the residual risk rather than claiming it away.
 
 Case G is the backstop under all the others and is the reason a supervisor bug cannot fail open: even
 an outright crash degrades to the kernel denying the child's next mediated syscall. It carries one

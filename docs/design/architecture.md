@@ -3,7 +3,7 @@
 - Status: settled (design layer frozen 2026-07-08)
 - Governs: how the supervisor is structured and how it brings a run into being.
 - Cites: FR-1, FR-3, FR-8, FR-9, FR-14, FR-15; SR-1, SR-3; ADR-0002, ADR-0003, ADR-0006, ADR-0007,
-  ADR-0011, ADR-0019.
+  ADR-0011, ADR-0019, ADR-0021.
 
 This is the entry point to the design. It fixes the process and trust model, the invariants every
 other design file cites, the module decomposition, and the supervisor lifecycle from preflight to
@@ -163,9 +163,11 @@ stated reason.
    layer over the workspace (or selects the copy fallback). (FR-21, ADR-0009.)
 2. Supervisor creates a socketpair for the notify-fd handoff, then forks the child.
 3. Child installs the seccomp filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER` and
-   `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (so a non-fatal signal cannot cancel a received
-   notification and let a supervisor-performed action double-execute, ADR-0012), which returns the
-   notification fd, and sets `no_new_privs`. The filter survives `execve` regardless; `no_new_privs`
+   `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`, which prevents a non-fatal signal from cancelling a
+   received notification before `SEND` (ADR-0012). On kernels without upstream fix `cce436aafc2a`,
+   the accepted post-`SEND` reply-loss race can still restart and double-execute a
+   supervisor-performed action (ADR-0021). Filter installation returns the notification fd, and the
+   child sets `no_new_privs`. The filter survives `execve` regardless; `no_new_privs`
    is what lets an unprivileged supervisor install the filter and makes it bind across a setuid
    `execve` so the agent cannot shed it.
 4. Child sends the notification fd to the supervisor over the socketpair using `SCM_RIGHTS`, then

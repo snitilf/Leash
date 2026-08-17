@@ -21,8 +21,11 @@ pub(crate) const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 pub(crate) const SECCOMP_GET_NOTIF_SIZES: libc::c_uint = 3;
 #[cfg(target_os = "linux")]
 pub(crate) const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
+// bit 5, not bit 4: bit 4 is SECCOMP_FILTER_FLAG_TSYNC_ESRCH. passing 1 << 4 installs
+// cleanly (the kernel accepts the mask) but silently leaves every wait interruptible,
+// so a caught signal cancels a received notification (issue #36).
 #[cfg(target_os = "linux")]
-pub(crate) const SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: libc::c_ulong = 1 << 4;
+pub(crate) const SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: libc::c_ulong = 1 << 5;
 
 /// response flag: let the kernel execute the trapped syscall (allow). safe only for
 /// decisions made on the syscall number or scalar arguments (syscalls.md section 4).
