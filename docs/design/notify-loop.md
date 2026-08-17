@@ -129,6 +129,15 @@ completes; the only interruption left is a fatal signal, in which case the child
 its syscall correctly does not complete (case B). This is why the kernel floor is 5.19: the
 supervisor-executed allow is unsound below the kernel that provides this flag.
 
+Two qualifications, both earned the hard way (issue #36,
+[`../measurements/0002-wait-killable-recv-signals.md`](../measurements/0002-wait-killable-recv-signals.md)).
+First, this paragraph described the intended semantics for months while the code passed the wrong flag bit (`TSYNC_ESRCH` instead of `WAIT_KILLABLE_RECV`), so the protection was silently absent and a caught signal cancelled received notifications exactly as the unprotected path describes.
+The preflight probe could not catch that: it validates that the kernel accepts a flag mask, not that the semantics hold.
+The semantics are now pinned behaviorally by `tests/wait_killable_recv_linux.rs`, which signals the trapped thread itself before and after `RECV` and checks `ID_VALID`, `SEND`, and the child's exit status.
+Second, even with the correct flag, kernels before the upstream fix `cce436aafc2a` ("seccomp: Fix a race with `WAIT_KILLABLE_RECV` if the tracer replies too fast", merged 2025-07-25, first released after 6.17) keep a narrow residual race: if the signal wakes the tracee and the supervisor's `SEND` lands before the tracee re-acquires the notification lock, the tracee discards the delivered reply and restarts the syscall anyway.
+The window is the few microseconds between the wake and the lock, and the consequence is the double-execution case this section exists to prevent, so on unfixed kernels a supervisor-performed side effect can still run twice, rarely.
+Leash cannot close that race from userspace; the floor stays 5.19 and the residual risk is recorded here rather than claimed away.
+
 Case G is the backstop under all the others and is the reason a supervisor bug cannot fail open: even
 an outright crash degrades to the kernel denying the child's next mediated syscall. It carries one
 subtlety to test, not assume (NFR-5): `-ENOSYS` must not let the child fall through to an
