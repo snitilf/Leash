@@ -14,6 +14,8 @@ Leash inspects the arguments and answers allow or deny; Landlock is a kernel-enf
 underneath. Measured cost: about 31 to 34 microseconds added per trapped file syscall at p50, on a
 2 vCPU Ubuntu 24.04 VM ([measurement 0001](docs/measurements/0001-m1-overhead.md)).
 
+![Leash denying a read of ~/.ssh and holding a .env write for approval](docs/assets/demo.gif)
+
 The design has three capabilities:
 
 - **Record.** A complete, append-only trace of what the agent actually did: ground truth, not
@@ -34,19 +36,53 @@ integration, nothing the supervised process can reason around.
   "not implemented yet".
 - Platform: Linux 5.19 or later on x86-64 only. CI runs on Ubuntu 24.04.
 
-## Build
+## Quickstart
 
-Requires a Rust toolchain and Linux 5.19 or later on x86-64 to run.
+Requires a Rust toolchain to build, and Linux 5.19 or later on x86-64 to run. The repo ships a
+dev container (`.devcontainer/`) with the capabilities seccomp and Landlock need.
 
 ```
 cargo build --release
+export PATH="$PWD/target/release:$PATH"
+leash --help
 ```
 
-The binary is `target/release/leash`. Usage:
+Without a policy, a run is record-only: everything is allowed and written to the trace.
 
 ```
-leash run [--policy <path>] -- <command...>
+$ leash run -- sh -c 'cat /etc/hostname'
+leash: record-only run; no policy is enforced, and only un-mediated I/O paths (SR-4), foreign-ABI entries (SR-3), and undecodable facts are denied
+codespaces-77710d
+leash: run 20261123T234345Z-rdzo2f recorded; report: /home/vscode/.local/state/leash/runs/20261123T234345Z-rdzo2f/report.txt
 ```
+
+With [`examples/policy.toml`](examples/policy.toml), reads under `~/.ssh` are denied and writing
+`.env` in the workspace needs a yes from the terminal:
+
+```
+$ leash run --policy examples/policy.toml -- sh -c 'cat ~/.ssh/id_demo'
+leash: enforce run
+cat: /home/vscode/.ssh/id_demo: Permission denied
+
+$ leash run --policy examples/policy.toml -- sh -c 'echo API_KEY=demo > .env; cat .env'
+leash: enforce run
+leash: the agent asks for:
+  write /tmp/ws/.env (rule fs.3)
+  create /tmp/ws/.env (rule fs.3)
+allow? [y/N] (denies in 60s): y
+API_KEY=demo
+```
+
+Each run directory holds `meta.json`, the append-only `trace.jsonl`, and a `report.txt`. The two
+decisions above, as recorded in the trace:
+
+```
+{"seq":36,"ts":1795477425883,"type":"syscall","pid":4692,"syscall":"openat","fact":{"family":"fs","path":"/home/vscode/.ssh/id_demo","access":["read"]},"decision":"deny","matched_rule":"fs.1"}
+{"seq":4,"ts":1795477425911,"type":"syscall","pid":4705,"syscall":"openat","fact":{"family":"fs","path":"/tmp/ws/.env","access":["write","create"]},"decision":"ask","ask_resolution":"approved","matched_rule":"fs.3"}
+```
+
+The output above is captured from real runs on Ubuntu 24.04 (kernel 6.8), lightly trimmed. The
+policy format is specified in [docs/design/policy.md](docs/design/policy.md).
 
 ## Known limitations
 
