@@ -36,14 +36,25 @@ pub enum Command {
     Help,
     /// `leash --version` or `leash -V`: print the version to stdout, exit 0
     Version,
+    /// list or explicitly prune recorded runs
+    Runs(RunsArgs),
     /// a reserved subcommand name that parses correctly but has no implementation yet
     NotImplemented {
-        /// the subcommand name, e.g. "rewind"
+        /// the subcommand name, e.g. "diff"
         name: &'static str,
         /// the stable message printed to stderr; names the milestone or requirement, never
         /// a fabricated issue number
         message: &'static str,
     },
+}
+
+/// arguments of `leash runs` (FR-21).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunsArgs {
+    /// explicit ids to delete, or none to list
+    pub prune: Option<Vec<String>>,
+    /// state directory override
+    pub state_dir: Option<PathBuf>,
 }
 
 /// a malformed command line (docs/design/cli.md section 1). every variant exits 2 and prints
@@ -84,6 +95,12 @@ pub enum UsageError {
     /// `--ask-timeout` is not a whole number of seconds in 1..=3600
     #[error("leash: '--ask-timeout' must be a whole number of seconds in 1..=3600")]
     InvalidAskTimeoutValue,
+    /// prune requires at least one run id
+    #[error("leash: 'runs prune' requires at least one run id")]
+    MissingPruneRunId,
+    /// a positional argument `runs` does not accept
+    #[error("leash: unexpected argument '{0}'")]
+    UnexpectedArgument(String),
 }
 
 /// the text printed by `--help` (docs/design/cli.md section 1).
@@ -101,7 +118,9 @@ run flags:
 
 everything after '--' is the command and is passed through verbatim.
 
-reserved subcommands, not implemented yet: diff, rewind, runs
+  leash runs [--state-dir <dir>]   list recorded runs
+
+reserved subcommands, not implemented yet: diff, rewind, runs prune
 
 options:
   -h, --help                print this help and exit
@@ -147,12 +166,50 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             name: "rewind",
             message: "leash: 'rewind' is not implemented yet (planned: time-travel milestone M3)",
         }),
-        "runs" => Ok(Command::NotImplemented {
-            name: "runs",
-            message: "leash: 'runs' is not implemented yet (planned: FR-21 run management)",
-        }),
+        "runs" => parse_runs(&args[1..]).map(Command::Runs),
         other => Err(UsageError::UnknownSubcommand(other.to_string())),
     }
+}
+
+fn parse_runs(rest: &[String]) -> Result<RunsArgs, UsageError> {
+    let mut state_dir = None;
+    let mut prune = None;
+    let mut i = 0;
+    while i < rest.len() {
+        let token = &rest[i];
+        if token == "--state-dir" || token.starts_with("--state-dir=") {
+            if state_dir.is_some() {
+                return Err(UsageError::DuplicateFlag("--state-dir"));
+            }
+            let value = if token == "--state-dir" {
+                i += 1;
+                rest.get(i)
+                    .filter(|v| !v.is_empty() && !v.starts_with('-'))
+                    .ok_or(UsageError::MissingStateDirValue)?
+                    .as_str()
+            } else {
+                let value = &token["--state-dir=".len()..];
+                if value.is_empty() {
+                    return Err(UsageError::MissingStateDirValue);
+                }
+                value
+            };
+            state_dir = Some(PathBuf::from(value));
+        } else if token.starts_with('-') {
+            return Err(UsageError::UnknownFlag(token.clone()));
+        } else if token == "prune" && prune.is_none() && i == 0 {
+            prune = Some(Vec::new());
+        } else if let Some(ids) = &mut prune {
+            ids.push(token.clone());
+        } else {
+            return Err(UsageError::UnexpectedArgument(token.clone()));
+        }
+        i += 1;
+    }
+    if matches!(&prune, Some(ids) if ids.is_empty()) {
+        return Err(UsageError::MissingPruneRunId);
+    }
+    Ok(RunsArgs { prune, state_dir })
 }
 
 /// parse the tokens after `run`.
@@ -387,6 +444,7 @@ pub fn run() -> ExitCode {
             println!("{}", version_line());
             return ExitCode::SUCCESS;
         }
+        Command::Runs(args) => return dispatch_runs(args),
         Command::NotImplemented { message, .. } => {
             eprintln!("{message}");
             return ExitCode::from(EXIT_USAGE);
@@ -462,6 +520,63 @@ pub fn run() -> ExitCode {
             .map(std::time::Duration::from_secs)
             .unwrap_or(crate::supervisor::run::DEFAULT_ASK_TIMEOUT),
     })
+}
+
+fn dispatch_runs(args: RunsArgs) -> ExitCode {
+    let state_root = match args.state_dir.or_else(|| {
+        let xdg = std::env::var("XDG_STATE_HOME").ok();
+        let home = std::env::var("HOME").ok();
+        crate::recorder::default_state_root(xdg.as_deref(), home.as_deref())
+    }) {
+        Some(root) => root,
+        None => {
+            eprintln!("leash: no state directory: set XDG_STATE_HOME or HOME, or pass --state-dir");
+            return ExitCode::from(EXIT_SUPERVISOR_FAILURE);
+        }
+    };
+    if let Some(ids) = args.prune {
+        return match crate::runs::prune(&state_root, &ids) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("leash: cannot prune runs: {e}");
+                ExitCode::from(EXIT_SUPERVISOR_FAILURE)
+            }
+        };
+    }
+    match crate::runs::list(&state_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let id = entry.display_id();
+                match entry.details {
+                    Ok(details) => {
+                        let mode = match details.meta.mode {
+                            crate::recorder::Mode::RecordOnly => "record-only",
+                            crate::recorder::Mode::Enforce => "enforce",
+                        };
+                        let exit = match details.exit {
+                            Some(crate::runs::RunExit::Code(code)) => format!("exit {code}"),
+                            Some(crate::runs::RunExit::Signal(signal)) => {
+                                format!("signal {signal}")
+                            }
+                            None => "incomplete (no run_end)".to_string(),
+                        };
+                        println!(
+                            "{}\t{}\t{}\t{:?}\t{}",
+                            id, mode, details.meta.start_ts, details.meta.argv, exit
+                        );
+                    }
+                    Err(e) => {
+                        println!("{id}\tcorrupt or incomplete: {e}")
+                    }
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("leash: cannot list runs: {e}");
+            ExitCode::from(EXIT_SUPERVISOR_FAILURE)
+        }
+    }
 }
 
 /// run the session and map its outcome to the shell (cli.md section 6): the child's own
@@ -952,18 +1067,64 @@ mod tests {
     }
 
     #[test]
-    fn parse_runs_is_not_implemented() {
-        let cmd = parse(&args(&["runs"])).unwrap();
-        match cmd {
-            Command::NotImplemented { name, message } => {
-                assert_eq!(name, "runs");
-                assert_eq!(
-                    message,
-                    "leash: 'runs' is not implemented yet (planned: FR-21 run management)"
-                );
-            }
-            other => panic!("expected NotImplemented, got {other:?}"),
-        }
+    fn parse_runs_list_and_prune() {
+        assert_eq!(
+            parse(&args(&["runs"])).unwrap(),
+            Command::Runs(RunsArgs {
+                prune: None,
+                state_dir: None
+            })
+        );
+        assert_eq!(
+            parse(&args(&["runs", "--state-dir=/tmp/state"])).unwrap(),
+            Command::Runs(RunsArgs {
+                prune: None,
+                state_dir: Some("/tmp/state".into())
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "runs",
+                "prune",
+                "a",
+                "b",
+                "--state-dir",
+                "/tmp/state"
+            ]))
+            .unwrap(),
+            Command::Runs(RunsArgs {
+                prune: Some(args(&["a", "b"])),
+                state_dir: Some("/tmp/state".into())
+            })
+        );
+    }
+
+    #[test]
+    fn parse_runs_rejects_bad_arguments() {
+        assert_eq!(
+            parse(&args(&["runs", "prune"])),
+            Err(UsageError::MissingPruneRunId)
+        );
+        assert_eq!(
+            parse(&args(&["runs", "--state-dir"])),
+            Err(UsageError::MissingStateDirValue)
+        );
+        assert_eq!(
+            parse(&args(&["runs", "--state-dir="])),
+            Err(UsageError::MissingStateDirValue)
+        );
+        assert_eq!(
+            parse(&args(&["runs", "--state-dir=a", "--state-dir=b"])),
+            Err(UsageError::DuplicateFlag("--state-dir"))
+        );
+        assert_eq!(
+            parse(&args(&["runs", "unexpected"])),
+            Err(UsageError::UnexpectedArgument("unexpected".into()))
+        );
+        assert_eq!(
+            parse(&args(&["runs", "--bogus"])),
+            Err(UsageError::UnknownFlag("--bogus".into()))
+        );
     }
 
     // --- attendance ---

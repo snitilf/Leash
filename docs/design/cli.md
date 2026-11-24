@@ -14,7 +14,7 @@ is announced and torn down, and what the shell sees when it finishes. Terms in *
 
 ## 1. Command surface
 
-The one implemented subcommand is `run`:
+The `run` command starts a supervised run:
 
 ```
 leash run [--unattended] [--state-dir <dir>] [--policy <path>] [--ask-timeout <seconds>] -- <command...>
@@ -43,7 +43,7 @@ normative set:
 |---|---|
 | no subcommand | `leash` invoked with no arguments, or a bare option before any subcommand other than `--help`/`-h` and `--version`/`-V` |
 | top-level option with extra arguments | `--help`, `-h`, `--version`, or `-V` followed by any further argument |
-| unknown subcommand or flag | a subcommand that is not `run` (and not a reserved name below), or a flag `run` does not accept |
+| unknown subcommand or flag | a subcommand that is not `run` or `runs` (and not a reserved name below), or a flag `run` does not accept |
 | `run` without `--` | `run` invoked with no `--` separator |
 | empty command after `--` | `--` present but nothing follows it |
 | a flag given twice | `--unattended`, `--state-dir`, `--policy`, or `--ask-timeout` repeated |
@@ -52,12 +52,25 @@ normative set:
 | `--ask-timeout` missing its value | `--ask-timeout` is immediately followed by `--`, or is given as `--ask-timeout=` |
 | `--ask-timeout` invalid | the value is not a whole number of seconds in 1..=3600 |
 
-Reserved subcommands parse but are not implemented in this slice. `diff` and `rewind` are the M3
-time-travel milestone (FR-12, FR-13); `runs` is the FR-21 listing and pruning subcommand. Each exits
-2 with a stable message that names where the work lives, for example
-`leash: 'rewind' is not implemented yet (planned: time-travel milestone M3)` and
-`leash: 'runs' is not implemented yet (planned: FR-21 run management)`. The message names the
-milestone or requirement, never a fabricated issue number.
+Run management uses explicit operator actions:
+
+```
+leash runs [--state-dir <dir>]
+leash runs prune <run-id>... [--state-dir <dir>]
+```
+
+`runs` lists each run directory with its id, mode, start time in Unix epoch milliseconds,
+command, and exit outcome. It reports corrupt or incomplete runs instead of skipping them.
+A missing runs directory produces an empty listing.
+The listing treats a run directory as untrusted input: it never follows a symlinked run directory or file, reads only regular files, never blocks on a fifo, and refuses a `meta.json` over 64 KiB or a `trace.jsonl` over 256 MiB, listing that run as corrupt instead.
+A run id that is not printable ASCII is printed escaped. `runs prune` requires at least one run id
+and is currently unavailable: it exits with an error without deleting data until deletion
+can safely bind to the selected directories under concurrent changes. No retention operation
+runs automatically. The state directory accepts the same space and equals forms as `run`; unknown flags,
+missing values, duplicate flags, and unexpected positional arguments are usage errors.
+
+Reserved subcommands `diff` and `rewind` parse but are not implemented in this slice. They
+exit 2 with a stable message naming the time-travel milestone (FR-12, FR-13).
 
 ## 2. Mode selection
 

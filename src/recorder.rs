@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // the human-readable session report, derived from the trace (trace.md section 6).
 pub mod report;
@@ -42,7 +42,7 @@ pub enum RecorderError {
 }
 
 /// the run mode (ADR-0010), stamped into the trace and named in the report (FR-19).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     /// camera: everything allowed and recorded, would-denies flagged
@@ -52,7 +52,7 @@ pub enum Mode {
 }
 
 /// whether an operator is present to answer asks (FR-20); stamped into the trace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Attendance {
     /// a controlling terminal is present; asks prompt
@@ -62,7 +62,7 @@ pub enum Attendance {
 }
 
 /// the snapshot mechanism preflight selected (ADR-0009), stamped with its reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotMechanism {
     /// overlayfs write layer
@@ -72,8 +72,9 @@ pub enum SnapshotMechanism {
 }
 
 /// run-start facts, written to `meta.json` and repeated in the `run_start` event so the
-/// stream is self-contained (trace.md sections 1-2).
-#[derive(Debug, Clone, Serialize)]
+/// stream is self-contained (trace.md sections 1-2). rewind reads this back, so it
+/// deserializes too.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunMeta {
     /// trace schema version (TRACE_SCHEMA_VERSION)
     pub schema_version: u32,
