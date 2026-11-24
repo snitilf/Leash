@@ -109,6 +109,9 @@ pub mod nr {
     pub const IO_URING_SETUP: u32 = 425;
     pub const IO_URING_ENTER: u32 = 426;
     pub const IO_URING_REGISTER: u32 = 427;
+    // section 6: snapshot runs only
+    pub const IO_SETUP: u32 = 206;
+    pub const IO_SUBMIT: u32 = 209;
 }
 
 /// the mediated set (syscalls.md sections 3.1-3.5): trapped, decided by policy.
@@ -158,6 +161,19 @@ pub const DENIED_RECORDED: &[u32] = &[
     nr::IO_URING_REGISTER,
 ];
 
+/// legacy AIO calls trapped only in a snapshot run (ADR-0024 decision 8): without
+/// `io_setup` no context exists, and `io_submit` is the call that would queue I/O, so
+/// trapping both leaves nothing that can submit. `io_getevents`, `io_pgetevents`,
+/// `io_cancel` and `io_destroy` need a context and so fail by themselves with `EINVAL`.
+/// these are routed to the notif return only when `build_filter_with(true)` asks, so a
+/// run without snapshots keeps today's filter and trace byte for byte.
+pub const SNAPSHOT_TRAPPED: &[u32] = &[nr::IO_SETUP, nr::IO_SUBMIT];
+
+/// build the filter program for a run without snapshot integrity restrictions.
+pub fn build_filter() -> Vec<SockFilter> {
+    build_filter_with(false)
+}
+
 /// build the filter program. every tabled syscall, every x32-bit number, and every
 /// foreign-arch entry routes to the notif return, except connected-socket `sendto` calls
 /// whose destination pointer is null; everything else passes through.
@@ -167,8 +183,18 @@ pub const DENIED_RECORDED: &[u32] = &[
 /// return. `sendto` branches through two 32-bit loads to test its 64-bit destination
 /// pointer. with two tables of ~40 numbers every jump offset stays far below the u8 bound,
 /// which `filter_is_well_formed` pins.
-pub fn build_filter() -> Vec<SockFilter> {
-    let tabled: Vec<u32> = MEDIATED.iter().chain(DENIED_RECORDED).copied().collect();
+pub fn build_filter_with(snapshot_integrity: bool) -> Vec<SockFilter> {
+    let snapshot_extra: &[u32] = if snapshot_integrity {
+        SNAPSHOT_TRAPPED
+    } else {
+        &[]
+    };
+    let tabled: Vec<u32> = MEDIATED
+        .iter()
+        .chain(DENIED_RECORDED)
+        .chain(snapshot_extra)
+        .copied()
+        .collect();
     // ld arch + jeq, ld nr + jset, one jeq per number, four extra sendto
     // destination-pointer instructions, ret allow, ret notif
     let len = 4 + tabled.len() + 4 + 2;
@@ -178,7 +204,9 @@ pub fn build_filter() -> Vec<SockFilter> {
 
     // the largest jump is from pc 1 to the notif return, an offset of table length + 3;
     // the compile-time check below keeps it inside the u8 jump field as the tables grow.
-    const _: () = assert!(MEDIATED.len() + DENIED_RECORDED.len() + 7 <= u8::MAX as usize);
+    const _: () = assert!(
+        MEDIATED.len() + DENIED_RECORDED.len() + SNAPSHOT_TRAPPED.len() + 7 <= u8::MAX as usize
+    );
     let jump_to_notif = |from_pc: usize| -> u8 { (notif_pc - from_pc - 1) as u8 };
     let jump_to_allow = |from_pc: usize| -> u8 { (allow_pc - from_pc - 1) as u8 };
 
@@ -345,6 +373,23 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_filter_traps_aio_and_the_default_filter_does_not() {
+        for &nr in SNAPSHOT_TRAPPED {
+            assert_eq!(
+                run_x86_64(nr),
+                SECCOMP_RET_ALLOW,
+                "default filter passes {nr}"
+            );
+            assert_eq!(
+                run(&build_filter_with(true), nr, AUDIT_ARCH_X86_64, [0; 6]).unwrap(),
+                SECCOMP_RET_USER_NOTIF,
+                "snapshot filter traps {nr}"
+            );
+        }
+        assert_eq!(build_filter(), build_filter_with(false));
+    }
+
+    #[test]
     fn filter_only_bypasses_sendto_with_a_null_destination() {
         assert_eq!(run_x86_64(nr::SENDTO), SECCOMP_RET_ALLOW);
 
@@ -470,8 +515,13 @@ mod tests {
             (nr::IO_URING_SETUP, libc::SYS_io_uring_setup),
             (nr::IO_URING_ENTER, libc::SYS_io_uring_enter),
             (nr::IO_URING_REGISTER, libc::SYS_io_uring_register),
+            (nr::IO_SETUP, libc::SYS_io_setup),
+            (nr::IO_SUBMIT, libc::SYS_io_submit),
         ];
-        assert_eq!(pairs.len(), MEDIATED.len() + DENIED_RECORDED.len());
+        assert_eq!(
+            pairs.len(),
+            MEDIATED.len() + DENIED_RECORDED.len() + SNAPSHOT_TRAPPED.len()
+        );
         for &(pinned, libc_nr) in pairs {
             assert_eq!(i64::from(pinned), libc_nr);
         }

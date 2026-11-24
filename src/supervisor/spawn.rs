@@ -20,7 +20,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::recorder::Mode;
 use crate::sandbox::child::{self, CHILD_BOUNDARY_READY, ChildSetup, SUPERVISOR_ACK, SockFprog};
-use crate::sandbox::filter::{SockFilter, build_filter};
+use crate::sandbox::filter::{SockFilter, build_filter_with};
 use crate::supervisor::notify::NotifyFd;
 
 /// what to launch and how.
@@ -80,7 +80,16 @@ pub enum SpawnError {
 
 /// launch `spec` under the seccomp filter and return the supervised child.
 pub fn spawn_supervised(spec: &SpawnSpec) -> Result<SupervisedChild, SpawnError> {
-    let filter = build_filter();
+    spawn_supervised_with(spec, false)
+}
+
+/// the same as `spawn_supervised`, with the snapshot-run filter (legacy AIO trapped,
+/// ADR-0024 decision 8) when `snapshot_integrity` is set.
+pub fn spawn_supervised_with(
+    spec: &SpawnSpec,
+    snapshot_integrity: bool,
+) -> Result<SupervisedChild, SpawnError> {
+    let filter = build_filter_with(snapshot_integrity);
     spawn_with_filter(spec, &filter)
 }
 
