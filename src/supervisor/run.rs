@@ -954,6 +954,8 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
         primary_decision.effective
     };
 
+    let injected_path = fact_path.clone();
+    let injected_dest = fact_dest.clone();
     record_with_operands(
         writer,
         ts,
@@ -1011,7 +1013,25 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
                 .commit_mutation(primary, secondary, operation)?
         }
     };
-    respond_broker_result(kernel, notif.id, result, close_on_exec)?;
+    if let Some(errno) = respond_broker_result(kernel, notif.id, result, close_on_exec)? {
+        // the allow was recorded before the kernel refused to install the descriptor. the
+        // syscall failed, so the trace gets the failure the agent saw, and nothing mutated
+        record_event(
+            writer,
+            ts,
+            notif,
+            shape.name,
+            Fact::Fs {
+                path: injected_path,
+                access,
+                dest: injected_dest,
+            },
+            &fixed_decision(Decision::Deny, rule::REALIZATION),
+            None,
+            Some(crate::recorder::errno_name(errno)),
+        )?;
+        return Ok(Handled::Responded);
+    }
     Ok(mutation_handled(decision.response_decision, &access))
 }
 
@@ -1198,23 +1218,37 @@ fn record_realization_deny<N: Notifier, S: TraceSink>(
     Ok(Handled::Responded)
 }
 
+/// answer a trapped syscall with the broker's result. returns the errno the agent received
+/// when the kernel refused to install an injected descriptor (the notification is then
+/// answered with that errno or EIO and the loop goes on), or `None` when the result was
+/// delivered. only a failure of the notify fd itself is an error: it surfaces from the
+/// error response, which the same fd would also fail to carry.
 #[cfg(target_os = "linux")]
 fn respond_broker_result<N: Notifier>(
     kernel: &N,
     id: u64,
     result: BrokerResult,
     newfd_flags: u32,
-) -> Result<(), RunError> {
+) -> Result<Option<i32>, RunError> {
     match result {
-        BrokerResult::Value(value) => tolerate_dead(kernel.send_success(id, value)),
+        BrokerResult::Value(value) => tolerate_dead(kernel.send_success(id, value)).map(|()| None),
         BrokerResult::Fd(fd) => {
             match kernel.send_addfd(id, fd.as_fd(), SECCOMP_ADDFD_FLAG_SEND, newfd_flags) {
-                Ok(_) => Ok(()),
-                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-                Err(error) => Err(RunError::Notify(error)),
+                Ok(_) => Ok(None),
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+                Err(error) => {
+                    // the agent's own limits are errnos it can act on; any other refusal is
+                    // an internal failure of this one injection
+                    let errno = match error.raw_os_error() {
+                        Some(errno @ (libc::EMFILE | libc::ENFILE | libc::ENOMEM)) => errno,
+                        _ => libc::EIO,
+                    };
+                    tolerate_dead(kernel.send_error(id, errno))?;
+                    Ok(Some(errno))
+                }
             }
         }
-        BrokerResult::Errno(errno) => tolerate_dead(kernel.send_error(id, errno)),
+        BrokerResult::Errno(errno) => tolerate_dead(kernel.send_error(id, errno)).map(|()| None),
     }
 }
 
@@ -2039,7 +2073,8 @@ mod tests {
         // answers consumed per id_valid call; empty means "always valid"
         id_valid_script: RefCell<Vec<bool>>,
         sent: RefCell<Vec<String>>,
-        send_errno: Option<i32>, // error every send with this errno
+        send_errno: Option<i32>,  // error every send with this errno
+        addfd_errno: Option<i32>, // refuse every ADDFD with this errno
     }
 
     impl FakeNotifier {
@@ -2092,6 +2127,9 @@ mod tests {
             flags: u32,
             newfd_flags: u32,
         ) -> io::Result<i32> {
+            if let Some(errno) = self.addfd_errno {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
             self.sent
                 .borrow_mut()
                 .push(format!("addfd:{id}:{flags}:{newfd_flags}"));
@@ -2473,6 +2511,80 @@ mod tests {
                 format!("error:7:{}", libc::ENOSYS),
                 format!("error:7:{}", libc::ENOSYS)
             ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn a_descriptor() -> BrokerResult {
+        BrokerResult::Fd(OwnedFd::from(std::fs::File::open("/dev/null").unwrap()))
+    }
+
+    /// issue #53: the kernel refusing one ADDFD fails that syscall only. the agent gets an
+    /// error, the caller is told the errno to record, and the loop is not ended.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_addfd_fails_only_that_notification() {
+        for (refused, expected) in [
+            (libc::EBADF, libc::EIO),
+            (libc::EINVAL, libc::EIO),
+            (libc::EMFILE, libc::EMFILE),
+            (libc::ENFILE, libc::ENFILE),
+            (libc::ENOMEM, libc::ENOMEM),
+        ] {
+            let kernel = FakeNotifier {
+                addfd_errno: Some(refused),
+                ..FakeNotifier::default()
+            };
+            let delivered = respond_broker_result(&kernel, 7, a_descriptor(), 0).unwrap();
+            assert_eq!(delivered, Some(expected), "ADDFD errno {refused}");
+            assert_eq!(kernel.sent(), vec![format!("error:7:{expected}")]);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_addfd_for_a_dead_child_is_not_a_failure() {
+        let kernel = FakeNotifier {
+            addfd_errno: Some(libc::ENOENT),
+            ..FakeNotifier::default()
+        };
+        assert_eq!(
+            respond_broker_result(&kernel, 7, a_descriptor(), 0).unwrap(),
+            None
+        );
+        assert!(kernel.sent().is_empty());
+    }
+
+    /// only a dead notify fd ends the loop: when the error response cannot be sent either,
+    /// the failure is the listener's, not the one notification's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_addfd_on_a_broken_notify_fd_surfaces() {
+        let kernel = FakeNotifier {
+            addfd_errno: Some(libc::EBADF),
+            send_errno: Some(libc::EBADF),
+            ..FakeNotifier::default()
+        };
+        assert!(matches!(
+            respond_broker_result(&kernel, 7, a_descriptor(), 0),
+            Err(RunError::Notify(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_delivered_descriptor_reports_no_failure() {
+        let kernel = FakeNotifier::default();
+        assert_eq!(
+            respond_broker_result(&kernel, 7, a_descriptor(), libc::O_CLOEXEC as u32).unwrap(),
+            None
+        );
+        assert_eq!(
+            kernel.sent(),
+            vec![format!(
+                "addfd:7:{SECCOMP_ADDFD_FLAG_SEND}:{}",
+                libc::O_CLOEXEC
+            )]
         );
     }
 
