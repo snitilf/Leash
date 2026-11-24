@@ -194,6 +194,8 @@ mod linux {
     /// failure path returns without writing artifacts the run cannot vouch for.
     pub fn run_session(spec: SessionSpec) -> Result<SessionOutcome, SessionError> {
         refuse_snapshot_integrity_outside_enforce(&spec)?;
+        // first, before any run directory, broker or child exists (ADR-0024 decision 9)
+        set_non_dumpable()?;
         let caps = preflight::probe()?;
         let (caps, mechanism, mechanism_reason) = match preflight::evaluate(&caps, spec.mode) {
             Outcome::Proceed {
@@ -380,8 +382,6 @@ mod linux {
         writer.append(meta.start_ts, EventBody::RunStart(meta))?;
         writer.sync()?;
 
-        // before the broker forks and before the child exists (ADR-0024 decision 9)
-        set_non_dumpable()?;
         let broker = match mode {
             Mode::RecordOnly => None,
             Mode::Enforce => Some(RefCell::new(Broker::spawn(

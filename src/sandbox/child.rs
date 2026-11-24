@@ -92,14 +92,6 @@ pub unsafe fn enter(setup: &ChildSetup) -> ! {
         }
     }
 
-    // the supervisor marks itself non-dumpable before it forks (ADR-0024 decision 9) and
-    // the flag survives fork. the agent keeps the default: the supervisor reads this
-    // process's memory through /proc/<pid>/mem, which refuses a non-dumpable target.
-    // SAFETY: prctl with PR_SET_DUMPABLE takes scalar args and touches no memory.
-    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } != 0 {
-        die();
-    }
-
     // step 3: no_new_privs, then install the filter, which returns the notify fd.
     // SAFETY: prctl with PR_SET_NO_NEW_PRIVS takes scalar args and touches no memory.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
@@ -156,6 +148,17 @@ pub unsafe fn enter(setup: &ChildSetup) -> ! {
     // handshake socket is >= 3 and closed here; close_range needs no /proc walk.
     // SAFETY: close_range over [3, u32::MAX] with no flags closes the child's spare fds.
     unsafe { libc::syscall(libc::SYS_close_range, 3u32, libc::c_uint::MAX, 0) };
+    // the supervisor marks itself non-dumpable before it forks (ADR-0024 decision 9) and
+    // the flag survives fork, so until here this process is non-dumpable too. it is made
+    // dumpable only now, after close_range has dropped every supervisor descriptor, so no
+    // dumpable process ever holds one. the supervisor's first memory read is the execve
+    // notification, which fires after this point, and /proc/<pid>/mem refuses a
+    // non-dumpable target. nothing between the handshake and here reads this process.
+    // prctl is not in the filter, so it runs unmediated after the filter is installed.
+    // SAFETY: prctl with PR_SET_DUMPABLE takes scalar args and touches no memory.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } != 0 {
+        die();
+    }
     // SAFETY: exec_path and argv are nul-terminated buffers owned by the caller; on
     // success execv never returns, on failure it returns -1 and we _exit.
     unsafe { libc::execv(setup.exec_path, setup.argv) };
