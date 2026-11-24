@@ -1226,7 +1226,9 @@ fn enforce_survives_a_rename_whose_destination_cannot_be_prepared() {
         &[
             "/bin/sh",
             "-c",
-            "mv source.txt no-such-dir/destination.txt 2>/dev/null; exit 0",
+            // no `2>/dev/null`: this policy grants no write to /dev/null, and a redirect the
+            // shell cannot open fails the command before `mv` ever runs
+            "mv source.txt no-such-dir/destination.txt; exit 0",
         ],
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1266,28 +1268,8 @@ fn enforce_survives_a_rename_whose_destination_cannot_be_prepared() {
 /// have armed cannot be built. a record-only session needs no root and still runs.
 #[test]
 fn enforce_session_without_a_resolvable_state_root_refuses_before_spawn() {
-    use leash::recorder::{
-        Attendance, Mode, RunMeta, SnapshotMechanism, TRACE_SCHEMA_VERSION, TraceSink, TraceWriter,
-    };
+    use leash::recorder::{Attendance, Mode, RunMeta, SnapshotMechanism, TRACE_SCHEMA_VERSION};
     use leash::supervisor::session::{SessionError, SessionSpec, run_session_with_writer};
-    use std::io::{self as stdio, Write};
-
-    #[derive(Default)]
-    struct Bytes(Vec<u8>);
-    impl Write for Bytes {
-        fn write(&mut self, buf: &[u8]) -> stdio::Result<usize> {
-            self.0.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> stdio::Result<()> {
-            Ok(())
-        }
-    }
-    impl TraceSink for Bytes {
-        fn sync(&mut self) -> stdio::Result<()> {
-            Ok(())
-        }
-    }
 
     let ws = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -1326,9 +1308,12 @@ fn enforce_session_without_a_resolvable_state_root_refuses_before_spawn() {
             policy_path: None,
             ask_timeout: Duration::from_secs(60),
         };
-        let mut writer = TraceWriter::new(Bytes::default());
+        let mut writer = run_dir.trace_writer().unwrap();
         let result = run_session_with_writer(&spec, meta, &run_dir, &mut writer);
-        (result, writer.into_inner().0)
+        (
+            result,
+            std::fs::read(run_dir.path.join("trace.jsonl")).unwrap(),
+        )
     };
 
     let (result, written) = session(Mode::Enforce);
