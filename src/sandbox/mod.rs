@@ -14,4 +14,4 @@ pub mod landlock;
 #[cfg(target_os = "linux")]
 pub mod child;
 
-pub use filter::{SockFilter, build_filter};
+pub use filter::{SockFilter, build_filter, build_filter_with};

@@ -268,6 +268,8 @@ pub fn syscall_name(syscall_nr: u32) -> Option<&'static str> {
         nr::CONNECT => "connect",
         nr::SENDTO => "sendto",
         nr::BIND => "bind",
+        nr::IO_SETUP => "io_setup",
+        nr::IO_SUBMIT => "io_submit",
         nr::IO_URING_SETUP => "io_uring_setup",
         nr::IO_URING_ENTER => "io_uring_enter",
         nr::IO_URING_REGISTER => "io_uring_register",

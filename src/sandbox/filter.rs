@@ -109,6 +109,9 @@ pub mod nr {
     pub const IO_URING_SETUP: u32 = 425;
     pub const IO_URING_ENTER: u32 = 426;
     pub const IO_URING_REGISTER: u32 = 427;
+    // section 6: snapshot runs only
+    pub const IO_SETUP: u32 = 206;
+    pub const IO_SUBMIT: u32 = 209;
 }
 
 /// the mediated set (syscalls.md sections 3.1-3.5): trapped, decided by policy.
@@ -158,6 +161,19 @@ pub const DENIED_RECORDED: &[u32] = &[
     nr::IO_URING_REGISTER,
 ];
 
+/// legacy AIO calls trapped only in a snapshot run (ADR-0024 decision 8): without
+/// `io_setup` no context exists, and `io_submit` is the call that would queue I/O, so
+/// trapping both leaves nothing that can submit. `io_getevents`, `io_pgetevents`,
+/// `io_cancel` and `io_destroy` need a context and so fail by themselves with `EINVAL`.
+/// these are routed to the notif return only when `build_filter_with(true)` asks, so a
+/// run without snapshots keeps today's filter and trace byte for byte.
+pub const SNAPSHOT_TRAPPED: &[u32] = &[nr::IO_SETUP, nr::IO_SUBMIT];
+
+/// build the filter program for a run without snapshot integrity restrictions.
+pub fn build_filter() -> Vec<SockFilter> {
+    build_filter_with(false)
+}
+
 /// build the filter program. every tabled syscall, every x32-bit number, and every
 /// foreign-arch entry routes to the notif return, except connected-socket `sendto` calls
 /// whose destination pointer is null; everything else passes through.
@@ -167,8 +183,18 @@ pub const DENIED_RECORDED: &[u32] = &[
 /// return. `sendto` branches through two 32-bit loads to test its 64-bit destination
 /// pointer. with two tables of ~40 numbers every jump offset stays far below the u8 bound,
 /// which `filter_is_well_formed` pins.
-pub fn build_filter() -> Vec<SockFilter> {
-    let tabled: Vec<u32> = MEDIATED.iter().chain(DENIED_RECORDED).copied().collect();
+pub fn build_filter_with(snapshot_integrity: bool) -> Vec<SockFilter> {
+    let snapshot_extra: &[u32] = if snapshot_integrity {
+        SNAPSHOT_TRAPPED
+    } else {
+        &[]
+    };
+    let tabled: Vec<u32> = MEDIATED
+        .iter()
+        .chain(DENIED_RECORDED)
+        .chain(snapshot_extra)
+        .copied()
+        .collect();
     // ld arch + jeq, ld nr + jset, one jeq per number, four extra sendto
     // destination-pointer instructions, ret allow, ret notif
     let len = 4 + tabled.len() + 4 + 2;
@@ -178,7 +204,9 @@ pub fn build_filter() -> Vec<SockFilter> {
 
     // the largest jump is from pc 1 to the notif return, an offset of table length + 3;
     // the compile-time check below keeps it inside the u8 jump field as the tables grow.
-    const _: () = assert!(MEDIATED.len() + DENIED_RECORDED.len() + 7 <= u8::MAX as usize);
+    const _: () = assert!(
+        MEDIATED.len() + DENIED_RECORDED.len() + SNAPSHOT_TRAPPED.len() + 7 <= u8::MAX as usize
+    );
     let jump_to_notif = |from_pc: usize| -> u8 { (notif_pc - from_pc - 1) as u8 };
     let jump_to_allow = |from_pc: usize| -> u8 { (allow_pc - from_pc - 1) as u8 };
 
@@ -321,40 +349,85 @@ mod tests {
         Err("instruction budget exhausted without a return".to_string())
     }
 
-    fn run_x86_64(nr: u32) -> u32 {
-        run(&build_filter(), nr, AUDIT_ARCH_X86_64, [0; 6]).expect("filter must terminate")
+    /// the two programs the supervisor can install: the default and the snapshot-run one.
+    /// the routing tests run over both, since the snapshot filter must route everything the
+    /// default does.
+    fn both_filters() -> [(&'static str, Vec<SockFilter>); 2] {
+        [
+            ("default", build_filter()),
+            ("snapshot", build_filter_with(true)),
+        ]
     }
 
-    fn run_x86_64_with_args(nr: u32, args: [u64; 6]) -> u32 {
-        run(&build_filter(), nr, AUDIT_ARCH_X86_64, args).expect("filter must terminate")
+    fn run_x86_64(prog: &[SockFilter], nr: u32) -> u32 {
+        run(prog, nr, AUDIT_ARCH_X86_64, [0; 6]).expect("filter must terminate")
+    }
+
+    fn run_x86_64_with_args(prog: &[SockFilter], nr: u32, args: [u64; 6]) -> u32 {
+        run(prog, nr, AUDIT_ARCH_X86_64, args).expect("filter must terminate")
     }
 
     #[test]
     fn filter_routes_every_tabled_syscall_to_user_notif() {
-        for &nr in MEDIATED.iter().chain(DENIED_RECORDED) {
-            let mut args = [0; 6];
-            if nr == nr::SENDTO {
-                args[4] = 1;
+        for (which, prog) in both_filters() {
+            for &nr in MEDIATED.iter().chain(DENIED_RECORDED) {
+                let mut args = [0; 6];
+                if nr == nr::SENDTO {
+                    args[4] = 1;
+                }
+                assert_eq!(
+                    run_x86_64_with_args(&prog, nr, args),
+                    SECCOMP_RET_USER_NOTIF,
+                    "{which} filter: tabled syscall {nr} must trap"
+                );
             }
-            assert_eq!(
-                run_x86_64_with_args(nr, args),
-                SECCOMP_RET_USER_NOTIF,
-                "tabled syscall {nr} must trap"
-            );
         }
     }
 
     #[test]
-    fn filter_only_bypasses_sendto_with_a_null_destination() {
-        assert_eq!(run_x86_64(nr::SENDTO), SECCOMP_RET_ALLOW);
-
-        for dest in [1, u64::from(u32::MAX), 1_u64 << 32, u64::MAX] {
-            let mut args = [0; 6];
-            args[4] = dest;
+    fn snapshot_filter_traps_aio_and_the_default_filter_does_not() {
+        for &nr in SNAPSHOT_TRAPPED {
             assert_eq!(
-                run_x86_64_with_args(nr::SENDTO, args),
-                SECCOMP_RET_USER_NOTIF
+                run_x86_64(&build_filter(), nr),
+                SECCOMP_RET_ALLOW,
+                "default filter passes {nr}"
             );
+            assert_eq!(
+                run(&build_filter_with(true), nr, AUDIT_ARCH_X86_64, [0; 6]).unwrap(),
+                SECCOMP_RET_USER_NOTIF,
+                "snapshot filter traps {nr}"
+            );
+        }
+        assert_eq!(build_filter(), build_filter_with(false));
+    }
+
+    #[test]
+    fn filter_length_matches_its_construction() {
+        // ld arch + jeq, ld nr + jset, one jeq per tabled number, the four extra sendto
+        // destination-pointer instructions, ret allow, ret notif.
+        let tabled = MEDIATED.len() + DENIED_RECORDED.len();
+        assert_eq!(build_filter().len(), 4 + tabled + 4 + 2);
+        assert_eq!(
+            build_filter_with(true).len(),
+            4 + tabled + SNAPSHOT_TRAPPED.len() + 4 + 2,
+            "the snapshot filter adds exactly one jeq per AIO number"
+        );
+    }
+
+    #[test]
+    fn filter_only_bypasses_sendto_with_a_null_destination() {
+        for (which, prog) in both_filters() {
+            assert_eq!(run_x86_64(&prog, nr::SENDTO), SECCOMP_RET_ALLOW, "{which}");
+
+            for dest in [1, u64::from(u32::MAX), 1_u64 << 32, u64::MAX] {
+                let mut args = [0; 6];
+                args[4] = dest;
+                assert_eq!(
+                    run_x86_64_with_args(&prog, nr::SENDTO, args),
+                    SECCOMP_RET_USER_NOTIF,
+                    "{which}"
+                );
+            }
         }
     }
 
@@ -363,12 +436,14 @@ mod tests {
         // read, write, mmap, getpid, sendmsg, futex: the hot path and the handshake
         // syscalls the child issues after filter install (spawn would deadlock if any
         // of these trapped before the supervisor holds the notify fd).
-        for nr in [0, 1, 9, 39, 46, 202] {
-            assert_eq!(
-                run_x86_64(nr),
-                SECCOMP_RET_ALLOW,
-                "untabled syscall {nr} must pass through"
-            );
+        for (which, prog) in both_filters() {
+            for nr in [0, 1, 9, 39, 46, 202] {
+                assert_eq!(
+                    run_x86_64(&prog, nr),
+                    SECCOMP_RET_ALLOW,
+                    "{which} filter: untabled syscall {nr} must pass through"
+                );
+            }
         }
     }
 
@@ -377,11 +452,21 @@ mod tests {
         // the deny itself is the notify loop's; the filter only routes. an x32 number
         // must never be read against the x86-64 table, so even pass-through numbers
         // trap once bit 30 is set.
-        for nr in [0, 1, 39] {
-            assert_eq!(run_x86_64(nr | X32_SYSCALL_BIT), SECCOMP_RET_USER_NOTIF);
-        }
-        for &nr in MEDIATED {
-            assert_eq!(run_x86_64(nr | X32_SYSCALL_BIT), SECCOMP_RET_USER_NOTIF);
+        for (which, prog) in both_filters() {
+            for nr in [0, 1, 39] {
+                assert_eq!(
+                    run_x86_64(&prog, nr | X32_SYSCALL_BIT),
+                    SECCOMP_RET_USER_NOTIF,
+                    "{which}"
+                );
+            }
+            for &nr in MEDIATED {
+                assert_eq!(
+                    run_x86_64(&prog, nr | X32_SYSCALL_BIT),
+                    SECCOMP_RET_USER_NOTIF,
+                    "{which}"
+                );
+            }
         }
     }
 
@@ -389,18 +474,29 @@ mod tests {
     fn filter_routes_foreign_arch_to_user_notif() {
         // the deny itself is the notify loop's; the filter only routes. nr is read
         // only after the arch check, so even an "allowed" i386 number traps.
-        for nr in [0, 1, 39, nr::OPENAT] {
-            assert_eq!(
-                run(&build_filter(), nr, AUDIT_ARCH_I386, [0; 6]).expect("filter must terminate"),
-                SECCOMP_RET_USER_NOTIF
-            );
+        for (which, prog) in both_filters() {
+            for nr in [0, 1, 39, nr::OPENAT] {
+                assert_eq!(
+                    run(&prog, nr, AUDIT_ARCH_I386, [0; 6]).expect("filter must terminate"),
+                    SECCOMP_RET_USER_NOTIF,
+                    "{which}"
+                );
+            }
         }
     }
 
     #[test]
     fn filter_is_well_formed() {
-        let prog = build_filter();
-        assert!(!prog.is_empty(), "the kernel rejects an empty program");
+        for (which, prog) in both_filters() {
+            assert_well_formed(which, &prog);
+        }
+    }
+
+    fn assert_well_formed(which: &str, prog: &[SockFilter]) {
+        assert!(
+            !prog.is_empty(),
+            "{which}: the kernel rejects an empty program"
+        );
         assert!(prog.len() <= 4096, "BPF_MAXINSNS is 4096");
         for (pc, insn) in prog.iter().enumerate() {
             match insn.code {
@@ -418,7 +514,7 @@ mod tests {
         }
         let last = prog.last().expect("non-empty");
         assert_eq!(last.code, BPF_RET_K, "the program must end in a return");
-        for insn in &prog {
+        for insn in prog {
             if insn.code == BPF_RET_K {
                 assert!(
                     insn.k == SECCOMP_RET_ALLOW || insn.k == SECCOMP_RET_USER_NOTIF,
@@ -470,8 +566,13 @@ mod tests {
             (nr::IO_URING_SETUP, libc::SYS_io_uring_setup),
             (nr::IO_URING_ENTER, libc::SYS_io_uring_enter),
             (nr::IO_URING_REGISTER, libc::SYS_io_uring_register),
+            (nr::IO_SETUP, libc::SYS_io_setup),
+            (nr::IO_SUBMIT, libc::SYS_io_submit),
         ];
-        assert_eq!(pairs.len(), MEDIATED.len() + DENIED_RECORDED.len());
+        assert_eq!(
+            pairs.len(),
+            MEDIATED.len() + DENIED_RECORDED.len() + SNAPSHOT_TRAPPED.len()
+        );
         for &(pinned, libc_nr) in pairs {
             assert_eq!(i64::from(pinned), libc_nr);
         }

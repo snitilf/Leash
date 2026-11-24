@@ -20,7 +20,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::recorder::Mode;
 use crate::sandbox::child::{self, CHILD_BOUNDARY_READY, ChildSetup, SUPERVISOR_ACK, SockFprog};
-use crate::sandbox::filter::{SockFilter, build_filter};
+use crate::sandbox::filter::{SockFilter, build_filter_with};
 use crate::supervisor::notify::NotifyFd;
 
 /// what to launch and how.
@@ -42,6 +42,9 @@ pub struct SupervisedChild {
     pub pid: libc::pid_t,
     /// the supervisor's end of the seccomp notify listener.
     pub notify: NotifyFd,
+    /// whether the installed filter is the snapshot-run one (legacy AIO trapped); the
+    /// notify loop refuses to serve when this disagrees with the run's flag.
+    pub snapshot_filter: bool,
 }
 
 impl SupervisedChild {
@@ -80,8 +83,19 @@ pub enum SpawnError {
 
 /// launch `spec` under the seccomp filter and return the supervised child.
 pub fn spawn_supervised(spec: &SpawnSpec) -> Result<SupervisedChild, SpawnError> {
-    let filter = build_filter();
-    spawn_with_filter(spec, &filter)
+    spawn_supervised_with(spec, false)
+}
+
+/// the same as `spawn_supervised`, with the snapshot-run filter (legacy AIO trapped,
+/// ADR-0024 decision 8) when `snapshot_integrity` is set.
+pub fn spawn_supervised_with(
+    spec: &SpawnSpec,
+    snapshot_integrity: bool,
+) -> Result<SupervisedChild, SpawnError> {
+    let filter = build_filter_with(snapshot_integrity);
+    let mut child = spawn_with_filter(spec, &filter)?;
+    child.snapshot_filter = snapshot_integrity;
+    Ok(child)
 }
 
 /// the same as `spawn_supervised` but with a caller-supplied filter program. the seam the
@@ -184,7 +198,11 @@ fn parent_handshake(
     }
 
     let notify = NotifyFd::new(notify_fd).map_err(SpawnError::Handshake)?;
-    Ok(SupervisedChild { pid, notify })
+    Ok(SupervisedChild {
+        pid,
+        notify,
+        snapshot_filter: false,
+    })
 }
 
 /// resolve `argv0` to a nul-terminated executable path, mirroring `execvp` search but in

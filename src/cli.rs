@@ -592,6 +592,7 @@ pub fn run() -> ExitCode {
             .ask_timeout
             .map(std::time::Duration::from_secs)
             .unwrap_or(crate::supervisor::run::DEFAULT_ASK_TIMEOUT),
+        snapshot_integrity: false,
     })
 }
 

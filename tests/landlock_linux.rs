@@ -137,7 +137,7 @@ fn self_exe() -> String {
 }
 
 fn drive_continue(child: SupervisedChild) -> i32 {
-    let SupervisedChild { pid, notify } = child;
+    let SupervisedChild { pid, notify, .. } = child;
     let start = Instant::now();
     loop {
         if start.elapsed() > DEADLINE {
