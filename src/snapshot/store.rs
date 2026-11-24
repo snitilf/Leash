@@ -395,7 +395,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, StoreError> {
 /// - invalid mode bits (`> 0o7777`) or invalid `mtime_nsec`
 /// - missing or extraneous kind-specific fields
 /// - malformed lowercase hex in `sha256` or `xattrs` values, or non-`user.` xattr names
-/// - `link_group` members that disagree on `size` or `sha256`
+/// - `link_group` members that disagree on size, digest, mode, owner, mtime or xattrs
 /// - `totals` that disagree with `entries`
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), StoreError> {
     if manifest.schema_version != MANIFEST_SCHEMA_VERSION {
@@ -408,7 +408,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), StoreError> {
     }
 
     let mut kind_by_path: HashMap<&str, EntryKind> = HashMap::with_capacity(manifest.entries.len());
-    let mut link_groups: HashMap<u64, (u64, &str)> = HashMap::new();
+    let mut link_groups: HashMap<u64, &ManifestEntry> = HashMap::new();
     let mut files = 0u64;
     let mut dirs = 0u64;
     let mut symlinks = 0u64;
@@ -497,8 +497,17 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), StoreError> {
                             reason: "total_bytes overflow".into(),
                         })?;
                 if let Some(group) = entry.link_group {
-                    if let Some(&(expected_size, expected_sha)) = link_groups.get(&group) {
-                        if expected_size != size || expected_sha != sha256 {
+                    if let Some(first) = link_groups.get(&group) {
+                        // members share one inode, so every field of the inode must agree
+                        let same = first.size == entry.size
+                            && first.sha256 == entry.sha256
+                            && first.mode == entry.mode
+                            && first.uid == entry.uid
+                            && first.gid == entry.gid
+                            && first.mtime_sec == entry.mtime_sec
+                            && first.mtime_nsec == entry.mtime_nsec
+                            && first.xattrs == entry.xattrs;
+                        if !same {
                             return Err(StoreError::InvalidManifest {
                                 reason: format!(
                                     "link_group {group} members disagree at {:?}",
@@ -507,7 +516,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), StoreError> {
                             });
                         }
                     } else {
-                        link_groups.insert(group, (size, sha256));
+                        link_groups.insert(group, entry);
                     }
                 }
             }
@@ -2140,6 +2149,34 @@ mod tests {
         f.link_group = Some(3);
         let m = manifest_from_entries(vec![e, f]);
         validate_manifest(&m).unwrap();
+    }
+
+    #[test]
+    fn rejects_link_group_members_with_different_metadata() {
+        type Tweak = fn(&mut ManifestEntry);
+        let tweaks: [(&str, Tweak); 6] = [
+            ("mode", |e| e.mode = 0o600),
+            ("uid", |e| e.uid = 1001),
+            ("gid", |e| e.gid = 1001),
+            ("mtime_sec", |e| e.mtime_sec += 1),
+            ("mtime_nsec", |e| e.mtime_nsec += 1),
+            ("xattrs", |e| {
+                e.xattrs.insert("user.k".into(), "00".into());
+            }),
+        ];
+        for (what, tweak) in tweaks {
+            let mut a = sample_file("a", 10, &valid_sha('a'));
+            let mut b = sample_file("b", 10, &valid_sha('a'));
+            a.link_group = Some(1);
+            b.link_group = Some(1);
+            tweak(&mut b);
+            let m = manifest_from_entries(vec![a, b]);
+            let err = validate_manifest(&m).unwrap_err();
+            assert!(
+                matches!(&err, StoreError::InvalidManifest { reason } if reason.contains("link_group")),
+                "{what}: {err}"
+            );
+        }
     }
 
     #[test]
