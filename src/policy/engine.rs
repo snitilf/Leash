@@ -93,6 +93,9 @@ pub enum MatchId {
     /// ADR-0024). the supervisor decides it before any policy rule; the engine never
     /// produces it, it only names it so the recorder stamps one spelling.
     ImplicitStateRoot,
+    /// the implicit, first-ranked deny of the supervisor's and broker's `/proc/<pid>` tree
+    /// in an enforce run, a sibling of [`MatchId::ImplicitStateRoot`].
+    ImplicitSupervisorProc,
 }
 
 impl fmt::Display for MatchId {
@@ -103,6 +106,7 @@ impl fmt::Display for MatchId {
             MatchId::BaseEnforce => f.write_str("base:enforce"),
             MatchId::BaseRecordOnly => f.write_str("base:record_only"),
             MatchId::ImplicitStateRoot => f.write_str("implicit:state_root"),
+            MatchId::ImplicitSupervisorProc => f.write_str("implicit:supervisor_proc"),
         }
     }
 }
