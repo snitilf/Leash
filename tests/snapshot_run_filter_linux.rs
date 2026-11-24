@@ -196,13 +196,20 @@ fn record_only_with_snapshot_integrity_is_refused_before_spawn() {
 
 #[test]
 fn supervisor_is_non_dumpable_during_a_run() {
-    // the agent's parent is the supervisor; the same uid can read its status file.
+    // /proc/<pid>/status has no Dumpable field. the kernel's visible effect is that a
+    // non-dumpable process's /proc/<pid> inode is owned by root, while a dumpable one
+    // belongs to its own uid. the agent's parent is the supervisor; the agent itself
+    // keeps the default, so its own /proc entry stays owned by it.
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root cannot tell the two ownerships apart");
+        return;
+    }
     let script = "import os\n\
-        status = open('/proc/%d/status' % os.getppid()).read()\n\
-        line = [l for l in status.splitlines() if l.startswith('Dumpable:')][0]\n\
-        assert line.split()[1] == '0', line\n\
-        mine = open('/proc/self/status').read()\n\
-        assert 'Dumpable:\\t1' in mine, 'the agent itself keeps the default'\n";
+        me = os.geteuid()\n\
+        sup = os.stat('/proc/%d' % os.getppid()).st_uid\n\
+        assert sup == 0, ('supervisor proc owner', sup)\n\
+        assert os.stat('/proc/self').st_uid == me, 'the agent keeps the default'\n";
     for snapshot_integrity in [false, true] {
         let run = enforce(script, snapshot_integrity);
         assert_exit_zero(&run);
