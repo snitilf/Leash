@@ -11,9 +11,10 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::path::Path;
 
 use leash::snapshot::restore::{
-    ChangeAction, RestoreOp, chain_head, current_manifest, plan, recompute_chain,
+    ChangeAction, RestoreContext, RestoreError, RestoreOp, apply, apply_with_context, chain_head,
+    current_manifest, plan, recompute_chain,
 };
-use leash::snapshot::store::{EntryKind, Limits, Manifest, capture, load_manifest};
+use leash::snapshot::store::{EntryKind, Limits, Manifest, StoreError, capture, load_manifest};
 
 fn open_dir(path: &Path) -> File {
     OpenOptions::new()
@@ -300,4 +301,343 @@ fn plan_turns_a_kind_change_into_remove_then_create() {
                 path: "y/inner".into()
             })
     );
+}
+
+fn is_root() -> bool {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+fn try_set_user_xattr(path: &Path, name: &str, value: &[u8]) -> bool {
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let c_name = CString::new(name).unwrap();
+    // SAFETY: c_path and c_name are NUL-terminated and value is a valid byte slice.
+    let rc = unsafe {
+        libc::setxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if rc == 0 {
+        return true;
+    }
+    let err = std::io::Error::last_os_error();
+    assert!(
+        matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP | libc::ENOSYS)),
+        "unexpected setxattr failure: {err}"
+    );
+    false
+}
+
+fn chmod(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// names of the entries directly inside `dir`, sorted.
+fn names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn round_trip_restores_the_captured_workspace_exactly() {
+    if is_root() {
+        return;
+    }
+    let fx = Fixture::new();
+    let ws = &fx.ws;
+
+    fs::write(ws.join("a.txt"), b"hello").unwrap();
+    set_mtime(&ws.join("a.txt"), 1_700_000_000, 123_456_789);
+    let xattrs = try_set_user_xattr(&ws.join("a.txt"), "user.x", b"1");
+    fs::write(ws.join("exec.sh"), b"#!/bin/sh\n").unwrap();
+    chmod(&ws.join("exec.sh"), 0o755);
+    set_mtime(&ws.join("exec.sh"), 1_700_000_001, 0);
+    fs::write(ws.join("setuid"), b"s").unwrap();
+    chmod(&ws.join("setuid"), 0o4755);
+    set_mtime(&ws.join("setuid"), 1_700_000_002, 5);
+    create_dir(&ws.join("d"));
+    fs::write(ws.join("d/inner.txt"), b"inner").unwrap();
+    create_dir(&ws.join("d/deep"));
+    fs::write(ws.join("d/deep/x.txt"), b"deep").unwrap();
+    chmod(&ws.join("d"), 0o750);
+    create_dir(&ws.join("empty"));
+    create_dir(&ws.join("ro"));
+    fs::write(ws.join("ro/f"), b"readonly").unwrap();
+    chmod(&ws.join("ro/f"), 0o400);
+    chmod(&ws.join("ro"), 0o500);
+    fs::write(ws.join("filetodir"), b"was a file").unwrap();
+    create_dir(&ws.join("dirtofile"));
+    fs::write(ws.join("dirtofile/child"), b"c").unwrap();
+    symlink("a.txt", ws.join("lnk")).unwrap();
+    set_mtime(&ws.join("lnk"), 1_700_000_003, 7);
+    fs::write(ws.join("h1"), b"linked").unwrap();
+    fs::hard_link(ws.join("h1"), ws.join("h2")).unwrap();
+    fs::write(ws.join("solo"), b"solo").unwrap();
+    // pin every mtime so the comparison is not about wall-clock luck
+    for (i, name) in [
+        "h1",
+        "solo",
+        "d/inner.txt",
+        "d/deep/x.txt",
+        "ro/f",
+        "filetodir",
+    ]
+    .iter()
+    .enumerate()
+    {
+        set_mtime(&ws.join(name), 1_600_000_000 + i as i64, 11);
+    }
+    for (i, name) in ["d/deep", "d", "empty", "dirtofile/child", "dirtofile", "ro"]
+        .iter()
+        .enumerate()
+    {
+        set_mtime(&ws.join(name), 1_500_000_000 + i as i64, 22);
+    }
+    let base = fx.capture(0);
+
+    // mutate: edit, add, delete, modes, mtimes, kind swaps, link changes, xattrs
+    fs::write(ws.join("a.txt"), b"hello, edited").unwrap();
+    set_mtime(&ws.join("a.txt"), 1_800_000_000, 1);
+    if xattrs {
+        try_set_user_xattr(&ws.join("a.txt"), "user.x", b"2");
+        try_set_user_xattr(&ws.join("a.txt"), "user.y", b"extra");
+        try_set_user_xattr(&ws.join("d"), "user.dir", b"d");
+    }
+    chmod(&ws.join("exec.sh"), 0o600);
+    set_mtime(&ws.join("setuid"), 1_800_000_001, 0);
+    fs::write(ws.join("added.txt"), b"added").unwrap();
+    create_dir(&ws.join("newdir"));
+    fs::write(ws.join("newdir/n"), b"n").unwrap();
+    fs::remove_file(ws.join("d/inner.txt")).unwrap();
+    fs::remove_file(ws.join("d/deep/x.txt")).unwrap();
+    fs::remove_dir(ws.join("d/deep")).unwrap();
+    chmod(&ws.join("ro"), 0o700);
+    fs::write(ws.join("ro/new"), b"new in ro").unwrap();
+    chmod(&ws.join("ro"), 0o500);
+    fs::remove_file(ws.join("filetodir")).unwrap();
+    create_dir(&ws.join("filetodir"));
+    fs::write(ws.join("filetodir/inside"), b"i").unwrap();
+    fs::remove_file(ws.join("dirtofile/child")).unwrap();
+    fs::remove_dir(ws.join("dirtofile")).unwrap();
+    fs::write(ws.join("dirtofile"), b"now a file").unwrap();
+    fs::remove_file(ws.join("lnk")).unwrap();
+    symlink("added.txt", ws.join("lnk")).unwrap();
+    fs::remove_file(ws.join("h2")).unwrap();
+    fs::write(ws.join("h2"), b"linked").unwrap();
+    fs::hard_link(ws.join("solo"), ws.join("solo-link")).unwrap();
+    set_mtime(&ws.join("empty"), 1_900_000_000, 0);
+    let now = fx.capture(1);
+    assert_ne!(now.entries, base.entries);
+
+    let p = plan(&now, &base);
+    assert!(!p.summary().is_empty());
+    let stats = apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap();
+    assert!(stats.files_written > 0 && stats.removed > 0 && stats.hard_links > 0);
+
+    let after = fx.capture(2);
+    assert_eq!(after.entries, base.entries);
+    assert!(plan(&after, &base).is_empty());
+    assert_eq!(fs::read(ws.join("a.txt")).unwrap(), b"hello");
+    assert_eq!(fs::read_link(ws.join("lnk")).unwrap(), Path::new("a.txt"));
+    assert!(!names(ws).iter().any(|n| n.starts_with(".leash-restore")));
+
+    chmod(&ws.join("ro"), 0o700);
+}
+
+#[test]
+fn hostile_manifest_paths_are_refused_before_any_write() {
+    if is_root() {
+        return;
+    }
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("keep"), b"keep").unwrap();
+    let base = fx.capture(0);
+    fs::write(fx.ws.join("extra"), b"extra").unwrap();
+    let now = fx.capture(1);
+
+    for bad in ["../escape", "/abs/escape", "a/../../escape", "a//b", "./x"] {
+        let mut forged = base.clone();
+        forged.entries[0].path = bad.to_owned();
+        // as a stored manifest: refused when loaded
+        let json = serde_json::to_vec(&forged).unwrap();
+        let mpath = fx.store_path.join("manifests/step-000009.json");
+        fs::write(&mpath, &json).unwrap();
+        let err = load_manifest(&fx.store_fd(), 9).unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidManifest { .. }),
+            "{bad}: {err}"
+        );
+        fs::remove_file(&mpath).unwrap();
+
+        // as an in-memory target: refused by apply before it touches the workspace
+        let p = plan(&now, &forged);
+        let err = apply(&fx.ws_fd(), &fx.store_fd(), &forged, &p).unwrap_err();
+        assert!(
+            matches!(err, RestoreError::Store(StoreError::InvalidManifest { .. })),
+            "{bad}: {err}"
+        );
+        assert_eq!(names(&fx.ws), ["extra", "keep"]);
+        assert!(!fx.outside("escape").exists());
+    }
+}
+
+#[test]
+fn a_plan_path_that_escapes_is_refused_before_any_write() {
+    if is_root() {
+        return;
+    }
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("keep"), b"keep").unwrap();
+    let base = fx.capture(0);
+    fs::write(fx.outside("victim"), b"victim").unwrap();
+    let mut p = plan(&base, &base);
+    p.ops.push(RestoreOp::Remove {
+        path: "../victim".into(),
+        kind: EntryKind::File,
+    });
+    let err = apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap_err();
+    assert!(matches!(err, RestoreError::Store(_)), "{err}");
+    assert_eq!(fs::read(fx.outside("victim")).unwrap(), b"victim");
+}
+
+#[test]
+fn a_tampered_object_fails_before_the_destination_is_replaced() {
+    if is_root() {
+        return;
+    }
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("f"), b"original").unwrap();
+    fs::write(fx.ws.join("g"), b"gee").unwrap();
+    let base = fx.capture(0);
+    fs::write(fx.ws.join("f"), b"changed").unwrap();
+    let now = fx.capture(1);
+
+    let sha = base
+        .entries
+        .iter()
+        .find(|e| e.path == "f")
+        .unwrap()
+        .sha256
+        .clone()
+        .unwrap();
+    let object = fx.store_path.join(format!("objects/{}/{sha}", &sha[..2]));
+    chmod(&object, 0o600);
+    fs::write(&object, b"evil bytes").unwrap();
+
+    let p = plan(&now, &base);
+    let err = apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap_err();
+    assert!(
+        matches!(err, RestoreError::Store(StoreError::ObjectCorrupt { .. })),
+        "{err}"
+    );
+    assert_eq!(fs::read(fx.ws.join("f")).unwrap(), b"changed");
+    assert_eq!(names(&fx.ws), ["f", "g"]);
+}
+
+#[test]
+fn a_directory_swapped_for_a_symlink_after_planning_is_not_followed() {
+    if is_root() {
+        return;
+    }
+    let fx = Fixture::new();
+    create_dir(&fx.ws.join("sub"));
+    fs::write(fx.ws.join("sub/file"), b"orig").unwrap();
+    let base = fx.capture(0);
+    fs::write(fx.ws.join("sub/file"), b"mod").unwrap();
+    let now = fx.capture(1);
+    let p = plan(&now, &base);
+
+    let outside = fx.outside("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("file"), b"outside").unwrap();
+    fs::remove_file(fx.ws.join("sub/file")).unwrap();
+    fs::remove_dir(fx.ws.join("sub")).unwrap();
+    symlink(&outside, fx.ws.join("sub")).unwrap();
+
+    let err = apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap_err();
+    assert!(matches!(err, RestoreError::UnsafePath { .. }), "{err}");
+    assert_eq!(fs::read(outside.join("file")).unwrap(), b"outside");
+    assert_eq!(names(&outside), ["file"]);
+    assert!(
+        fs::symlink_metadata(fx.ws.join("sub"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn an_outside_hard_link_is_never_written_through() {
+    if is_root() {
+        return;
+    }
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("f"), b"orig").unwrap();
+    let outside = fx.outside("outside-link");
+    fs::hard_link(fx.ws.join("f"), &outside).unwrap();
+    let base = fx.capture(0);
+    // the agent edits through the shared inode, so the outside name changes too
+    fs::write(fx.ws.join("f"), b"evil").unwrap();
+    assert_eq!(fs::read(&outside).unwrap(), b"evil");
+    let now = fx.capture(1);
+
+    let p = plan(&now, &base);
+    apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap();
+    assert_eq!(fs::read(fx.ws.join("f")).unwrap(), b"orig");
+    assert_eq!(fs::read(&outside).unwrap(), b"evil");
+}
+
+#[test]
+fn root_is_refused_through_the_context_seam() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("f"), b"orig").unwrap();
+    let base = fx.capture(0);
+    fs::write(fx.ws.join("f"), b"changed").unwrap();
+    let now = fx.capture(1);
+    let p = plan(&now, &base);
+    let ctx = RestoreContext {
+        euid: 0,
+        egid: 0,
+        groups: vec![],
+    };
+    let err = apply_with_context(&fx.ws_fd(), &fx.store_fd(), &base, &p, &ctx).unwrap_err();
+    assert!(matches!(err, RestoreError::RunningAsRoot), "{err}");
+    assert_eq!(fs::read(fx.ws.join("f")).unwrap(), b"changed");
+}
+
+#[test]
+fn an_owner_this_process_cannot_create_fails_in_preflight_naming_the_path() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("f"), b"orig").unwrap();
+    fs::write(fx.ws.join("extra"), b"extra").unwrap();
+    let base = fx.capture(0);
+    fs::remove_file(fx.ws.join("extra")).unwrap();
+    fs::write(fx.ws.join("f"), b"changed").unwrap();
+    fs::write(fx.ws.join("later"), b"later").unwrap();
+    let now = fx.capture(1);
+
+    let me = RestoreContext::from_process().unwrap();
+    // pretend the process is someone else, so the manifest owner is out of reach
+    let ctx = RestoreContext {
+        euid: me.euid.wrapping_add(1).max(1),
+        egid: me.egid,
+        groups: me.groups.clone(),
+    };
+    let p = plan(&now, &base);
+    let err = apply_with_context(&fx.ws_fd(), &fx.store_fd(), &base, &p, &ctx).unwrap_err();
+    match err {
+        RestoreError::Ownership { path, .. } => assert!(path == "f" || path == "extra", "{path}"),
+        other => panic!("expected an ownership error, got {other}"),
+    }
+    // nothing was written, not even the removal that comes first in the plan
+    assert_eq!(names(&fx.ws), ["f", "later"]);
+    assert_eq!(fs::read(fx.ws.join("f")).unwrap(), b"changed");
 }
