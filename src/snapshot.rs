@@ -20,6 +20,9 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// content-addressed exact snapshot store (ADR-0022).
+pub mod store;
+
 /// errors from snapshot capture and restore.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
