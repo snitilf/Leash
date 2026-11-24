@@ -43,7 +43,8 @@ fn torture_child() {
     };
     let dir = RunDir::create(Path::new(&root), &sample_meta(), SystemTime::now()).unwrap();
     let mut writer = dir.trace_writer().unwrap();
-    for i in 0.. {
+    // bounded only to satisfy the lint; the parent kills this loop long before
+    for i in 0..=u64::MAX {
         writer.append(i, EventBody::Step { step: i }).unwrap();
         writer.sync().unwrap();
     }

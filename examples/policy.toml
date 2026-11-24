@@ -1,0 +1,32 @@
+schema_version = 1
+
+# first match wins, so the deny rules sit above the broad read allow
+[[fs]]
+path   = "~/.ssh/**"
+mode   = ["read", "write"]
+action = "deny"
+
+[[fs]]
+path   = "/etc/shadow"
+mode   = ["read", "write"]
+action = "deny"
+
+# writing a .env file in the workspace needs a yes from the terminal
+[[fs]]
+path   = "{workspace}/.env"
+mode   = ["write", "create"]
+action = "ask"
+
+# system paths needed to run sh and cat (the workspace itself is allowed by default)
+[[fs]]
+path   = "/**"
+mode   = ["read"]
+action = "allow"
+
+[[exec]]
+binary = "/usr/bin/curl"
+action = "ask"
+
+[[exec]]
+binary = "/**"
+action = "allow"

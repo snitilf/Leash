@@ -28,12 +28,21 @@ accepted. `--unattended` takes no value. `--ask-timeout <seconds>` sets the FR-1
 timeout (both `--ask-timeout <n>` and `--ask-timeout=<n>` forms; whole seconds in 1..=3600,
 default 60).
 
+Two top-level options are accepted, and only as the first argument, before any subcommand:
+`-h`/`--help` prints the usage text to stdout and exits 0, and `-V`/`--version` prints
+`leash <version>` (the crate version) to stdout and exits 0. Both are handled before any platform
+check, so they work on hosts that cannot supervise. They take nothing after them: `leash --help extra`
+is a usage error. They are not subcommand flags: `leash run --help` is not supported and keeps the
+`run` grammar above (it is a missing-`--` error, or an unknown flag if a `--` follows), and nothing
+after `--` is ever parsed.
+
 Every usage error exits 2 (section 6) and prints a message to stderr naming the mistake. The
 normative set:
 
 | Usage error | Condition |
 |---|---|
-| no subcommand | `leash` invoked with no arguments, or a bare option before any subcommand |
+| no subcommand | `leash` invoked with no arguments, or a bare option before any subcommand other than `--help`/`-h` and `--version`/`-V` |
+| top-level option with extra arguments | `--help`, `-h`, `--version`, or `-V` followed by any further argument |
 | unknown subcommand or flag | a subcommand that is not `run` (and not a reserved name below), or a flag `run` does not accept |
 | `run` without `--` | `run` invoked with no `--` separator |
 | empty command after `--` | `--` present but nothing follows it |

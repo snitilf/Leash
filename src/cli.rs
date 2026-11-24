@@ -32,6 +32,10 @@ pub struct RunArgs {
 pub enum Command {
     /// `leash run ...`
     Run(RunArgs),
+    /// `leash --help` or `leash -h`: print usage to stdout, exit 0
+    Help,
+    /// `leash --version` or `leash -V`: print the version to stdout, exit 0
+    Version,
     /// a reserved subcommand name that parses correctly but has no implementation yet
     NotImplemented {
         /// the subcommand name, e.g. "rewind"
@@ -46,9 +50,13 @@ pub enum Command {
 /// a message naming the mistake.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UsageError {
-    /// `leash` invoked with no arguments, or a bare option before any subcommand
+    /// `leash` invoked with no arguments, or a bare option before any subcommand other than
+    /// the help and version options
     #[error("leash: no subcommand given (try 'leash run -- <command>')")]
     NoSubcommand,
+    /// `--help`, `-h`, `--version`, or `-V` followed by further arguments
+    #[error("leash: '{0}' takes no further arguments")]
+    TrailingAfterOption(String),
     /// a subcommand that is not `run` and not a reserved name
     #[error("leash: unknown subcommand '{0}'")]
     UnknownSubcommand(String),
@@ -78,11 +86,52 @@ pub enum UsageError {
     InvalidAskTimeoutValue,
 }
 
+/// the text printed by `--help` (docs/design/cli.md section 1).
+const HELP: &str = "\
+leash: supervise an AI coding agent at the operating-system boundary
+
+usage:
+  leash run [--unattended] [--state-dir <dir>] [--policy <path>] [--ask-timeout <seconds>] -- <command...>
+
+run flags:
+  --unattended              treat the run as unattended even on a terminal
+  --state-dir <dir>         state root for run traces (must be outside the workspace)
+  --policy <path>           enforce this policy file (without it the run is record-only)
+  --ask-timeout <seconds>   attended-ask timeout, 1 to 3600 (default 60)
+
+everything after '--' is the command and is passed through verbatim.
+
+reserved subcommands, not implemented yet: diff, rewind, runs
+
+options:
+  -h, --help                print this help and exit
+  -V, --version             print the version and exit
+";
+
+/// the line printed by `--version`.
+fn version_line() -> String {
+    format!("leash {}", env!("CARGO_PKG_VERSION"))
+}
+
 /// parse argv (excluding argv\[0\]) into a [`Command`] per docs/design/cli.md section 1.
 pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     let Some(first) = args.first() else {
         return Err(UsageError::NoSubcommand);
     };
+
+    // help and version are top-level options, only valid alone as the first argument
+    let top_level = match first.as_str() {
+        "--help" | "-h" => Some(Command::Help),
+        "--version" | "-V" => Some(Command::Version),
+        _ => None,
+    };
+    if let Some(command) = top_level {
+        return if args.len() == 1 {
+            Ok(command)
+        } else {
+            Err(UsageError::TrailingAfterOption(first.clone()))
+        };
+    }
 
     if first.starts_with('-') {
         return Err(UsageError::NoSubcommand);
@@ -329,6 +378,15 @@ pub fn run() -> ExitCode {
     };
     let run_args = match parsed {
         Command::Run(run_args) => run_args,
+        // handled before any platform check so they work on hosts that cannot supervise
+        Command::Help => {
+            print!("{HELP}");
+            return ExitCode::SUCCESS;
+        }
+        Command::Version => {
+            println!("{}", version_line());
+            return ExitCode::SUCCESS;
+        }
         Command::NotImplemented { message, .. } => {
             eprintln!("{message}");
             return ExitCode::from(EXIT_USAGE);
@@ -791,6 +849,73 @@ mod tests {
         assert_eq!(
             parse(&args(&["run", "--state-dir=", "--", "echo"])).unwrap_err(),
             UsageError::MissingStateDirValue
+        );
+    }
+
+    #[test]
+    fn parse_help_and_version_options() {
+        assert_eq!(parse(&args(&["--help"])).unwrap(), Command::Help);
+        assert_eq!(parse(&args(&["-h"])).unwrap(), Command::Help);
+        assert_eq!(parse(&args(&["--version"])).unwrap(), Command::Version);
+        assert_eq!(parse(&args(&["-V"])).unwrap(), Command::Version);
+    }
+
+    #[test]
+    fn parse_help_with_trailing_args_is_usage_error() {
+        assert_eq!(
+            parse(&args(&["--help", "extra"])).unwrap_err(),
+            UsageError::TrailingAfterOption("--help".into())
+        );
+        assert_eq!(
+            parse(&args(&["-V", "run"])).unwrap_err(),
+            UsageError::TrailingAfterOption("-V".into())
+        );
+    }
+
+    #[test]
+    fn parse_other_bare_options_stay_no_subcommand() {
+        for opt in ["--bogus", "-x", "--helpme", "-v"] {
+            assert_eq!(
+                parse(&args(&[opt])).unwrap_err(),
+                UsageError::NoSubcommand,
+                "{opt}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_run_help_is_not_supported() {
+        assert_eq!(
+            parse(&args(&["run", "--help"])).unwrap_err(),
+            UsageError::MissingSeparator
+        );
+        assert_eq!(
+            parse(&args(&["run", "--help", "--", "echo"])).unwrap_err(),
+            UsageError::UnknownFlag("--help".into())
+        );
+        // after the separator it is the child's argument, never parsed
+        assert!(matches!(
+            parse(&args(&["run", "--", "echo", "--help"])).unwrap(),
+            Command::Run(_)
+        ));
+    }
+
+    #[test]
+    fn help_text_names_every_run_flag_and_option() {
+        for needle in [
+            "--unattended",
+            "--state-dir",
+            "--policy",
+            "--ask-timeout",
+            "-h, --help",
+            "-V, --version",
+            "diff, rewind, runs",
+        ] {
+            assert!(HELP.contains(needle), "{needle}");
+        }
+        assert_eq!(
+            version_line(),
+            format!("leash {}", env!("CARGO_PKG_VERSION"))
         );
     }
 

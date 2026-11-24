@@ -3,7 +3,7 @@ name = "leash"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
-description = "Supervise an AI coding agent at the OS boundary: record, enforce, rewind."
+description = "Supervise an AI coding agent at the OS boundary: record and enforce every file, process, and network action."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/snitilf/Leash"
 
