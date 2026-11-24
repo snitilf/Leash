@@ -113,15 +113,15 @@ Rules the output follows:
 - A file with changed content does not report `mtime`; its mode, uid, gid and xattr changes still appear as `m`.
 - Directory mtimes change whenever an entry is added or removed, so they appear as `m` lines.
 
-### Time-travel commands (specified by ADR-0024, not yet implemented)
+### Snapshots and rewind (specified by ADR-0024, not yet implemented)
 
-The flag and the two subcommands below are specified and not yet implemented.
-Until they are, `diff` and `rewind` remain the reserved subcommands described above, and `run` does not accept `--snapshots`.
+The flag and the `rewind` subcommand below are specified and not yet implemented.
+Until they are, `rewind` remains a reserved subcommand, and `run` does not accept `--snapshots`.
+`diff` is implemented; see the `diff` section above.
 
 ```
 leash run --snapshots [--unattended] [--state-dir <dir>] --policy <path> [--ask-timeout <seconds>] -- <command...>
 leash rewind <run-id> [--step N] [--expect <digest>] [--no-undo] [--workspace <dir>] [--state-dir <dir>]
-leash diff <run-id>[:<step>] <run-id>[:<step>] [--state-dir <dir>]
 ```
 
 `--snapshots` is available in enforce mode only.
@@ -140,8 +140,6 @@ It prints a change summary before it applies anything, and says that it reverses
 `--expect <digest>` refuses a store that does not match the chain head or manifest digest the operator kept outside the store.
 `--workspace <dir>` names the workspace when the working directory is not it; rewind refuses when the workspace differs from the run metadata.
 The rewind rules are in [`snapshot.md`](snapshot.md) section 5.
-
-`diff` compares the filesystem effects of two runs or two steps, each named `<run-id>` or `<run-id>:<step>`.
 
 ## 2. Mode selection
 
