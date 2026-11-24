@@ -22,6 +22,7 @@ use crate::recorder::Mode;
 use crate::sandbox::child::{self, CHILD_BOUNDARY_READY, ChildSetup, SUPERVISOR_ACK, SockFprog};
 use crate::sandbox::filter::{SockFilter, build_filter_with};
 use crate::supervisor::notify::NotifyFd;
+use crate::supervisor::run_cgroup::RunCgroup;
 
 /// what to launch and how.
 pub struct SpawnSpec {
@@ -45,6 +46,10 @@ pub struct SupervisedChild {
     /// whether the installed filter is the snapshot-run one (legacy AIO trapped); the
     /// notify loop refuses to serve when this disagrees with the run's flag.
     pub snapshot_filter: bool,
+    /// the run cgroup the child was born into (snapshot runs, ADR-0024 decision 2). the
+    /// run loop takes it to end the run when the root exits and to kill the whole tree on
+    /// every abort path; dropping it kills and removes the cgroup.
+    pub cgroup: Option<RunCgroup>,
 }
 
 impl SupervisedChild {
@@ -98,12 +103,46 @@ pub fn spawn_supervised_with(
     Ok(child)
 }
 
+/// the snapshot-run spawn: the snapshot filter, and the child is created directly inside
+/// `cgroup` with `clone3(CLONE_INTO_CGROUP)`, so it is a member before it runs a single
+/// instruction, before it installs its filter, and before `execve`. the cgroup moves into
+/// the returned child; on any spawn failure it is dropped, which kills and removes it.
+pub fn spawn_supervised_in_cgroup(
+    spec: &SpawnSpec,
+    cgroup: RunCgroup,
+) -> Result<SupervisedChild, SpawnError> {
+    let filter = build_filter_with(true);
+    let mut child = spawn_in_cgroup_with_filter(spec, &filter, cgroup)?;
+    child.snapshot_filter = true;
+    Ok(child)
+}
+
+/// `spawn_supervised_in_cgroup` with a caller-supplied filter, the seam tests use to put
+/// a record-only tree in a run cgroup. the child's `snapshot_filter` stays false.
+pub fn spawn_in_cgroup_with_filter(
+    spec: &SpawnSpec,
+    filter: &[SockFilter],
+    cgroup: RunCgroup,
+) -> Result<SupervisedChild, SpawnError> {
+    let mut child = spawn_with_filter_in(spec, filter, Some(cgroup.dir_fd()))?;
+    child.cgroup = Some(cgroup);
+    Ok(child)
+}
+
 /// the same as `spawn_supervised` but with a caller-supplied filter program. the seam the
 /// fail-closed test uses to inject a deliberately broken program without a test-only
 /// branch in production code.
 pub fn spawn_with_filter(
     spec: &SpawnSpec,
     filter: &[SockFilter],
+) -> Result<SupervisedChild, SpawnError> {
+    spawn_with_filter_in(spec, filter, None)
+}
+
+fn spawn_with_filter_in(
+    spec: &SpawnSpec,
+    filter: &[SockFilter],
+    cgroup_fd: Option<RawFd>,
 ) -> Result<SupervisedChild, SpawnError> {
     // the fprog length field is u16 and the kernel caps programs at BPF_MAXINSNS (4096).
     if filter.len() > 4096 {
@@ -137,8 +176,9 @@ pub fn spawn_with_filter(
 
     // SAFETY: fork from here; the child branch does nothing but call child::enter, which
     // is async-signal-safe and never returns. all buffers the child reads are built above
-    // and live across the fork (COW preserves their addresses).
-    let pid = unsafe { libc::fork() };
+    // and live across the fork (COW preserves their addresses). with a cgroup fd the fork
+    // is a raw clone3 that enters the cgroup atomically.
+    let pid = unsafe { fork_process(cgroup_fd) };
     if pid < 0 {
         return Err(SpawnError::Fork(io::Error::last_os_error()));
     }
@@ -202,7 +242,53 @@ fn parent_handshake(
         pid,
         notify,
         snapshot_filter: false,
+        cgroup: None,
     })
+}
+
+/// `struct clone_args` at `CLONE_ARGS_SIZE_VER2`, the first version with `cgroup`.
+#[repr(C)]
+#[derive(Default)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+
+/// `CLONE_INTO_CGROUP` (Linux 5.7): the child is created in the cgroup `cgroup` names.
+const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+
+/// fork, or with a cgroup fd, fork through `clone3(CLONE_INTO_CGROUP)`. the clone3 form
+/// has fork semantics (no `CLONE_VM`, `SIGCHLD` on exit), so the child's allocation-free
+/// sequence is the same. it skips glibc's atfork handlers, which the child never needs
+/// because it only issues raw syscalls. returns the pid in the parent and 0 in the child.
+///
+/// # Safety
+/// the same contract as `libc::fork`: the child may only do async-signal-safe work.
+unsafe fn fork_process(cgroup_fd: Option<RawFd>) -> libc::pid_t {
+    let Some(fd) = cgroup_fd else {
+        // SAFETY: forwarded from the caller.
+        return unsafe { libc::fork() };
+    };
+    let args = CloneArgs {
+        flags: CLONE_INTO_CGROUP,
+        exit_signal: libc::SIGCHLD as u64,
+        cgroup: fd as u64,
+        ..CloneArgs::default()
+    };
+    // SAFETY: args is a live, correctly sized clone_args; clone3 without CLONE_VM copies
+    // the address space like fork, so the child never shares memory with the parent.
+    unsafe {
+        libc::syscall(libc::SYS_clone3, &raw const args, size_of::<CloneArgs>()) as libc::pid_t
+    }
 }
 
 /// resolve `argv0` to a nul-terminated executable path, mirroring `execvp` search but in

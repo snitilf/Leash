@@ -155,6 +155,9 @@ pub enum RunError {
     /// boundary whose snapshot does not exist (snapshot.md section 6)
     #[error("snapshot capture failed; run aborted: {0}")]
     Snapshot(#[from] crate::snapshot::SnapshotError),
+    /// the run cgroup could not be watched, killed or removed (ADR-0024 decisions 11, 12).
+    #[error("run cgroup failed: {0}")]
+    RunCgroup(#[source] io::Error),
 }
 
 /// immutable inputs for one notify-loop run.
@@ -1740,6 +1743,7 @@ mod linux {
     use super::*;
     use crate::supervisor::mem::proc::ChildMem;
     use crate::supervisor::notify::NotifyFd;
+    use crate::supervisor::run_cgroup::RunCgroup;
     use crate::supervisor::spawn::SupervisedChild;
     use std::os::fd::AsRawFd;
     use std::time::{Instant, SystemTime};
@@ -1816,10 +1820,40 @@ mod linux {
     /// the direct child (architecture.md section 5.3). the loop owns the child: on the
     /// case-E abort it kills the tree's root and drops the notify fd, which fails every
     /// pending and future mediated syscall closed (case G).
+    ///
+    /// a child born into a run cgroup (snapshot runs) changes two things. the run ends when
+    /// the root process exits, not when the last filter holder does, and Leash then kills
+    /// every leftover process through `cgroup.kill` before it finishes. every abort path
+    /// and every error kills the whole cgroup, not only the direct child, and the cgroup
+    /// directory is removed on the way out (ADR-0024 decisions 11 and 12).
     pub fn run_loop<S: TraceSink>(
+        mut child: SupervisedChild,
+        config: RunConfig<'_>,
+        writer: &mut TraceWriter<S>,
+    ) -> Result<RunOutcome, RunError> {
+        let Some(mut cgroup) = child.cgroup.take() else {
+            return run_loop_in(child, config, writer, None);
+        };
+        let result = run_loop_in(child, config, writer, Some(&cgroup));
+        if result.is_err() {
+            // the loop already killed the direct child; take the rest of the tree with it.
+            // best-effort record: the run is already failing, so a trace error here only
+            // loses the note, never the kill.
+            let event = cgroup.kill_all(crate::recorder::CgroupKillReason::Abort);
+            let _ = writer.append(now_ms(), EventBody::CgroupKill(event));
+        }
+        let removed = cgroup.remove().map_err(RunError::RunCgroup);
+        match result {
+            Ok(outcome) => removed.map(|()| outcome),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn run_loop_in<S: TraceSink>(
         child: SupervisedChild,
         config: RunConfig<'_>,
         writer: &mut TraceWriter<S>,
+        cgroup: Option<&RunCgroup>,
     ) -> Result<RunOutcome, RunError> {
         let config = match config.validate() {
             Ok(config) => config,
@@ -1840,6 +1874,14 @@ mod linux {
         let mut clock = config
             .capture
             .map(|_| crate::snapshot::StepClock::new(crate::snapshot::STEP_WINDOW));
+        // a run cgroup ends the run at the root's exit: a pidfd for the root joins the poll set
+        let root_pidfd = match cgroup.map(|_| pidfd_open(child.pid)).transpose() {
+            Ok(fd) => fd,
+            Err(e) => {
+                abort_run(&child);
+                return Err(RunError::RunCgroup(e));
+            }
+        };
 
         loop {
             // close a step boundary if activity has quiesced. capture first, then the
@@ -1860,14 +1902,24 @@ mod linux {
                     return Err(e.into());
                 }
             }
-            let mut pfd = libc::pollfd {
-                fd: child.notify.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: poll reads one pollfd we own; the timeout bounds the wait so a
-            // wedged fd cannot hang the supervisor without the loop noticing (arc H).
-            let rc = unsafe { libc::poll(&raw mut pfd, 1, 100) };
+            let mut set = [
+                libc::pollfd {
+                    fd: child.notify.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    // a negative fd is ignored by poll: no root watch outside a run cgroup
+                    fd: root_pidfd.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: poll reads and writes the two pollfds we own; the timeout bounds the
+            // wait so a wedged fd cannot hang the supervisor without the loop noticing
+            // (arc H).
+            let rc = unsafe { libc::poll(set.as_mut_ptr(), 2, 100) };
+            let [pfd, root_exit] = set;
             if rc < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
@@ -1875,6 +1927,10 @@ mod linux {
                 }
                 abort_run(&child);
                 return Err(RunError::Notify(e));
+            }
+            if root_exit.revents & libc::POLLIN != 0 {
+                // the root exited: nothing more of the tree is trusted to run on
+                break;
             }
             if pfd.revents & libc::POLLIN != 0 {
                 let notif = match child.notify.recv() {
@@ -1916,6 +1972,16 @@ mod linux {
         }
 
         let wait_status = child.wait().map_err(RunError::Notify)?;
+        if let Some(cgroup) = cgroup {
+            // the root is reaped; whatever is left in the cgroup outlived it. kill it and
+            // wait for populated 0 before the final capture (ADR-0024 decision 12).
+            let event = cgroup.kill_all(crate::recorder::CgroupKillReason::RunEnd);
+            let incomplete = event.error.clone();
+            writer.append(now_ms(), EventBody::CgroupKill(event))?;
+            if let Some(error) = incomplete {
+                return Err(RunError::RunCgroup(io::Error::other(error)));
+            }
+        }
         // run end is always a boundary (snapshot.md section 1): the final capture lands
         // after the tree is reaped, so no write can slip past it.
         let final_step = match (clock.as_mut(), config.capture) {
@@ -1932,6 +1998,18 @@ mod linux {
             wait_status,
             final_step,
         })
+    }
+
+    /// a pidfd for `pid`, which the caller owns as an unreaped child, so the pid cannot be
+    /// recycled before the descriptor exists.
+    fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
+        // SAFETY: pidfd_open takes scalars and returns a new descriptor or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor was just created and nothing else owns it.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
     }
 
     /// kill the direct child and reap it; the notify fd closes when `child` drops.

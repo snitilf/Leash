@@ -150,6 +150,10 @@ pub enum SessionError {
     /// the notify loop aborted (notify-loop.md's fail-closed arcs).
     #[error("run loop failed: {0}")]
     Run(#[from] crate::supervisor::run::RunError),
+    /// the run cgroup of a snapshot run could not be set up (ADR-0024 decision 2).
+    #[cfg(target_os = "linux")]
+    #[error("run cgroup: {0}")]
+    RunCgroup(#[from] crate::supervisor::run_cgroup::RunCgroupError),
     /// the confined realization broker could not be established or served.
     #[cfg(target_os = "linux")]
     #[error("broker failed: {0}")]
@@ -179,7 +183,10 @@ mod linux {
     use crate::supervisor::broker::Broker;
     use crate::supervisor::preflight::{self, Outcome};
     use crate::supervisor::run::run_loop;
-    use crate::supervisor::spawn::{SpawnSpec, spawn_supervised_with};
+    use crate::supervisor::run_cgroup::{
+        CgroupParent, RunCgroup, RunCgroupError, RunLock, cleanup_stale,
+    };
+    use crate::supervisor::spawn::{SpawnSpec, spawn_supervised_in_cgroup, spawn_supervised_with};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::io::Write;
@@ -213,6 +220,16 @@ mod linux {
             Outcome::Refuse(message) => return Err(SessionError::Refused(message)),
         };
         let enforcement = prepare_enforcement(&spec, caps.landlock_abi)?;
+        // a snapshot run needs a writable delegated cgroup; refuse before any run
+        // directory exists. its id is drawn now so meta names the cgroup (decision 2).
+        let (run_id, run_cgroup) = if spec.snapshot_integrity {
+            let parent = CgroupParent::locate()?;
+            let id = crate::recorder::generate_run_id(SystemTime::now())?;
+            let path = parent.child_path(&id)?;
+            (Some(id), Some(path))
+        } else {
+            (None, None)
+        };
 
         let meta = RunMeta {
             schema_version: TRACE_SCHEMA_VERSION,
@@ -227,8 +244,12 @@ mod linux {
             argv: spec.argv.clone(),
             workspace: spec.workspace.clone(),
             start_ts: now_ms()?,
+            run_cgroup,
         };
-        let run_dir = RunDir::create(&spec.state_root, &meta, SystemTime::now())?;
+        let run_dir = match run_id {
+            Some(id) => RunDir::create_with_id(&spec.state_root, &meta, id)?,
+            None => RunDir::create(&spec.state_root, &meta, SystemTime::now())?,
+        };
         let mut writer = run_dir.trace_writer()?;
         run_session_with_writer_and_ruleset(
             &spec,
@@ -397,6 +418,7 @@ mod linux {
         // step 4: run_start is appended and synced before the child exists, so any run
         // that produced a child also left durable evidence that it did (cli.md section 5)
         let mode = meta.mode;
+        let recorded_cgroup = meta.run_cgroup.clone();
         writer.append(meta.start_ts, EventBody::RunStart(meta))?;
         writer.sync()?;
 
@@ -419,16 +441,25 @@ mod linux {
             (root, _) => root,
         };
 
+        // a snapshot run holds its run lock for the whole run, cleans up the cgroups of
+        // dead runs, then creates its own. taken after the broker forks so the broker
+        // never inherits the lock (ADR-0024 decisions 2 and 17).
+        let snapshot_cgroup = start_run_cgroup(spec, run_dir, recorded_cgroup.as_deref(), writer)?;
+
         // steps 5-6: spawn and serve until the tree exits
-        let child = spawn_supervised_with(
-            &SpawnSpec {
-                argv: spec.argv.clone(),
-                stdout: None,
-                mode,
-                landlock_ruleset: prepared_ruleset.map(|ruleset| ruleset.ruleset_fd().as_raw_fd()),
-            },
-            spec.snapshot_integrity,
-        )?;
+        let spawn_spec = SpawnSpec {
+            argv: spec.argv.clone(),
+            stdout: None,
+            mode,
+            landlock_ruleset: prepared_ruleset.map(|ruleset| ruleset.ruleset_fd().as_raw_fd()),
+        };
+        let (child, _run_lock) = match snapshot_cgroup {
+            Some((lock, cgroup)) => (spawn_supervised_in_cgroup(&spawn_spec, cgroup)?, Some(lock)),
+            None => (
+                spawn_supervised_with(&spawn_spec, spec.snapshot_integrity)?,
+                None,
+            ),
+        };
         let config = match mode {
             Mode::RecordOnly => {
                 crate::supervisor::run::RunConfig::record_only(child.pid as u32, spec.attendance)
@@ -491,6 +522,42 @@ mod linux {
             run_path: run_dir.path.clone(),
             exit,
         })
+    }
+
+    /// the run lock and run cgroup of a snapshot run, with stale-cgroup cleanup between
+    /// them; `None` for every other run. the cleanup is recorded in the new run's trace.
+    fn start_run_cgroup<S: TraceSink>(
+        spec: &SessionSpec,
+        run_dir: &RunDir,
+        recorded: Option<&std::path::Path>,
+        writer: &mut TraceWriter<S>,
+    ) -> Result<Option<(RunLock, RunCgroup)>, SessionError> {
+        if !spec.snapshot_integrity {
+            return Ok(None);
+        }
+        let recorded = recorded.ok_or(RunCgroupError::MissingPath)?;
+        let parent_path = recorded.parent().ok_or(RunCgroupError::MissingPath)?;
+        let parent = CgroupParent::open_writable(parent_path)?;
+        let lock = RunLock::acquire(&run_dir.path)?;
+        match cleanup_stale(&parent, &spec.state_root, Some(&run_dir.id)) {
+            Ok(events) => {
+                for event in events {
+                    writer.append(now_ms()?, EventBody::CgroupKill(event))?;
+                }
+            }
+            // a cgroup that cannot be listed cannot hold a stale run Leash could clean; the
+            // new run does not depend on it, so say so and go on
+            Err(e) => eprintln!("leash: could not scan for stale run cgroups: {e}"),
+        }
+        let cgroup = RunCgroup::create(&parent, &run_dir.id)?;
+        if cgroup.path() != recorded {
+            return Err(RunCgroupError::PathMismatch {
+                created: cgroup.path().to_path_buf(),
+                recorded: recorded.to_path_buf(),
+            }
+            .into());
+        }
+        Ok(Some((lock, cgroup)))
     }
 
     /// wall-clock milliseconds; a clock before the epoch cannot stamp anything sane.

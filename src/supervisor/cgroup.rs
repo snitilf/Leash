@@ -24,6 +24,45 @@ impl Cgroup {
         Self::from_dir(dir)
     }
 
+    /// open the child `name` of a pinned parent directory, never following a symlink.
+    pub fn open_child(parent: &File, name: &CStr) -> io::Result<Self> {
+        // SAFETY: parent and name are live; openat returns a new owned descriptor.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd was returned by openat and is uniquely owned here.
+        Self::from_dir(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// the pinned directory descriptor, for `clone3(CLONE_INTO_CGROUP)`.
+    pub fn dir_fd(&self) -> std::os::fd::RawFd {
+        self.dir.as_raw_fd()
+    }
+
+    /// the pids currently listed in `cgroup.procs`.
+    pub fn members(&self) -> io::Result<Vec<u32>> {
+        self.read_control(c"cgroup.procs")?
+            .lines()
+            .map(|line| {
+                line.trim()
+                    .parse()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid cgroup pid"))
+            })
+            .collect()
+    }
+
+    /// wait until the kernel reports `populated 0`.
+    pub fn wait_unpopulated(&self, timeout: Duration) -> io::Result<()> {
+        self.wait_event("populated", false, timeout)
+    }
+
     fn from_dir(dir: File) -> io::Result<Self> {
         ensure_cgroup2(&dir)?;
         let group = Self { dir };
@@ -118,6 +157,34 @@ impl Cgroup {
             );
         }
     }
+}
+
+/// open a directory as a pinned cgroup v2 handle, never following a final symlink.
+pub fn open_cgroup_dir(path: &Path) -> io::Result<File> {
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    ensure_cgroup2(&dir)?;
+    Ok(dir)
+}
+
+/// create the cgroup directory `name` under a pinned parent.
+pub fn mkdir_child(parent: &File, name: &CStr) -> io::Result<()> {
+    // SAFETY: parent and name are live; mkdirat creates one child directory.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// remove the (empty) cgroup directory `name` under a pinned parent.
+pub fn rmdir_child(parent: &File, name: &CStr) -> io::Result<()> {
+    // SAFETY: parent and name are live; unlinkat with AT_REMOVEDIR removes one directory.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// exercise delegation, freezer confirmation, thaw, and whole-group termination using
