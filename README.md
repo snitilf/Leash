@@ -132,7 +132,7 @@ The project is documentation-driven: every decision is written down before it is
 
 - [Specification](docs/spec/SPEC.md): numbered requirements, the security ones included.
 - [Design](docs/design/): architecture, the notify loop, syscalls, policy, trace, and the escape inventory.
-- [Decision records](docs/adr/): 22 ADRs, from "why Rust" to which kernel races to accept.
+- [Decision records](docs/adr/): 23 ADRs, from "why Rust" to which kernel races to accept.
 - [Measurements](docs/measurements/): overhead and kernel behavior, with the method behind each number.
 - [Glossary](docs/CONTEXT.md): the project's vocabulary, used exactly.
 
