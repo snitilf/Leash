@@ -867,6 +867,39 @@ mod tests {
     }
 
     #[test]
+    fn run_cgroup_is_additive_and_cgroup_kill_has_a_stable_shape() {
+        let plain = serde_json::to_value(sample_meta()).unwrap();
+        assert!(
+            plain.get("run_cgroup").is_none(),
+            "absent outside a snapshot run"
+        );
+        let mut meta = sample_meta();
+        meta.run_cgroup = Some(PathBuf::from("/sys/fs/cgroup/a/leash-x"));
+        let value = serde_json::to_value(&meta).unwrap();
+        assert_eq!(value["run_cgroup"], "/sys/fs/cgroup/a/leash-x");
+        let old: RunMeta = serde_json::from_value(plain).unwrap();
+        assert!(old.run_cgroup.is_none(), "an older meta.json still decodes");
+
+        let kill = Event {
+            seq: 3,
+            ts: 9,
+            body: EventBody::CgroupKill(CgroupKillEvent {
+                reason: CgroupKillReason::StaleCleanup,
+                cgroup: "leash-x".into(),
+                processes: Some(2),
+                error: None,
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&kill).unwrap(),
+            json!({
+                "seq": 3, "ts": 9, "type": "cgroup_kill",
+                "reason": "stale_cleanup", "cgroup": "leash-x", "processes": 2
+            })
+        );
+    }
+
+    #[test]
     fn writer_surfaces_a_failed_write_as_an_error() {
         let mut writer = TraceWriter::new(FakeSink {
             fail_writes: true,
