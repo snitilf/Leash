@@ -134,6 +134,10 @@ pub enum SessionError {
     /// the recorder could not create the run directory or write to the trace.
     #[error("recorder failed: {0}")]
     Recorder(#[from] crate::recorder::RecorderError),
+    /// the state root could not be resolved before the child started, so the implicit deny
+    /// that protects it could not be armed (FR-21).
+    #[error("state root could not be resolved: {0}")]
+    StateRoot(#[source] std::io::Error),
     /// the child could not be spawned or the boundary could not be established.
     // spawn.rs is itself cfg(linux) (see supervisor::mod), so this variant is too; a
     // session on a non-linux host can never reach the point of constructing one.
@@ -365,6 +369,11 @@ mod linux {
         resolved_hosts: &HashMap<String, Vec<IpAddr>>,
     ) -> Result<SessionOutcome, SessionError> {
         refuse_snapshot_integrity_outside_enforce(spec)?;
+        // the state root is resolved once, here, before the child exists: the implicit
+        // enforce-mode deny compares resolved paths against this value (FR-21, ADR-0024)
+        let state_root = crate::supervisor::state_root::StateRoot::resolve(&spec.state_root)
+            .map_err(SessionError::StateRoot)?;
+
         // step 3: announce the mode on stderr; stdout belongs to the child (FR-19)
         match meta.mode {
             // the same FR-19/ADR-0019 wording the session report uses (report.rs): no policy
@@ -414,7 +423,8 @@ mod linux {
                     .as_ref()
                     .ok_or(crate::supervisor::run::RunError::MissingBroker)?,
                 resolved_hosts,
-            ),
+            )
+            .with_state_root(&state_root),
         }
         .with_ask_timeout(spec.ask_timeout)
         .with_snapshot_integrity(spec.snapshot_integrity);

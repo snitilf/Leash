@@ -1229,6 +1229,9 @@ fn enforce_survives_a_rename_whose_destination_cannot_be_prepared() {
         ],
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!stderr.contains("panicked"), "supervisor panicked: {stderr}");
+    assert!(
+        !stderr.contains("panicked"),
+        "supervisor panicked: {stderr}"
+    );
     assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
 }

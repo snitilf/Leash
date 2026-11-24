@@ -140,6 +140,10 @@ pub enum RunError {
     /// enforce mode reached the loop without a loaded policy.
     #[error("enforce mode requires a loaded policy")]
     EnforceWithoutPolicy,
+    /// enforce mode reached the loop without the resolved state root its implicit deny
+    /// protects (FR-21).
+    #[error("enforce mode requires the resolved state root")]
+    EnforceWithoutStateRoot,
     /// the confined side-effect broker failed, so the run aborts fail-closed.
     #[cfg(target_os = "linux")]
     #[error("confined realization broker failed: {0}")]
@@ -181,6 +185,9 @@ pub struct RunConfig<'a> {
     /// snapshot integrity restrictions apply (ADR-0024 decisions 7 and 8): `clone3` is
     /// answered ENOSYS unread and legacy AIO is denied. enforce mode only.
     pub snapshot_integrity: bool,
+    /// the resolved state root of an enforce run; evaluated as an implicit deny before any
+    /// policy rule (FR-21, ADR-0024). required in enforce mode, absent in record-only.
+    pub state_root: Option<&'a crate::supervisor::state_root::StateRoot>,
 }
 
 impl std::fmt::Debug for RunConfig<'_> {
@@ -210,6 +217,7 @@ impl<'a> RunConfig<'a> {
             broker: None,
             resolved_hosts: None,
             snapshot_integrity: false,
+            state_root: None,
         }
     }
 
@@ -227,6 +235,7 @@ impl<'a> RunConfig<'a> {
             broker: None,
             resolved_hosts: None,
             snapshot_integrity: false,
+            state_root: None,
         }
     }
 
@@ -250,6 +259,7 @@ impl<'a> RunConfig<'a> {
             broker: Some(broker),
             resolved_hosts: Some(resolved_hosts),
             snapshot_integrity: false,
+            state_root: None,
         }
     }
 
@@ -271,6 +281,12 @@ impl<'a> RunConfig<'a> {
         self
     }
 
+    /// name the resolved state root the implicit deny protects (FR-21, ADR-0024).
+    pub fn with_state_root(mut self, root: &'a crate::supervisor::state_root::StateRoot) -> Self {
+        self.state_root = Some(root);
+        self
+    }
+
     fn validate(self) -> Result<Self, RunError> {
         if self.capture.is_some() {
             return Err(RunError::CaptureUnavailable);
@@ -284,6 +300,9 @@ impl<'a> RunConfig<'a> {
         #[cfg(target_os = "linux")]
         if self.mode == crate::recorder::Mode::Enforce && self.broker.is_none() {
             return Err(RunError::MissingBroker);
+        }
+        if self.mode == crate::recorder::Mode::Enforce && self.state_root.is_none() {
+            return Err(RunError::EnforceWithoutStateRoot);
         }
         Ok(self)
     }
@@ -450,6 +469,44 @@ fn evaluate_tracked(
     request: &Request<'_>,
     asks: &mut Vec<ask::PendingAsk>,
 ) -> Evaluation {
+    evaluate_operand(config, request, false, asks)
+}
+
+/// the implicit state-root deny, ranked before every policy rule (FR-21, ADR-0024). it
+/// applies only in an enforce run that carries the root; `destination` marks the second
+/// operand of a rename or link, where naming an ancestor of the root replaces it.
+fn implicit_state_root_deny(
+    config: &RunConfig<'_>,
+    request: &Request<'_>,
+    destination: bool,
+) -> Option<Evaluation> {
+    if config.mode != crate::recorder::Mode::Enforce {
+        return None;
+    }
+    let root = config.state_root?;
+    let denied = match request {
+        Request::Fs { path, access } => {
+            root.denies_fs(std::path::Path::new(path), access, destination)
+        }
+        Request::Exec { binary } => root.denies_exec(std::path::Path::new(binary)),
+        Request::Net { .. } => false,
+    };
+    denied.then_some(Evaluation {
+        decision: Decision::Deny,
+        matched: crate::policy::MatchId::ImplicitStateRoot,
+        would_deny: None,
+    })
+}
+
+fn evaluate_operand(
+    config: &RunConfig<'_>,
+    request: &Request<'_>,
+    destination: bool,
+    asks: &mut Vec<ask::PendingAsk>,
+) -> Evaluation {
+    if let Some(eval) = implicit_state_root_deny(config, request, destination) {
+        return eval;
+    }
     let eval = match config.policy {
         Some(policy) => policy.evaluate(request, config.mode),
         None => Evaluation {
@@ -805,9 +862,10 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
     let secondary = if let Some(input) = secondary_input {
         // bind the result first: a `borrow_mut()` temporary in the match scrutinee would
         // live through the arms, and the arms release the primary through the same cell
-        let prepared = broker
-            .borrow_mut()
-            .prepare_path(input, secondary_follow, secondary_missing)?;
+        let prepared =
+            broker
+                .borrow_mut()
+                .prepare_path(input, secondary_follow, secondary_missing)?;
         match prepared {
             BrokerResultOrPath::Path(path) => Some(path),
             BrokerResultOrPath::Result(BrokerResult::Errno(errno)) => {
@@ -849,10 +907,11 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
         FsOperand::Path
     };
     let mut asks = Vec::new();
-    let primary_evals = evaluate_required_fs(config, &primary_identity, &primary_access, &mut asks);
+    let primary_evals =
+        evaluate_required_fs(config, &primary_identity, &primary_access, false, &mut asks);
     let secondary_evals = secondary.as_ref().map(|path| {
         let required = secondary_access(&invocation, path.exists());
-        evaluate_required_fs(config, path.identity(), &required, &mut asks)
+        evaluate_required_fs(config, path.identity(), &required, true, &mut asks)
     });
     let ask_resolution = settle_asks(config, &asks);
     let primary_decision = finalize_operand(primary_operand, primary_evals, ask_resolution);
@@ -1027,18 +1086,20 @@ fn evaluate_required_fs(
     config: &RunConfig<'_>,
     path: &std::path::Path,
     access: &[crate::recorder::FsAccess],
+    destination: bool,
     asks: &mut Vec<ask::PendingAsk>,
 ) -> Vec<(crate::recorder::FsAccess, Evaluation)> {
     let path_text = path.to_string_lossy();
     access
         .iter()
         .map(|required| {
-            let eval = evaluate_tracked(
+            let eval = evaluate_operand(
                 config,
                 &Request::Fs {
                     path: &path_text,
                     access: std::slice::from_ref(required),
                 },
+                destination,
                 asks,
             );
             (*required, eval)
@@ -2757,6 +2818,73 @@ mod tests {
         assert_eq!(decision.event_decision, Decision::Deny);
         assert_eq!(decision.response_decision, Decision::Deny);
         assert_eq!(decision.matched_rule, "base:enforce");
+    }
+
+    #[test]
+    fn the_implicit_state_root_deny_outranks_every_policy_rule() {
+        use crate::recorder::FsAccess::{Create, Delete, Read, Write};
+        let p = policy(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/**\"\nmode=[\"read\",\"write\",\"create\",\"delete\"]\naction=\"allow\"\n\
+             [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+        );
+        let root =
+            crate::supervisor::state_root::StateRoot::from_resolved("/var/leash".into()).unwrap();
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p).with_state_root(&root);
+        let denied = |path: &str, access: &[crate::recorder::FsAccess], destination: bool| {
+            let mut asks = Vec::new();
+            let eval = evaluate_operand(
+                &config,
+                &Request::Fs { path, access },
+                destination,
+                &mut asks,
+            );
+            (eval.decision, eval.matched.to_string())
+        };
+        for access in [Read, Write, Create, Delete] {
+            assert_eq!(
+                denied("/var/leash/runs/r/trace.jsonl", &[access], false),
+                (Decision::Deny, "implicit:state_root".to_string())
+            );
+        }
+        assert_eq!(
+            denied("/var", &[Delete], false),
+            (Decision::Deny, "implicit:state_root".to_string())
+        );
+        assert_eq!(
+            denied("/var", &[Create], true),
+            (Decision::Deny, "implicit:state_root".to_string())
+        );
+        // string-prefix siblings and plain ancestor reads fall through to the policy
+        assert_eq!(
+            denied("/var/leash2/f", &[Write], false),
+            (Decision::Allow, "fs.1".to_string())
+        );
+        assert_eq!(
+            denied("/var", &[Read], false),
+            (Decision::Allow, "fs.1".to_string())
+        );
+        let decision = resolve_decision(
+            &config,
+            &Request::Exec {
+                binary: "/var/leash/bin/x",
+            },
+        );
+        assert_eq!(decision.matched_rule, "implicit:state_root");
+        assert_eq!(decision.response_decision, Decision::Deny);
+    }
+
+    #[test]
+    fn a_run_without_a_state_root_is_not_subject_to_the_implicit_deny() {
+        let config = RunConfig::record_only(4242, Attendance::Unattended);
+        let decision = resolve_decision(
+            &config,
+            &Request::Fs {
+                path: "/var/leash/runs/r/trace.jsonl",
+                access: &[crate::recorder::FsAccess::Read],
+            },
+        );
+        assert_eq!(decision.response_decision, Decision::Allow);
     }
 
     #[test]
