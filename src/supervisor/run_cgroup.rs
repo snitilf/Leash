@@ -337,10 +337,17 @@ impl std::fmt::Debug for RunCgroup {
 }
 
 impl RunCgroup {
-    /// create `leash-<run_id>` under `parent` with no controllers, pin it, and probe that
-    /// freeze, thaw and kill work on it. the cgroup is removed again when the probe fails.
+    /// probe that the parent supports freeze, thaw and kill, then create `leash-<run_id>`
+    /// under it with no controllers, pin it, and confirm freeze and thaw on it. the cgroup
+    /// is removed again when that fails.
     pub fn create(parent: &CgroupParent, run_id: &str) -> Result<Self, RunCgroupError> {
         let (name_text, name) = cgroup_name(run_id)?;
+        // freeze, thaw and kill are proven on a sacrificial probe cgroup holding a real
+        // process, never on the run cgroup: on Linux 6.8 a cgroup that has been written
+        // `cgroup.kill` SIGKILLs every later `clone3(CLONE_INTO_CGROUP)` child, even when
+        // the cgroup was empty at the time, so the run cgroup must not be killed before use.
+        cgroup::probe_delegation(&parent.path, PROBE_TIMEOUT)
+            .map_err(|source| RunCgroupError::Probe { source })?;
         let create_error = |source| RunCgroupError::Create {
             path: parent.path.clone(),
             source,
@@ -363,13 +370,12 @@ impl RunCgroup {
             name_text,
             removed: false,
         };
-        // an empty cgroup confirms frozen=1, thaws, and accepts cgroup.kill; the entry of
-        // a real process is exercised by the clone3 spawn itself.
+        // an empty cgroup confirms frozen=1 and thaws; the entry of a real process is
+        // exercised by the clone3 spawn itself.
         let probe = run
             .group
             .set_frozen(true, PROBE_TIMEOUT)
-            .and_then(|()| run.group.set_frozen(false, PROBE_TIMEOUT))
-            .and_then(|()| run.group.kill(PROBE_TIMEOUT));
+            .and_then(|()| run.group.set_frozen(false, PROBE_TIMEOUT));
         if let Err(source) = probe {
             let _ = run.remove();
             return Err(RunCgroupError::Probe { source });
