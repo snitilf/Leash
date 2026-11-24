@@ -35,7 +35,9 @@ use crate::recorder::{
     AskResolution, Attendance, Decision, EventBody, Fact, FsOperandDecision, RecorderError,
     SyscallEvent, TraceSink, TraceWriter,
 };
-use crate::sandbox::filter::{AUDIT_ARCH_X86_64, DENIED_RECORDED, X32_SYSCALL_BIT, nr};
+use crate::sandbox::filter::{
+    AUDIT_ARCH_X86_64, DENIED_RECORDED, SNAPSHOT_TRAPPED, X32_SYSCALL_BIT, nr,
+};
 use crate::supervisor::ask;
 #[cfg(target_os = "linux")]
 use crate::supervisor::broker::{
@@ -95,6 +97,10 @@ pub mod rule {
     pub const PIDFD_GETFD: &str = "sr4:pidfd_getfd";
     /// broker path preparation or realization refused the operand
     pub const REALIZATION: &str = "failsafe:realization";
+    /// `clone3` answered ENOSYS in a snapshot run, before its struct is read (ADR-0024)
+    pub const SNAPSHOT_CLONE3: &str = "snapshot:clone3";
+    /// legacy AIO denied in a snapshot run (ADR-0024)
+    pub const SNAPSHOT_AIO: &str = "snapshot:aio";
 }
 
 /// how the run ended.
@@ -120,6 +126,9 @@ pub enum RunError {
     /// enforce mode reached the loop without its confined realization broker.
     #[error("enforce mode requires a confined realization broker")]
     MissingBroker,
+    /// snapshot integrity restrictions were requested outside enforce mode.
+    #[error("snapshot integrity restrictions require enforce mode")]
+    SnapshotIntegrityNeedsEnforce,
     /// enforce mode reached the loop without a loaded policy.
     #[error("enforce mode requires a loaded policy")]
     EnforceWithoutPolicy,
@@ -161,6 +170,9 @@ pub struct RunConfig<'a> {
     pub broker: Option<&'a RefCell<crate::supervisor::broker::Broker>>,
     /// pre-resolved exact hostname rules
     pub resolved_hosts: Option<&'a HashMap<String, Vec<IpAddr>>>,
+    /// snapshot integrity restrictions apply (ADR-0024 decisions 7 and 8): `clone3` is
+    /// answered ENOSYS unread and legacy AIO is denied. enforce mode only.
+    pub snapshot_integrity: bool,
 }
 
 impl std::fmt::Debug for RunConfig<'_> {
@@ -189,6 +201,7 @@ impl<'a> RunConfig<'a> {
             #[cfg(target_os = "linux")]
             broker: None,
             resolved_hosts: None,
+            snapshot_integrity: false,
         }
     }
 
@@ -205,6 +218,7 @@ impl<'a> RunConfig<'a> {
             #[cfg(target_os = "linux")]
             broker: None,
             resolved_hosts: None,
+            snapshot_integrity: false,
         }
     }
 
@@ -227,12 +241,19 @@ impl<'a> RunConfig<'a> {
             capture: None,
             broker: Some(broker),
             resolved_hosts: Some(resolved_hosts),
+            snapshot_integrity: false,
         }
     }
 
     /// set the attended-ask timeout (FR-10); the CLI passes `--ask-timeout` through here.
     pub fn with_ask_timeout(mut self, timeout: Duration) -> Self {
         self.ask_timeout = timeout;
+        self
+    }
+
+    /// apply the snapshot integrity restrictions (ADR-0024 decisions 7 and 8).
+    pub fn with_snapshot_integrity(mut self, snapshot_integrity: bool) -> Self {
+        self.snapshot_integrity = snapshot_integrity;
         self
     }
 
@@ -245,6 +266,9 @@ impl<'a> RunConfig<'a> {
     fn validate(self) -> Result<Self, RunError> {
         if self.capture.is_some() {
             return Err(RunError::CaptureUnavailable);
+        }
+        if self.snapshot_integrity && self.mode != crate::recorder::Mode::Enforce {
+            return Err(RunError::SnapshotIntegrityNeedsEnforce);
         }
         if self.mode == crate::recorder::Mode::Enforce && self.policy.is_none() {
             return Err(RunError::EnforceWithoutPolicy);
@@ -524,6 +548,28 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
             ts,
             notif,
             name,
+            Fact::Raw {},
+            &fixed_decision(Decision::Deny, matched_rule),
+        )?;
+        tolerate_dead(kernel.send_error(notif.id, libc::ENOSYS))?;
+        return Ok(Handled::Responded);
+    }
+
+    // snapshot runs (ADR-0024 decisions 7 and 8). clone3 is answered before its struct
+    // is read: the struct lives in agent memory, so a CLONE_INTO_CGROUP flag check would
+    // race the agent rewriting it. libc falls back to clone, which has no cgroup argument.
+    // AIO is denied because the freezer stops tasks, not in-flight I/O.
+    if config.snapshot_integrity && (sys_nr == nr::CLONE3 || SNAPSHOT_TRAPPED.contains(&sys_nr)) {
+        let matched_rule = if sys_nr == nr::CLONE3 {
+            rule::SNAPSHOT_CLONE3
+        } else {
+            rule::SNAPSHOT_AIO
+        };
+        record(
+            writer,
+            ts,
+            notif,
+            syscall_name(sys_nr).unwrap_or("unknown"),
             Fact::Raw {},
             &fixed_decision(Decision::Deny, matched_rule),
         )?;
@@ -2410,6 +2456,60 @@ mod tests {
             assert_eq!(ev["decision"], "deny");
             assert_eq!(ev["matched_rule"], rule::MEMORY_READ);
         }
+    }
+
+    #[test]
+    fn snapshot_run_answers_clone3_enosys_without_reading_the_struct() {
+        let p = policy("schema_version = 1\n");
+        let config =
+            RunConfig::enforce(4242, Attendance::Unattended, &p).with_snapshot_integrity(true);
+        // an unmapped struct pointer: any read would surface as memory_read, not the snapshot rule
+        for args in [
+            [0xdead, CLONE_ARGS_MIN_SIZE, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0],
+        ] {
+            let kernel = FakeNotifier::default();
+            let mut w = writer();
+            super::handle_notification(&kernel, &notif(nr::CLONE3, args), &mut w, &config, 1_000)
+                .unwrap();
+            assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::ENOSYS)]);
+            let ev = &events(w)[0];
+            assert_eq!(ev["syscall"], "clone3");
+            assert_eq!(ev["decision"], "deny");
+            assert_eq!(ev["matched_rule"], rule::SNAPSHOT_CLONE3);
+        }
+    }
+
+    #[test]
+    fn snapshot_run_denies_aio_and_leaves_clone_alone() {
+        let p = policy("schema_version = 1\n");
+        let config =
+            RunConfig::enforce(4242, Attendance::Unattended, &p).with_snapshot_integrity(true);
+        for (sys_nr, name) in [(nr::IO_SETUP, "io_setup"), (nr::IO_SUBMIT, "io_submit")] {
+            let kernel = FakeNotifier::default();
+            let mut w = writer();
+            super::handle_notification(&kernel, &notif(sys_nr, [0; 6]), &mut w, &config, 1_000)
+                .unwrap();
+            assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::ENOSYS)]);
+            let ev = &events(w)[0];
+            assert_eq!(ev["syscall"], name);
+            assert_eq!(ev["matched_rule"], rule::SNAPSHOT_AIO);
+        }
+        let kernel = FakeNotifier::default();
+        let mut w = writer();
+        super::handle_notification(&kernel, &notif(nr::CLONE, [0; 6]), &mut w, &config, 1_000)
+            .unwrap();
+        assert_eq!(kernel.sent(), vec!["continue:7"]);
+    }
+
+    #[test]
+    fn snapshot_integrity_is_refused_outside_enforce() {
+        let config =
+            RunConfig::record_only(1, Attendance::Unattended).with_snapshot_integrity(true);
+        assert!(matches!(
+            config.validate(),
+            Err(RunError::SnapshotIntegrityNeedsEnforce)
+        ));
     }
 
     #[test]

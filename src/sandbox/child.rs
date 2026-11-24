@@ -92,6 +92,14 @@ pub unsafe fn enter(setup: &ChildSetup) -> ! {
         }
     }
 
+    // the supervisor marks itself non-dumpable before it forks (ADR-0024 decision 9) and
+    // the flag survives fork. the agent keeps the default: the supervisor reads this
+    // process's memory through /proc/<pid>/mem, which refuses a non-dumpable target.
+    // SAFETY: prctl with PR_SET_DUMPABLE takes scalar args and touches no memory.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } != 0 {
+        die();
+    }
+
     // step 3: no_new_privs, then install the filter, which returns the notify fd.
     // SAFETY: prctl with PR_SET_NO_NEW_PRIVS takes scalar args and touches no memory.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {

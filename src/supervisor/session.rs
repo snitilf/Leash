@@ -84,6 +84,9 @@ pub struct SessionSpec {
     pub policy_path: Option<PathBuf>,
     /// the attended-ask timeout (FR-10), from `--ask-timeout` or the 60 s default.
     pub ask_timeout: std::time::Duration,
+    /// snapshot integrity restrictions apply (ADR-0024 decisions 7 and 8): `clone3` is
+    /// answered ENOSYS and legacy AIO is denied. enforce mode only; false by default.
+    pub snapshot_integrity: bool,
 }
 
 /// how a completed run ended.
@@ -107,6 +110,15 @@ pub enum SessionError {
     /// preflight could not probe the host at all.
     #[error("preflight probe failed: {0}")]
     Preflight(#[from] crate::supervisor::preflight::PreflightError),
+    /// snapshot integrity restrictions need the enforce-mode policy domain.
+    #[error(
+        "snapshot integrity restrictions require enforce mode; record-only cannot keep the agent away from snapshot state"
+    )]
+    SnapshotIntegrityNeedsEnforce,
+    /// the supervisor could not mark itself non-dumpable.
+    #[cfg(target_os = "linux")]
+    #[error("could not mark the supervisor non-dumpable: {0}")]
+    NonDumpable(#[source] std::io::Error),
     /// the policy file was missing or invalid.
     #[error("policy failed to load: {0}")]
     Policy(#[from] crate::policy::PolicyError),
@@ -160,7 +172,7 @@ mod linux {
     use crate::supervisor::broker::Broker;
     use crate::supervisor::preflight::{self, Outcome};
     use crate::supervisor::run::run_loop;
-    use crate::supervisor::spawn::{SpawnSpec, spawn_supervised};
+    use crate::supervisor::spawn::{SpawnSpec, spawn_supervised_with};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::io::Write;
@@ -181,6 +193,7 @@ mod linux {
     /// the notify loop, and the report, in the fixed order of cli.md section 5. every
     /// failure path returns without writing artifacts the run cannot vouch for.
     pub fn run_session(spec: SessionSpec) -> Result<SessionOutcome, SessionError> {
+        refuse_snapshot_integrity_outside_enforce(&spec)?;
         let caps = preflight::probe()?;
         let (caps, mechanism, mechanism_reason) = match preflight::evaluate(&caps, spec.mode) {
             Outcome::Proceed {
@@ -217,6 +230,28 @@ mod linux {
             enforcement.ruleset.as_ref(),
             &enforcement.resolved_hosts,
         )
+    }
+
+    /// the flag is honored only in enforce mode; refuse before anything exists.
+    fn refuse_snapshot_integrity_outside_enforce(spec: &SessionSpec) -> Result<(), SessionError> {
+        if spec.snapshot_integrity && spec.mode != Mode::Enforce {
+            return Err(SessionError::SnapshotIntegrityNeedsEnforce);
+        }
+        Ok(())
+    }
+
+    /// mark the supervisor non-dumpable (ADR-0024 decision 9): a same-uid process can
+    /// no longer ptrace it or read its `/proc/<pid>` files that need dumpability. the
+    /// flag is inherited by the broker. the agent child resets it to the default in
+    /// `sandbox::child::enter`, because the supervisor reads the child's memory through
+    /// `/proc/<child>/mem` and that access check consults the child's flag, not ours.
+    /// the supervisor's own ptrace-class access to the child is unaffected by this flag.
+    fn set_non_dumpable() -> Result<(), SessionError> {
+        // SAFETY: PR_SET_DUMPABLE takes scalar arguments and touches no memory.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err(SessionError::NonDumpable(std::io::Error::last_os_error()));
+        }
+        Ok(())
     }
 
     fn prepare_enforcement(
@@ -327,6 +362,7 @@ mod linux {
         prepared_ruleset: Option<&PreparedRuleset>,
         resolved_hosts: &HashMap<String, Vec<IpAddr>>,
     ) -> Result<SessionOutcome, SessionError> {
+        refuse_snapshot_integrity_outside_enforce(spec)?;
         // step 3: announce the mode on stderr; stdout belongs to the child (FR-19)
         match meta.mode {
             // the same FR-19/ADR-0019 wording the session report uses (report.rs): no policy
@@ -344,6 +380,8 @@ mod linux {
         writer.append(meta.start_ts, EventBody::RunStart(meta))?;
         writer.sync()?;
 
+        // before the broker forks and before the child exists (ADR-0024 decision 9)
+        set_non_dumpable()?;
         let broker = match mode {
             Mode::RecordOnly => None,
             Mode::Enforce => Some(RefCell::new(Broker::spawn(
@@ -355,12 +393,15 @@ mod linux {
         };
 
         // steps 5-6: spawn and serve until the tree exits
-        let child = spawn_supervised(&SpawnSpec {
-            argv: spec.argv.clone(),
-            stdout: None,
-            mode,
-            landlock_ruleset: prepared_ruleset.map(|ruleset| ruleset.ruleset_fd().as_raw_fd()),
-        })?;
+        let child = spawn_supervised_with(
+            &SpawnSpec {
+                argv: spec.argv.clone(),
+                stdout: None,
+                mode,
+                landlock_ruleset: prepared_ruleset.map(|ruleset| ruleset.ruleset_fd().as_raw_fd()),
+            },
+            spec.snapshot_integrity,
+        )?;
         let config = match mode {
             Mode::RecordOnly => {
                 crate::supervisor::run::RunConfig::record_only(child.pid as u32, spec.attendance)
@@ -375,7 +416,8 @@ mod linux {
                 resolved_hosts,
             ),
         }
-        .with_ask_timeout(spec.ask_timeout);
+        .with_ask_timeout(spec.ask_timeout)
+        .with_snapshot_integrity(spec.snapshot_integrity);
         let outcome = run_loop(child, config, writer)?;
 
         // step 7: an undecodable status stamps nothing (an untruthful exit is worse
