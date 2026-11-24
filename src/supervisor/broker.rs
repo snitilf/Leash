@@ -163,6 +163,11 @@ struct AnchorMeta {
 }
 
 impl Broker {
+    /// The broker process id, so its `/proc/<pid>` tree can be denied to the agent.
+    pub fn pid(&self) -> u32 {
+        u32::try_from(self.pid).unwrap_or(0)
+    }
+
     /// Fork, confine, and handshake with a broker before the agent is spawned.
     pub fn spawn(prepared: &PreparedRuleset, workspace: &Path) -> Result<Self, BrokerError> {
         let (parent_socket, child_socket) = seqpacket_pair()?;
@@ -493,12 +498,47 @@ struct BrokerState<'a> {
     next_token: u64,
 }
 
+/// close every descriptor of this process except those in `keep`, with `close_range` over
+/// the gaps between them.
+fn close_all_except(keep: &[libc::c_int]) {
+    let mut keep: Vec<libc::c_uint> = keep
+        .iter()
+        .filter_map(|fd| libc::c_uint::try_from(*fd).ok())
+        .collect();
+    keep.sort_unstable();
+    keep.dedup();
+    let mut next: libc::c_uint = 0;
+    for fd in keep {
+        if fd > next {
+            // SAFETY: close_range closes only descriptors of this process in [next, fd - 1].
+            unsafe { libc::syscall(libc::SYS_close_range, next, fd - 1, 0 as libc::c_uint) };
+        }
+        next = fd + 1;
+    }
+    // SAFETY: as above, for the open-ended tail.
+    unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            next,
+            libc::c_uint::MAX,
+            0 as libc::c_uint,
+        )
+    };
+}
+
 fn broker_child(
     socket: OwnedFd,
     ruleset: BorrowedFd<'_>,
     anchors: &[RootAnchor],
     workspace: &Path,
 ) -> i32 {
+    // the fork inherited every descriptor the supervisor holds, among them the live trace and
+    // the run directory. the broker keeps only stdio, its socket, the ruleset (until it has
+    // restricted itself) and the policy anchors, so a compromised broker cannot write the
+    // trace through an inherited descriptor.
+    let mut keep: Vec<libc::c_int> = vec![0, 1, 2, socket.as_raw_fd(), ruleset.as_raw_fd()];
+    keep.extend(anchors.iter().map(|anchor| anchor.as_fd().as_raw_fd()));
+    close_all_except(&keep);
     // SAFETY: prctl changes only this broker process.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         let _ = send_packet(
@@ -521,6 +561,15 @@ fn broker_child(
         );
         return 71;
     }
+    // the ruleset descriptor has done its job; this process is the forked copy and the
+    // parent still owns the original
+    close_all_except(
+        &keep
+            .iter()
+            .copied()
+            .filter(|fd| *fd != ruleset.as_raw_fd())
+            .collect::<Vec<_>>(),
+    );
     if send_packet(socket.as_raw_fd(), &Response::Ready, None).is_err() {
         return 72;
     }

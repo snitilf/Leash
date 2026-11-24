@@ -1143,6 +1143,7 @@ fn trace_failure_mid_run_aborts_without_run_end_or_report() {
         mode: Mode::RecordOnly,
         attendance: Attendance::Unattended,
         state_root: state.path().to_path_buf(),
+        state_root_spelling: state.path().to_path_buf(),
         workspace: ws.path().to_path_buf(),
         policy_path: None,
         ask_timeout: Duration::from_secs(60),
@@ -1209,4 +1210,125 @@ fn state_dir_inside_workspace_is_refused() {
         stderr.contains("workspace"),
         "the refusal names the workspace rule: {stderr}"
     );
+}
+
+/// a rename whose destination cannot be prepared (its parent does not exist) must be a
+/// clean refusal of that one syscall, not a panic that takes the supervisor down.
+#[test]
+fn enforce_survives_a_rename_whose_destination_cannot_be_prepared() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join("source.txt"), b"source").unwrap();
+    let (out, state) = run_enforce(
+        "schema_version = 1\n\
+         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+         [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+        ws.path(),
+        &[
+            "/bin/sh",
+            "-c",
+            // no `2>/dev/null`: this policy grants no write to /dev/null, and a redirect the
+            // shell cannot open fails the command before `mv` ever runs
+            "mv source.txt no-such-dir/destination.txt; exit 0",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "supervisor panicked: {stderr}"
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    // the refused rename is recorded as a realization failure, not dropped, and the file
+    // the agent tried to move is still where it was
+    let runs: Vec<_> = std::fs::read_dir(state.path().join("runs"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let trace = std::fs::read_to_string(runs[0].join("trace.jsonl")).unwrap();
+    let refused = trace.lines().any(|line| {
+        let ev: serde_json::Value = serde_json::from_str(line).unwrap();
+        ev["syscall"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("rename"))
+            && ev["matched_rule"] == "failsafe:realization"
+    });
+    assert!(
+        refused,
+        "no rename event with failsafe:realization: {trace}"
+    );
+    assert_eq!(
+        std::fs::read(ws.path().join("source.txt")).unwrap(),
+        b"source",
+        "the source file must survive the refused rename"
+    );
+}
+
+/// FR-21 (ADR-0024): an enforce session whose state root cannot be resolved refuses before
+/// any event is written and before any process exists, because the implicit deny it would
+/// have armed cannot be built. a record-only session needs no root and still runs.
+#[test]
+fn enforce_session_without_a_resolvable_state_root_refuses_before_spawn() {
+    use leash::recorder::{Attendance, Mode, RunMeta, SnapshotMechanism, TRACE_SCHEMA_VERSION};
+    use leash::supervisor::session::{SessionError, SessionSpec, run_session_with_writer};
+
+    let ws = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let marker = ws.path().join("spawned");
+    let argv = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        format!("touch {}", marker.display()),
+    ];
+    let session = |mode: Mode| {
+        let meta = RunMeta {
+            schema_version: TRACE_SCHEMA_VERSION,
+            mode,
+            attendance: Attendance::Unattended,
+            policy_digest: None,
+            kernel: "test".into(),
+            landlock_abi: None,
+            landlock_residuals: None,
+            snapshot_mechanism: SnapshotMechanism::Copy,
+            snapshot_reason: "test fixture".into(),
+            argv: argv.clone(),
+            workspace: ws.path().to_path_buf(),
+            start_ts: 1,
+        };
+        let run_dir =
+            leash::recorder::RunDir::create(state.path(), &meta, std::time::SystemTime::now())
+                .unwrap();
+        let spec = SessionSpec {
+            argv: argv.clone(),
+            mode,
+            attendance: Attendance::Unattended,
+            state_root: state.path().to_path_buf(),
+            // a spelling that does not resolve: the root the deny would protect is unknowable
+            state_root_spelling: state.path().join("does-not-exist"),
+            workspace: ws.path().to_path_buf(),
+            policy_path: None,
+            ask_timeout: Duration::from_secs(60),
+            snapshot_integrity: false,
+        };
+        let mut writer = run_dir.trace_writer().unwrap();
+        let result = run_session_with_writer(&spec, meta, &run_dir, &mut writer);
+        (
+            result,
+            std::fs::read(run_dir.path.join("trace.jsonl")).unwrap(),
+        )
+    };
+
+    let (result, written) = session(Mode::Enforce);
+    assert!(
+        matches!(result, Err(SessionError::StateRoot(_))),
+        "enforce must refuse: {result:?}"
+    );
+    assert!(written.is_empty(), "no event may precede the refusal");
+    assert!(!marker.exists(), "the agent must never have been spawned");
+
+    let (result, _) = session(Mode::RecordOnly);
+    assert!(
+        result.is_ok(),
+        "record-only must not resolve a state root: {result:?}"
+    );
+    assert!(marker.exists(), "the record-only agent ran");
 }

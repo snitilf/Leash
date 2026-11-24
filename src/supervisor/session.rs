@@ -78,6 +78,9 @@ pub struct SessionSpec {
     pub attendance: Attendance,
     /// the resolved state root the run directory is created under.
     pub state_root: PathBuf,
+    /// the absolute state-root path as the operator spelled it, before canonicalization. an
+    /// enforce run walks it for symlink hops and protects each one (FR-21, ADR-0024).
+    pub state_root_spelling: PathBuf,
     /// the canonicalized workspace the run supervises.
     pub workspace: PathBuf,
     /// optional policy path; present means enforce mode and is loaded during preflight.
@@ -134,6 +137,10 @@ pub enum SessionError {
     /// the recorder could not create the run directory or write to the trace.
     #[error("recorder failed: {0}")]
     Recorder(#[from] crate::recorder::RecorderError),
+    /// the state root could not be resolved before the child started, so the implicit deny
+    /// that protects it could not be armed (FR-21).
+    #[error("state root could not be resolved: {0}")]
+    StateRoot(#[source] std::io::Error),
     /// the child could not be spawned or the boundary could not be established.
     // spawn.rs is itself cfg(linux) (see supervisor::mod), so this variant is too; a
     // session on a non-linux host can never reach the point of constructing one.
@@ -365,6 +372,17 @@ mod linux {
         resolved_hosts: &HashMap<String, Vec<IpAddr>>,
     ) -> Result<SessionOutcome, SessionError> {
         refuse_snapshot_integrity_outside_enforce(spec)?;
+        // an enforce run resolves its state root once, here, before any process exists: the
+        // implicit deny compares resolved paths against this value (FR-21, ADR-0024). a root
+        // that cannot be resolved refuses the run. record-only has no deny, so it needs none.
+        let state_root = match meta.mode {
+            Mode::RecordOnly => None,
+            Mode::Enforce => Some(
+                crate::supervisor::state_root::StateRoot::resolve(&spec.state_root_spelling)
+                    .map_err(SessionError::StateRoot)?,
+            ),
+        };
+
         // step 3: announce the mode on stderr; stdout belongs to the child (FR-19)
         match meta.mode {
             // the same FR-19/ADR-0019 wording the session report uses (report.rs): no policy
@@ -392,6 +410,15 @@ mod linux {
             )?)),
         };
 
+        // the supervisor and its broker are the processes whose /proc tree the agent must not
+        // reach (implicit:supervisor_proc)
+        let state_root = match (state_root, broker.as_ref()) {
+            (Some(root), Some(broker)) => {
+                Some(root.with_supervisor_pids([std::process::id(), broker.borrow().pid()]))
+            }
+            (root, _) => root,
+        };
+
         // steps 5-6: spawn and serve until the tree exits
         let child = spawn_supervised_with(
             &SpawnSpec {
@@ -414,6 +441,9 @@ mod linux {
                     .as_ref()
                     .ok_or(crate::supervisor::run::RunError::MissingBroker)?,
                 resolved_hosts,
+                state_root
+                    .as_ref()
+                    .ok_or(crate::supervisor::run::RunError::EnforceWithoutStateRoot)?,
             ),
         }
         .with_ask_timeout(spec.ask_timeout)

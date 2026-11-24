@@ -256,6 +256,64 @@ fn production_broker_prepares_and_commits_an_allowed_open() {
     assert_eq!(contents, "prepared-open");
 }
 
+/// the broker is a forked copy of the supervisor and must drop every descriptor it does not
+/// need, the live trace above all. a real run's supervisor and broker are non-dumpable, so
+/// their `/proc/<pid>/fd` is unreadable from outside; this test process is dumpable, which
+/// lets it read the broker's table directly and see exactly what the production
+/// `Broker::spawn` leaves open after its handshake.
+#[test]
+fn broker_closes_inherited_descriptors_it_does_not_need() {
+    let _guard = fork_guard();
+    let workspace = tempfile::tempdir().unwrap();
+    let run_dir = tempfile::tempdir().unwrap();
+    // stand-ins for what the supervisor holds when it forks: the live trace, a run directory
+    // handle, and a spare descriptor (the fork keeps all of them)
+    let trace = std::fs::File::create(run_dir.path().join("trace.jsonl")).unwrap();
+    let run_handle = std::fs::File::open(run_dir.path()).unwrap();
+    let spare = std::fs::File::open("/dev/null").unwrap();
+    let policy = Policy::parse(
+        "schema_version = 1\n",
+        &ExpandContext {
+            workspace: workspace.path().to_str().unwrap(),
+            home: "/tmp",
+        },
+    )
+    .unwrap();
+    let prepared_ruleset = landlock::prepare_ruleset(&landlock::derive_hull(&policy, 4)).unwrap();
+    let broker = Broker::spawn(&prepared_ruleset, workspace.path()).unwrap();
+
+    // dumpable here, so the table is readable; a failed read must fail the test, never pass it
+    let fd_dir = format!("/proc/{}/fd", broker.pid());
+    let held: Vec<(i32, String)> = std::fs::read_dir(&fd_dir)
+        .unwrap_or_else(|e| panic!("cannot read {fd_dir}: {e}"))
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let fd = entry.file_name().to_str().unwrap().parse::<i32>().unwrap();
+            let target = std::fs::read_link(entry.path()).ok();
+            (
+                fd,
+                target.map_or_else(String::new, |t| t.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    assert!(
+        held.len() >= 4,
+        "the broker keeps stdio and its socket at least: {held:?}"
+    );
+    for stand_in in [trace.as_raw_fd(), run_handle.as_raw_fd(), spare.as_raw_fd()] {
+        assert!(
+            held.iter().all(|(fd, _)| *fd != stand_in),
+            "the broker still holds inherited descriptor {stand_in}: {held:?}"
+        );
+    }
+    let run_prefix = run_dir.path().to_str().unwrap();
+    assert!(
+        held.iter()
+            .all(|(_, t)| !t.contains("trace.jsonl") && !t.starts_with(run_prefix)),
+        "the broker holds the trace or a run directory: {held:?}"
+    );
+}
+
 #[test]
 fn production_broker_preserves_o_path_directory_validation() {
     let _guard = fork_guard();

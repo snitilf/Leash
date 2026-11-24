@@ -877,6 +877,7 @@ fn enforce_mode_without_policy_is_refused() {
         resolved_hosts: None,
         capture: None,
         snapshot_integrity: false,
+        state_root: None,
     };
     let result = run_loop(child, config, &mut writer);
     assert!(matches!(result, Err(RunError::EnforceWithoutPolicy)));
