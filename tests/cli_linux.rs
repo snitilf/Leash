@@ -460,7 +460,71 @@ fn enforce_rejects_workspace_symlink_and_proc_magic_link_escapes() {
         event["fact"]["path"] == "/proc/self/fd/0"
             && event["decision"] == "deny"
             && event["matched_rule"] == "failsafe:realization"
+            && event["errno"].is_string()
+            && event["errno"] != "ENOENT"
     }));
+    let report =
+        std::fs::read_to_string(only_run_dir(proc_state.path()).join("report.txt")).unwrap();
+    assert!(
+        report
+            .lines()
+            .any(|line| line.starts_with("  /proc/self/fd/0  [read]  denied (E")),
+        "a refused resolution must stay denied and name its errno: {report}"
+    );
+}
+
+#[test]
+fn enforce_reports_a_missing_path_as_not_found_not_denied() {
+    let ws = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let policy_path = state.path().join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        "schema_version = 1\n\
+         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+         [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+    )
+    .unwrap();
+    let missing = "/usr/lib/locale/leash-no-such-locale/LC_ADDRESS";
+    let out = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--",
+            "/bin/cat",
+            missing,
+        ],
+        ws.path(),
+    );
+    assert_ne!(out.status.code(), Some(0));
+    assert_ne!(
+        out.status.code(),
+        Some(125),
+        "the enforce run must start successfully: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run_dir = only_run_dir(state.path());
+    let events = trace_events(&run_dir);
+    let event = events
+        .iter()
+        .find(|event| event["fact"]["path"] == missing)
+        .unwrap_or_else(|| panic!("missing-path event not in trace: {events:#?}"));
+    assert_eq!(event["decision"], "deny");
+    assert_eq!(event["matched_rule"], "failsafe:realization");
+    assert_eq!(event["errno"], "ENOENT");
+    let report = std::fs::read_to_string(run_dir.join("report.txt")).unwrap();
+    assert!(
+        report.contains(&format!("  {missing}  [read]  not found\n")),
+        "a missing path must report as not found: {report}"
+    );
+    assert!(
+        !report.contains(&format!("{missing}  [read]  denied")),
+        "a missing path must not report as denied: {report}"
+    );
 }
 
 #[test]

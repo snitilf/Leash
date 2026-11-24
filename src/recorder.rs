@@ -159,6 +159,36 @@ pub struct SyscallEvent {
     /// independent policy evidence for each authorized operand of a two-path operation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operand_decisions: Option<Vec<FsOperandDecision>>,
+    /// symbolic errno the child received on an enforce-mode realization failure
+    /// (`failsafe:realization`); absent on every other event
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errno: Option<String>,
+}
+
+/// the symbolic name of an errno value as written to the trace `errno` field. the set is the
+/// errnos the realization broker can return for a path (trace.md section 2); an unnamed value
+/// is written `errno_<n>` so the field is never lossy.
+pub fn errno_name(errno: i32) -> String {
+    let name = match errno {
+        libc::ENOENT => "ENOENT",
+        libc::ENOTDIR => "ENOTDIR",
+        libc::ELOOP => "ELOOP",
+        libc::EXDEV => "EXDEV",
+        libc::EACCES => "EACCES",
+        libc::EPERM => "EPERM",
+        libc::EBADF => "EBADF",
+        libc::EINVAL => "EINVAL",
+        libc::ENAMETOOLONG => "ENAMETOOLONG",
+        libc::EOPNOTSUPP => "EOPNOTSUPP",
+        libc::EEXIST => "EEXIST",
+        libc::EISDIR => "EISDIR",
+        libc::EMFILE => "EMFILE",
+        libc::ENFILE => "ENFILE",
+        libc::ENOMEM => "ENOMEM",
+        libc::EIO => "EIO",
+        _ => return format!("errno_{errno}"),
+    };
+    name.to_string()
 }
 
 /// Policy evidence for one operand of a two-path filesystem operation.
@@ -520,6 +550,7 @@ mod tests {
                 matched_rule: "base:workspace".into(),
                 would_deny: None,
                 operand_decisions: None,
+                errno: None,
             }),
         };
         assert_eq!(
@@ -574,6 +605,7 @@ mod tests {
                         matched_rule: "base:enforce".into(),
                     },
                 ]),
+                errno: None,
             }),
         };
         assert_eq!(
@@ -618,11 +650,42 @@ mod tests {
                 matched_rule: "sr4:io_uring".into(),
                 would_deny: None,
                 operand_decisions: None,
+                errno: None,
             }),
         };
         assert_eq!(as_value(&event)["fact"], json!({ "family": "raw" }));
         assert_eq!(as_value(&event)["decision"], "deny");
         assert_eq!(as_value(&event)["syscall"], "io_uring_setup");
+    }
+
+    #[test]
+    fn realization_failure_serializes_its_errno_name() {
+        let event = |errno: Option<String>| Event {
+            seq: 6,
+            ts: 1_783_535_405_400,
+            body: EventBody::Syscall(SyscallEvent {
+                pid: 4242,
+                syscall: "openat".into(),
+                fact: Fact::Fs {
+                    path: "/usr/lib/locale/C.UTF-8/LC_ADDRESS".into(),
+                    access: vec![FsAccess::Read],
+                    dest: None,
+                },
+                decision: Decision::Deny,
+                ask_resolution: None,
+                matched_rule: "failsafe:realization".into(),
+                would_deny: None,
+                operand_decisions: None,
+                errno,
+            }),
+        };
+        let with = as_value(&event(Some(errno_name(libc::ENOENT))));
+        assert_eq!(with["errno"], "ENOENT");
+        assert_eq!(with["decision"], "deny");
+        assert_eq!(with["matched_rule"], "failsafe:realization");
+        assert!(as_value(&event(None)).get("errno").is_none());
+        assert_eq!(errno_name(libc::ELOOP), "ELOOP");
+        assert_eq!(errno_name(9999), "errno_9999");
     }
 
     #[test]
@@ -642,6 +705,7 @@ mod tests {
                 matched_rule: "net.2".into(),
                 would_deny: Some(true),
                 operand_decisions: None,
+                errno: None,
             }),
         };
         assert_eq!(

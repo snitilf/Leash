@@ -1009,13 +1009,15 @@ fn record_realization_deny<N: Notifier, S: TraceSink>(
     access: Vec<crate::recorder::FsAccess>,
     errno: i32,
 ) -> Result<Handled, RunError> {
-    record(
+    record_event(
         writer,
         ts,
         notif,
         syscall,
         Fact::Fs { path, access, dest },
         &fixed_decision(Decision::Deny, rule::REALIZATION),
+        None,
+        Some(crate::recorder::errno_name(errno)),
     )?;
     tolerate_dead(kernel.send_error(notif.id, errno))?;
     Ok(Handled::Responded)
@@ -1500,6 +1502,29 @@ fn record_with_operands<S: TraceSink>(
     decision: &ResolvedDecision,
     operand_decisions: Option<Vec<FsOperandDecision>>,
 ) -> Result<(), RunError> {
+    record_event(
+        writer,
+        ts,
+        notif,
+        name,
+        fact,
+        decision,
+        operand_decisions,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_event<S: TraceSink>(
+    writer: &mut TraceWriter<S>,
+    ts: u64,
+    notif: &SeccompNotif,
+    name: &str,
+    fact: Fact,
+    decision: &ResolvedDecision,
+    operand_decisions: Option<Vec<FsOperandDecision>>,
+    errno: Option<String>,
+) -> Result<(), RunError> {
     writer.append(
         ts,
         EventBody::Syscall(SyscallEvent {
@@ -1511,6 +1536,7 @@ fn record_with_operands<S: TraceSink>(
             matched_rule: decision.matched_rule.clone(),
             would_deny: decision.would_deny,
             operand_decisions,
+            errno,
         }),
     )?;
     Ok(())
