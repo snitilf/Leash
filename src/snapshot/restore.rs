@@ -31,6 +31,13 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 const COPY_BUF_LEN: usize = 64 * 1024;
 const MAX_XATTR_RETRIES: usize = 4;
+/// prefix of every temporary name `apply` creates; a killed apply can leave these behind
+/// and the next apply removes them from the directories it touches.
+const TEMP_PREFIX: &str = ".leash-restore-";
+/// `openat2` walks a parent path in chunks of at most this many components ...
+const CHUNK_MAX_COMPONENTS: usize = 64;
+/// ... and at most this many bytes, so no single call nears PATH_MAX.
+const CHUNK_MAX_BYTES: usize = 2048;
 
 /// chain head over step manifest digests.
 ///
@@ -617,6 +624,19 @@ pub enum RestoreError {
         /// effective gid of this process.
         egid: u32,
     },
+    /// the process does not own an entry whose metadata the plan changes.
+    #[error(
+        "cannot change metadata of {}: owned by uid {uid}, running as uid {euid} without root",
+        display_path(.path)
+    )]
+    NotOwner {
+        /// relative path.
+        path: String,
+        /// uid the manifest records for the entry.
+        uid: u32,
+        /// effective uid of this process.
+        euid: u32,
+    },
     /// the bytes written for a file do not hash to the manifest digest.
     #[error("bytes written for {} hash to {actual}, manifest says {expected}", display_path(.path))]
     ContentMismatch {
@@ -775,21 +795,43 @@ fn fstatat_nofollow(dir: RawFd, name: &CStr, path: &str) -> Result<libc::stat, R
     Ok(unsafe { st.assume_init() })
 }
 
-/// open the directory `rel` beneath `root`, refusing any symlink or magic link on the way
-/// and any escape from `root`. `rel` empty means `root` itself.
-fn open_dir_beneath(root: &File, rel: &str, path: &str) -> Result<File, RestoreError> {
-    let c_rel = cstring(if rel.is_empty() { "." } else { rel }, path)?;
+/// split `rel` (components joined by `/`, none empty) into slices of whole components,
+/// each at most `CHUNK_MAX_COMPONENTS` components and `CHUNK_MAX_BYTES` bytes unless one
+/// component alone is longer.
+fn path_chunks(rel: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let (mut start, mut count, mut pos) = (0usize, 0usize, 0usize);
+    for component in rel.split('/') {
+        let end = pos + component.len();
+        if count > 0 && (count == CHUNK_MAX_COMPONENTS || end - start > CHUNK_MAX_BYTES) {
+            // close the chunk before this component, dropping the separator
+            chunks.push(&rel[start..pos - 1]);
+            start = pos;
+            count = 0;
+        }
+        count += 1;
+        pos = end + 1;
+    }
+    if count > 0 {
+        chunks.push(&rel[start..]);
+    }
+    chunks
+}
+
+/// one `openat2` of `rel` beneath `base`, refusing symlinks, magic links and escapes.
+fn open_dir_chunk(base: &File, rel: &str, path: &str) -> Result<File, RestoreError> {
+    let c_rel = cstring(rel, path)?;
     let how = OpenHow {
         flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
         mode: 0,
         resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
     };
-    // SAFETY: root is a live directory descriptor, c_rel is NUL-terminated, and `how` is a
+    // SAFETY: base is a live directory descriptor, c_rel is NUL-terminated, and `how` is a
     // complete open_how of the size passed.
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,
-            root.as_raw_fd(),
+            base.as_raw_fd(),
             c_rel.as_ptr(),
             &raw const how,
             size_of::<OpenHow>(),
@@ -808,10 +850,77 @@ fn open_dir_beneath(root: &File, rel: &str, path: &str) -> Result<File, RestoreE
     Ok(unsafe { File::from_raw_fd(fd as RawFd) })
 }
 
+/// open the directory `rel` beneath `root`, refusing any symlink or magic link on the way
+/// and any escape from `root`. `rel` empty means `root` itself.
+///
+/// the parent is walked in chunks of components, each chunk opened with the same resolve
+/// flags from the previous chunk's handle, so a path longer than PATH_MAX (a deep tree an
+/// agent built with relative `mkdirat`) is still reachable.
+fn open_dir_beneath(root: &File, rel: &str, path: &str) -> Result<File, RestoreError> {
+    let mut chunks = path_chunks(rel).into_iter();
+    let Some(first) = chunks.next() else {
+        return open_dir_chunk(root, ".", path);
+    };
+    let mut dir = open_dir_chunk(root, first, path)?;
+    for chunk in chunks {
+        dir = open_dir_chunk(&dir, chunk, path)?;
+    }
+    Ok(dir)
+}
+
+/// names in `dir`, without `.` and `..`, in directory order.
+fn read_dir_names(dir: &File, path: &str) -> Result<Vec<CString>, RestoreError> {
+    // SAFETY: dir is a live directory descriptor; "." reopens it as an independent open file
+    // description at offset 0.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(last_err("openat", path));
+    }
+    // SAFETY: fd is a uniquely owned directory descriptor; fdopendir takes ownership on
+    // success.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: fdopendir failed, so fd is still ours to close.
+        unsafe { libc::close(fd) };
+        return Err(io_err("fdopendir", path, err));
+    }
+    let mut names = Vec::new();
+    let result = loop {
+        // SAFETY: __errno_location returns the current thread's errno slot.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: stream is a live DIR* owned by this function.
+        let ent = unsafe { libc::readdir(stream) };
+        if ent.is_null() {
+            let err = io::Error::last_os_error();
+            break if err.raw_os_error() == Some(0) {
+                Ok(())
+            } else {
+                Err(io_err("readdir", path, err))
+            };
+        }
+        // SAFETY: ent is non-null and d_name is NUL-terminated, valid until the next
+        // readdir or closedir.
+        let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
+        if name != c"." && name != c".." {
+            names.push(name.to_owned());
+        }
+    };
+    // SAFETY: stream came from fdopendir and is closed exactly once.
+    unsafe { libc::closedir(stream) };
+    result.map(|()| names)
+}
+
 fn temp_name() -> Result<CString, RestoreError> {
     let mut rnd = [0u8; 16];
     getrandom::fill(&mut rnd).map_err(|e| RestoreError::Random(e.to_string()))?;
-    CString::new(format!(".leash-restore-{}", hex_encode(&rnd)))
+    CString::new(format!("{TEMP_PREFIX}{}", hex_encode(&rnd)))
         .map_err(|_| RestoreError::Random("temporary name has a NUL byte".into()))
 }
 
@@ -855,7 +964,6 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 }
 
 fn list_user_xattrs(fd: RawFd, path: &str) -> Result<Vec<CString>, RestoreError> {
-    let mut buf = Vec::new();
     for _ in 0..MAX_XATTR_RETRIES {
         // SAFETY: fd is live; a null list with size 0 queries the needed length.
         let needed = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
@@ -880,14 +988,19 @@ fn list_user_xattrs(fd: RawFd, path: &str) -> Result<Vec<CString>, RestoreError>
             return Err(io_err("flistxattr", path, err));
         }
         list.truncate(got as usize);
-        buf = list;
-        break;
+        return Ok(list
+            .split(|&b| b == 0)
+            .filter(|name| name.starts_with(b"user."))
+            .filter_map(|name| CString::new(name).ok())
+            .collect());
     }
-    Ok(buf
-        .split(|&b| b == 0)
-        .filter(|name| name.starts_with(b"user."))
-        .filter_map(|name| CString::new(name).ok())
-        .collect())
+    // the list kept growing between the length query and the read; guessing "no xattrs"
+    // would leave stale attributes behind
+    Err(io_err(
+        "flistxattr",
+        path,
+        io::Error::other("xattr list size changed repeatedly"),
+    ))
 }
 
 /// make the `user.*` xattrs of `fd` exactly `wanted`. `elevate_mode` is applied first when
@@ -1065,7 +1178,9 @@ pub fn apply_with_context(
     plan: &RestorePlan,
     ctx: &RestoreContext,
 ) -> Result<ApplyStats, RestoreError> {
-    if ctx.euid == 0 {
+    // the seam can lower the context's uid for tests, never the process's real one
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if ctx.euid == 0 || unsafe { libc::geteuid() } == 0 {
         return Err(RestoreError::RunningAsRoot);
     }
     validate_manifest(target)?;
@@ -1082,13 +1197,17 @@ pub fn apply_with_context(
         workspace,
         store,
         entries,
+        groups: group_members(target),
         stats: ApplyStats::default(),
         touched: BTreeSet::new(),
+        dirty: BTreeSet::new(),
     };
     applier.preflight(plan, ctx)?;
+    applier.remove_leftovers(plan);
     for op in &plan.ops {
         applier.run(op)?;
     }
+    applier.sync_dirs()?;
     applier.finalize(plan)?;
     Ok(applier.stats)
 }
@@ -1097,9 +1216,14 @@ struct Applier<'a> {
     workspace: &'a File,
     store: &'a File,
     entries: HashMap<&'a str, &'a ManifestEntry>,
+    /// members of each target link group, keyed by group id.
+    groups: HashMap<u64, Vec<&'a str>>,
     stats: ApplyStats,
     /// directories whose contents changed, so their mtime and mode are applied last.
     touched: BTreeSet<String>,
+    /// directories (the workspace root is `""`) that had entries created, renamed or
+    /// removed, so they are fsynced once after the content operations.
+    dirty: BTreeSet<String>,
 }
 
 impl<'a> Applier<'a> {
@@ -1137,6 +1261,26 @@ impl<'a> Applier<'a> {
                 gid: entry.gid,
                 euid: ctx.euid,
                 egid: ctx.egid,
+            })
+        }
+    }
+
+    /// the entry must be owned by this process, so chmod and utimensat can succeed without
+    /// root. used where the owner does not change.
+    fn check_uid(
+        &self,
+        ctx: &RestoreContext,
+        path: &str,
+        kind: EntryKind,
+    ) -> Result<(), RestoreError> {
+        let entry = self.entry(path, kind)?;
+        if entry.uid == ctx.euid {
+            Ok(())
+        } else {
+            Err(RestoreError::NotOwner {
+                path: path.to_owned(),
+                uid: entry.uid,
+                euid: ctx.euid,
             })
         }
     }
@@ -1179,18 +1323,118 @@ impl<'a> Applier<'a> {
                     if change.owner {
                         self.check_owner(ctx, path, kind)?;
                     } else {
-                        self.entry(path, kind)?;
+                        self.check_uid(ctx, path, kind)?;
                     }
                 }
             }
         }
         for dir in &plan.finalize_dirs {
             validate_relative_path(&dir.path)?;
-            if dir.change.owner && !dir.created {
+            if dir.created {
+                self.entry(&dir.path, EntryKind::Dir)?;
+            } else if dir.change.owner {
                 self.check_owner(ctx, &dir.path, EntryKind::Dir)?;
             } else {
-                self.entry(&dir.path, EntryKind::Dir)?;
+                self.check_uid(ctx, &dir.path, EntryKind::Dir)?;
             }
+        }
+        // every existing target directory the plan changes entries in gets its mode and
+        // mtime applied last, which needs ownership too
+        let created: BTreeSet<&str> = plan
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                RestoreOp::Mkdir { path } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        for parent in self.touched_parents(plan) {
+            if parent.is_empty() {
+                continue;
+            }
+            if !created.contains(parent.as_str())
+                && self
+                    .entries
+                    .get(parent.as_str())
+                    .is_some_and(|e| e.kind == EntryKind::Dir)
+            {
+                self.check_uid(ctx, &parent, EntryKind::Dir)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// the parent directory of every path the plan writes, links, removes or fixes
+    /// (`""` is the workspace root).
+    fn touched_parents(&self, plan: &RestorePlan) -> BTreeSet<String> {
+        plan.ops
+            .iter()
+            .map(|op| match op {
+                RestoreOp::Remove { path, .. }
+                | RestoreOp::Mkdir { path }
+                | RestoreOp::WriteFile { path }
+                | RestoreOp::LinkFile { path, .. }
+                | RestoreOp::Symlink { path }
+                | RestoreOp::SetMetadata { path, .. } => split_path(path).0.to_owned(),
+            })
+            .collect()
+    }
+
+    /// remove `.leash-restore-*` entries a killed apply left in the directories this plan
+    /// touches, except names the target or the plan itself names. best effort: a directory
+    /// that cannot be opened or written is left for the operations to report.
+    fn remove_leftovers(&self, plan: &RestorePlan) {
+        let mut dirs = self.touched_parents(plan);
+        dirs.extend(plan.finalize_dirs.iter().map(|d| d.path.clone()));
+        let removed: BTreeSet<&str> = plan
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                RestoreOp::Remove { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        for dir_rel in dirs {
+            let Ok(dir) = open_dir_beneath(self.workspace, &dir_rel, &dir_rel) else {
+                continue;
+            };
+            let Ok(names) = read_dir_names(&dir, &dir_rel) else {
+                continue;
+            };
+            for name in names {
+                if !name.as_bytes().starts_with(TEMP_PREFIX.as_bytes()) {
+                    continue;
+                }
+                let rel = match name.to_str() {
+                    Ok(n) if dir_rel.is_empty() => n.to_owned(),
+                    Ok(n) => format!("{dir_rel}/{n}"),
+                    Err(_) => String::new(),
+                };
+                if self.entries.contains_key(rel.as_str()) || removed.contains(rel.as_str()) {
+                    continue;
+                }
+                // SAFETY: dir is a live directory descriptor and name is NUL-terminated;
+                // flags 0 never removes a directory. a failure leaves the entry in place.
+                let _ = unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+            }
+        }
+    }
+
+    /// fsync every directory that had names created, renamed or removed in it.
+    fn sync_dirs(&mut self) -> Result<(), RestoreError> {
+        for rel in std::mem::take(&mut self.dirty) {
+            let dir = match open_dir_beneath(self.workspace, &rel, &rel) {
+                Ok(dir) => dir,
+                // removed by a later operation, so there is nothing left to sync
+                Err(RestoreError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            // SAFETY: dir is a live descriptor.
+            check(unsafe { libc::fsync(dir.as_raw_fd()) }, "fsync", &rel)?;
         }
         Ok(())
     }
@@ -1199,6 +1443,7 @@ impl<'a> Applier<'a> {
     fn open_parent(&mut self, path: &str) -> Result<(File, CString), RestoreError> {
         let (parent, name) = split_path(path);
         let dir = open_dir_beneath(self.workspace, parent, path)?;
+        self.dirty.insert(parent.to_owned());
         if !parent.is_empty() {
             self.touched.insert(parent.to_owned());
             // a restored directory can be read-only; the owner needs rwx while it changes
@@ -1395,7 +1640,15 @@ impl<'a> Applier<'a> {
             })?;
         let (dir, name) = self.open_parent(path)?;
         match entry.kind {
-            EntryKind::Symlink => set_symlink_meta(dir.as_raw_fd(), &name, entry, path)?,
+            EntryKind::Symlink => {
+                // a symlink is never in a link group, so any second name is outside the
+                // plan and would share the owner and mtime written here
+                if fstatat_nofollow(dir.as_raw_fd(), &name, path)?.st_nlink > 1 {
+                    drop(dir);
+                    return self.symlink(path);
+                }
+                set_symlink_meta(dir.as_raw_fd(), &name, entry, path)?;
+            }
             EntryKind::File => {
                 // SAFETY: dir is a live directory descriptor and name is NUL-terminated;
                 // read-only, O_NOFOLLOW and O_NONBLOCK so a swapped-in symlink or fifo
@@ -1423,6 +1676,21 @@ impl<'a> Applier<'a> {
                         reason: "workspace entry is not a regular file",
                     });
                 }
+                // names the target puts in this inode's link group; a file outside any
+                // group has just its own name
+                let expected = entry
+                    .link_group
+                    .and_then(|g| self.groups.get(&g))
+                    .map_or(1, |members| members.len().max(1))
+                    as libc::nlink_t;
+                if st.st_nlink > expected {
+                    // another name, outside the workspace, shares this inode. changing
+                    // its metadata would change that name too, so replace the inode and
+                    // point the other workspace names at the new one.
+                    drop(file);
+                    drop(dir);
+                    return self.replace_shared_inode(path, entry);
+                }
                 apply_inode_meta(file.as_raw_fd(), entry, path, true, 0o600)?;
             }
             EntryKind::Dir => {
@@ -1433,6 +1701,25 @@ impl<'a> Applier<'a> {
             }
         }
         self.stats.metadata_fixed += 1;
+        Ok(())
+    }
+
+    /// write `path` from the store as a new inode, then link the other members of its
+    /// target link group to it.
+    fn replace_shared_inode(
+        &mut self,
+        path: &str,
+        entry: &ManifestEntry,
+    ) -> Result<(), RestoreError> {
+        self.write_file(path)?;
+        let peers: Vec<&'a str> = entry
+            .link_group
+            .and_then(|g| self.groups.get(&g))
+            .cloned()
+            .unwrap_or_default();
+        for peer in peers.into_iter().filter(|peer| *peer != path) {
+            self.link_file(peer, path)?;
+        }
         Ok(())
     }
 

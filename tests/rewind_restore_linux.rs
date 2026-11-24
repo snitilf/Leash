@@ -767,3 +767,365 @@ fn an_owner_this_process_cannot_create_fails_in_preflight_naming_the_path() {
     assert_eq!(names(&fx.ws), ["f", "later"]);
     assert_eq!(fs::read(fx.ws.join("f")).unwrap(), b"changed");
 }
+
+// ---- hard links outside the workspace, ownership preflight, leftovers, deep trees ----
+
+fn mtime_of(path: &Path) -> (i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::symlink_metadata(path).unwrap();
+    (m.mtime(), m.mtime_nsec())
+}
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).unwrap().mode() & 0o7777
+}
+
+fn ino_of(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).unwrap().ino()
+}
+
+fn nlink_of(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).unwrap().nlink()
+}
+
+#[test]
+fn a_metadata_only_restore_never_writes_through_an_outside_hard_link() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("f"), b"orig").unwrap();
+    chmod(&fx.ws.join("f"), 0o644);
+    set_mtime(&fx.ws.join("f"), 1_600_000_000, 5);
+    let outside = fx.outside("outside-link");
+    fs::hard_link(fx.ws.join("f"), &outside).unwrap();
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    // the agent changes only metadata, through the shared inode, so the outside name
+    // changes too
+    chmod(&fx.ws.join("f"), 0o600);
+    set_mtime(&fx.ws.join("f"), 1_700_000_000, 9);
+    let now = fx.capture(1);
+
+    let p = plan(&now, &base);
+    assert!(
+        p.ops
+            .iter()
+            .any(|op| matches!(op, RestoreOp::SetMetadata { path, .. } if path == "f"))
+    );
+    assert!(
+        !p.ops
+            .iter()
+            .any(|op| matches!(op, RestoreOp::WriteFile { .. }))
+    );
+    apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap();
+
+    assert_eq!(fs::read(fx.ws.join("f")).unwrap(), b"orig");
+    assert_eq!(mode_of(&fx.ws.join("f")), 0o644);
+    assert_eq!(mtime_of(&fx.ws.join("f")), (1_600_000_000, 5));
+    // the outside name keeps exactly what the agent left it
+    assert_eq!(mode_of(&outside), 0o600);
+    assert_eq!(mtime_of(&outside), (1_700_000_000, 9));
+    assert_ne!(ino_of(&fx.ws.join("f")), ino_of(&outside));
+    assert!(plan(&fx.capture(2), &base).is_empty());
+}
+
+#[test]
+fn a_metadata_only_restore_relinks_the_group_off_an_outside_hard_link() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("a"), b"pair").unwrap();
+    fs::hard_link(fx.ws.join("a"), fx.ws.join("b")).unwrap();
+    chmod(&fx.ws.join("a"), 0o644);
+    set_mtime(&fx.ws.join("a"), 1_600_000_000, 5);
+    let outside = fx.outside("outside-link");
+    fs::hard_link(fx.ws.join("a"), &outside).unwrap();
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    chmod(&fx.ws.join("a"), 0o600);
+    set_mtime(&fx.ws.join("a"), 1_700_000_000, 9);
+    let now = fx.capture(1);
+
+    let p = plan(&now, &base);
+    apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap();
+
+    // both workspace names still share one inode, which is no longer the outside one
+    assert_eq!(ino_of(&fx.ws.join("a")), ino_of(&fx.ws.join("b")));
+    assert_eq!(nlink_of(&fx.ws.join("a")), 2);
+    assert_ne!(ino_of(&fx.ws.join("a")), ino_of(&outside));
+    assert_eq!(mode_of(&fx.ws.join("b")), 0o644);
+    assert_eq!(mtime_of(&fx.ws.join("b")), (1_600_000_000, 5));
+    assert_eq!(mode_of(&outside), 0o600);
+    assert_eq!(mtime_of(&outside), (1_700_000_000, 9));
+    let after = fx.capture(2);
+    assert_eq!(after.entries, base.entries);
+}
+
+#[test]
+fn a_symlink_metadata_fix_never_touches_an_outside_hard_link_of_the_symlink() {
+    let fx = Fixture::new();
+    symlink("target", fx.ws.join("lnk")).unwrap();
+    set_mtime(&fx.ws.join("lnk"), 1_600_000_000, 5);
+    let outside = fx.outside("outside-lnk");
+    fs::hard_link(fx.ws.join("lnk"), &outside).unwrap();
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    set_mtime(&fx.ws.join("lnk"), 1_700_000_000, 9);
+    let now = fx.capture(1);
+
+    let p = plan(&now, &base);
+    assert!(
+        p.ops
+            .iter()
+            .any(|op| matches!(op, RestoreOp::SetMetadata { path, .. } if path == "lnk"))
+    );
+    apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap();
+
+    assert_eq!(
+        fs::read_link(fx.ws.join("lnk")).unwrap(),
+        Path::new("target")
+    );
+    assert_eq!(mtime_of(&fx.ws.join("lnk")), (1_600_000_000, 5));
+    assert_eq!(mtime_of(&outside), (1_700_000_000, 9));
+    assert_ne!(ino_of(&fx.ws.join("lnk")), ino_of(&outside));
+}
+
+#[test]
+fn metadata_of_an_entry_owned_by_someone_else_fails_in_preflight() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("g"), b"gee").unwrap();
+    create_dir(&fx.ws.join("d"));
+    fs::write(fx.ws.join("d/inner"), b"i").unwrap();
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    let me = RestoreContext::from_process().unwrap();
+    // pretend to be another uid; only metadata differs, and the owner does not change
+    let ctx = RestoreContext {
+        euid: me.euid.wrapping_add(1).max(1),
+        egid: me.egid,
+        groups: me.groups.clone(),
+    };
+
+    chmod(&fx.ws.join("g"), 0o600);
+    let now = fx.capture(1);
+    let p = plan(&now, &base);
+    let err = apply_with_context(&fx.ws_fd(), &fx.store_fd(), &base, &p, &ctx).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::NotOwner { path, .. } if path == "g"),
+        "{err}"
+    );
+    assert_eq!(mode_of(&fx.ws.join("g")), 0o600);
+
+    // an existing directory whose mtime alone differs is checked the same way
+    chmod(&fx.ws.join("g"), 0o644);
+    set_mtime(&fx.ws.join("d"), 1_700_000_000, 1);
+    let now = fx.capture(2);
+    let p = plan(&now, &base);
+    let err = apply_with_context(&fx.ws_fd(), &fx.store_fd(), &base, &p, &ctx).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::NotOwner { path, .. } if path == "d"),
+        "{err}"
+    );
+    assert_eq!(mtime_of(&fx.ws.join("d")), (1_700_000_000, 1));
+}
+
+#[test]
+fn a_contents_change_in_a_directory_owned_by_someone_else_fails_in_preflight() {
+    let fx = Fixture::new();
+    create_dir(&fx.ws.join("d"));
+    fs::write(fx.ws.join("d/inner"), b"i").unwrap();
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    fs::write(fx.ws.join("d/extra"), b"x").unwrap();
+    let now = fx.capture(1);
+    let p = plan(&now, &base);
+    // the directory is in the plan only because its contents change; as another uid the
+    // final mode and mtime pass could not run, so nothing may be removed first
+    let me = RestoreContext::from_process().unwrap();
+    let ctx = RestoreContext {
+        euid: me.euid.wrapping_add(1).max(1),
+        egid: me.egid,
+        groups: me.groups.clone(),
+    };
+    let err = apply_with_context(&fx.ws_fd(), &fx.store_fd(), &base, &p, &ctx).unwrap_err();
+    assert!(matches!(err, RestoreError::NotOwner { .. }), "{err}");
+    assert_eq!(names(&fx.ws.join("d")), ["extra", "inner"]);
+}
+
+#[test]
+fn leftover_temp_names_in_touched_directories_are_removed_before_applying() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("f"), b"orig").unwrap();
+    create_dir(&fx.ws.join("d"));
+    fs::write(fx.ws.join("d/g"), b"gee").unwrap();
+    create_dir(&fx.ws.join("untouched"));
+    fs::write(fx.ws.join("untouched/h"), b"h").unwrap();
+    // a snapshot can legitimately contain a file with the temp prefix, which must stay
+    fs::write(fx.ws.join(".leash-restore-kept"), b"mine").unwrap();
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    fs::write(fx.ws.join("f"), b"changed").unwrap();
+    fs::write(fx.ws.join("d/g"), b"changed").unwrap();
+    let now = fx.capture(1);
+
+    // a killed apply left these behind after the plan was computed
+    fs::write(fx.ws.join(".leash-restore-dead"), b"partial").unwrap();
+    symlink("/nonexistent", fx.ws.join("d/.leash-restore-dead2")).unwrap();
+    fs::write(fx.ws.join("untouched/.leash-restore-dead3"), b"partial").unwrap();
+
+    let p = plan(&now, &base);
+    apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap();
+    assert_eq!(
+        names(&fx.ws),
+        [".leash-restore-kept", "d", "f", "untouched"]
+    );
+    assert_eq!(names(&fx.ws.join("d")), ["g"]);
+    // a directory the plan does not touch is left alone
+    assert_eq!(
+        names(&fx.ws.join("untouched")),
+        [".leash-restore-dead3", "h"]
+    );
+    assert_eq!(
+        fs::read(fx.ws.join(".leash-restore-kept")).unwrap(),
+        b"mine"
+    );
+}
+
+#[test]
+fn a_real_root_is_refused_even_when_the_context_claims_another_uid() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("f"), b"orig").unwrap();
+    let base = fx.capture(0);
+    fs::write(fx.ws.join("f"), b"changed").unwrap();
+    let now = fx.capture(1);
+    let me = RestoreContext::from_process().unwrap();
+    let ctx = RestoreContext {
+        euid: me.euid.max(1000),
+        egid: me.egid,
+        groups: me.groups.clone(),
+    };
+    let result = apply_with_context(&fx.ws_fd(), &fx.store_fd(), &base, &plan(&now, &base), &ctx);
+    if is_root() {
+        assert!(matches!(result, Err(RestoreError::RunningAsRoot)));
+        assert_eq!(fs::read(fx.ws.join("f")).unwrap(), b"changed");
+    } else {
+        // not root, so only the seam is exercised and this context may fail on ownership
+        assert!(!matches!(result, Err(RestoreError::RunningAsRoot)));
+    }
+}
+
+fn deep_names(levels: usize) -> Vec<String> {
+    (0..levels)
+        .map(|i| format!("{i:02}{}", "d".repeat(98)))
+        .collect()
+}
+
+/// open (creating when `create`) the directory chain `names` one `openat` at a time, so
+/// the full path is never handed to the kernel at once.
+fn deep_dir(ws: &File, names: &[String], create: bool) -> File {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut cur = ws.try_clone().unwrap();
+    for name in names {
+        let c_name = CString::new(name.as_str()).unwrap();
+        if create {
+            // SAFETY: cur is a live directory descriptor and c_name is NUL-terminated.
+            let rc = unsafe { libc::mkdirat(cur.as_raw_fd(), c_name.as_ptr(), 0o755) };
+            assert!(
+                rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST),
+                "mkdirat: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // SAFETY: as above; O_DIRECTORY | O_NOFOLLOW opens a real directory.
+        let fd = unsafe {
+            libc::openat(
+                cur.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0, "openat: {}", std::io::Error::last_os_error());
+        // SAFETY: openat returned a fresh descriptor that nothing else owns.
+        cur = unsafe { File::from_raw_fd(fd) };
+    }
+    cur
+}
+
+fn write_deep(ws: &File, names: &[String], file: &str, content: &[u8]) {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let dir = deep_dir(ws, names, true);
+    let c_file = CString::new(file).unwrap();
+    // SAFETY: dir is a live directory descriptor and c_file is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_file.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
+            0o644 as libc::c_uint,
+        )
+    };
+    assert!(fd >= 0, "openat: {}", std::io::Error::last_os_error());
+    // SAFETY: openat returned a fresh descriptor that nothing else owns.
+    let mut f = unsafe { File::from_raw_fd(fd) };
+    f.write_all(content).unwrap();
+}
+
+fn read_deep(ws: &File, names: &[String], file: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let dir = deep_dir(ws, names, false);
+    let c_file = CString::new(file).unwrap();
+    // SAFETY: dir is a live directory descriptor and c_file is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_file.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: openat returned a fresh descriptor that nothing else owns.
+    let mut f = unsafe { File::from_raw_fd(fd) };
+    let mut out = Vec::new();
+    f.read_to_end(&mut out).unwrap();
+    Some(out)
+}
+
+#[test]
+fn a_tree_deeper_than_path_max_is_restored() {
+    let fx = Fixture::new();
+    let names = deep_names(50);
+    write_deep(&fx.ws_fd(), &names, "f", b"orig");
+    write_deep(&fx.ws_fd(), &names[..30], "mid", b"mid");
+    let base = fx.capture(0);
+    let longest = base.entries.iter().map(|e| e.path.len()).max().unwrap();
+    assert!(longest > 4096, "tree is only {longest} bytes deep");
+    if root_refused(&fx, &base) {
+        return;
+    }
+    write_deep(&fx.ws_fd(), &names, "f", b"changed");
+    write_deep(&fx.ws_fd(), &names, "extra", b"x");
+    write_deep(&fx.ws_fd(), &names[..30], "mid", b"changed");
+    let now = fx.capture(1);
+
+    let p = plan(&now, &base);
+    apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap();
+    assert_eq!(read_deep(&fx.ws_fd(), &names, "f").unwrap(), b"orig");
+    assert_eq!(read_deep(&fx.ws_fd(), &names[..30], "mid").unwrap(), b"mid");
+    assert_eq!(read_deep(&fx.ws_fd(), &names, "extra"), None);
+    assert_eq!(fx.capture(2).entries, base.entries);
+}
