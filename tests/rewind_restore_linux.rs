@@ -387,6 +387,17 @@ fn root_refused(fx: &Fixture, target: &Manifest) -> bool {
     true
 }
 
+/// like `root_refused` for a test that has not built its target yet: under root it captures
+/// a probe workspace and asserts the refusal, as a normal user it does nothing.
+fn root_guard(fx: &Fixture) -> bool {
+    if !is_root() {
+        return false;
+    }
+    fs::write(fx.ws.join("probe"), b"probe").unwrap();
+    let target = fx.capture(0);
+    root_refused(fx, &target)
+}
+
 const HOSTILE_NAME: &str = "evil\nA  fake-line \u{1b}[2Jname";
 
 fn assert_one_line_escaped(text: &str) {
@@ -434,6 +445,9 @@ fn restore_errors_escape_hostile_paths() {
     assert!(text.contains("\\n"), "{text:?}");
 }
 
+/// set a user xattr. returns false, after saying why, only when the filesystem does not
+/// support user xattrs; `LEASH_REQUIRE_XATTR=1` (set in CI) turns that into a failure so the
+/// xattr paths cannot go untested unnoticed.
 fn try_set_user_xattr(path: &Path, name: &str, value: &[u8]) -> bool {
     let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
     let c_name = CString::new(name).unwrap();
@@ -455,6 +469,15 @@ fn try_set_user_xattr(path: &Path, name: &str, value: &[u8]) -> bool {
         matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP | libc::ENOSYS)),
         "unexpected setxattr failure: {err}"
     );
+    assert!(
+        std::env::var("LEASH_REQUIRE_XATTR").as_deref() != Ok("1"),
+        "LEASH_REQUIRE_XATTR=1 but {} does not support user xattrs: {err}",
+        path.display()
+    );
+    eprintln!(
+        "SKIPPED xattr coverage: {} does not support user xattrs ({err}); set LEASH_REQUIRE_XATTR=1 to fail instead",
+        path.display()
+    );
     false
 }
 
@@ -474,10 +497,10 @@ fn names(dir: &Path) -> Vec<String> {
 
 #[test]
 fn round_trip_restores_the_captured_workspace_exactly() {
-    if is_root() {
+    let fx = Fixture::new();
+    if root_guard(&fx) {
         return;
     }
-    let fx = Fixture::new();
     let ws = &fx.ws;
 
     fs::write(ws.join("a.txt"), b"hello").unwrap();
@@ -580,10 +603,10 @@ fn round_trip_restores_the_captured_workspace_exactly() {
 
 #[test]
 fn hostile_manifest_paths_are_refused_before_any_write() {
-    if is_root() {
+    let fx = Fixture::new();
+    if root_guard(&fx) {
         return;
     }
-    let fx = Fixture::new();
     fs::write(fx.ws.join("keep"), b"keep").unwrap();
     let base = fx.capture(0);
     fs::write(fx.ws.join("extra"), b"extra").unwrap();
@@ -592,13 +615,16 @@ fn hostile_manifest_paths_are_refused_before_any_write() {
     for bad in ["../escape", "/abs/escape", "a/../../escape", "a//b", "./x"] {
         let mut forged = base.clone();
         forged.entries[0].path = bad.to_owned();
-        // as a stored manifest: refused when loaded
+        // the step matches the file it is loaded from, so only the path can be at fault
+        forged.step = 9;
+        // as a stored manifest: refused when loaded, naming the bad path
         let json = serde_json::to_vec(&forged).unwrap();
         let mpath = fx.store_path.join("manifests/step-000009.json");
         fs::write(&mpath, &json).unwrap();
         let err = load_manifest(&fx.store_fd(), 9).unwrap_err();
         assert!(
-            matches!(err, StoreError::InvalidManifest { .. }),
+            matches!(&err, StoreError::InvalidManifest { reason }
+                if reason.contains(&format!("{bad:?}")) && !reason.contains("step")),
             "{bad}: {err}"
         );
         fs::remove_file(&mpath).unwrap();
@@ -607,7 +633,8 @@ fn hostile_manifest_paths_are_refused_before_any_write() {
         let p = plan(&now, &forged);
         let err = apply(&fx.ws_fd(), &fx.store_fd(), &forged, &p).unwrap_err();
         assert!(
-            matches!(err, RestoreError::Store(StoreError::InvalidManifest { .. })),
+            matches!(&err, RestoreError::Store(StoreError::InvalidManifest { reason })
+                if reason.contains(&format!("{bad:?}"))),
             "{bad}: {err}"
         );
         assert_eq!(names(&fx.ws), ["extra", "keep"]);
@@ -617,10 +644,10 @@ fn hostile_manifest_paths_are_refused_before_any_write() {
 
 #[test]
 fn a_plan_path_that_escapes_is_refused_before_any_write() {
-    if is_root() {
+    let fx = Fixture::new();
+    if root_guard(&fx) {
         return;
     }
-    let fx = Fixture::new();
     fs::write(fx.ws.join("keep"), b"keep").unwrap();
     let base = fx.capture(0);
     fs::write(fx.outside("victim"), b"victim").unwrap();
@@ -636,10 +663,10 @@ fn a_plan_path_that_escapes_is_refused_before_any_write() {
 
 #[test]
 fn a_tampered_object_fails_before_the_destination_is_replaced() {
-    if is_root() {
+    let fx = Fixture::new();
+    if root_guard(&fx) {
         return;
     }
-    let fx = Fixture::new();
     fs::write(fx.ws.join("f"), b"original").unwrap();
     fs::write(fx.ws.join("g"), b"gee").unwrap();
     let base = fx.capture(0);
@@ -669,11 +696,43 @@ fn a_tampered_object_fails_before_the_destination_is_replaced() {
 }
 
 #[test]
-fn a_directory_swapped_for_a_symlink_after_planning_is_not_followed() {
-    if is_root() {
+fn a_forged_size_fails_during_the_copy_and_leaves_no_temp_entries() {
+    let fx = Fixture::new();
+    if root_guard(&fx) {
         return;
     }
+    fs::write(fx.ws.join("f"), b"original").unwrap();
+    fs::write(fx.ws.join("g"), b"gee").unwrap();
+    let base = fx.capture(0);
+    fs::write(fx.ws.join("f"), b"changed").unwrap();
+    let now = fx.capture(1);
+
+    // the object is intact and hashes right; only the manifest's size is wrong, so the
+    // failure comes from the copy, after the temporary file exists
+    let mut forged = base.clone();
+    for e in &mut forged.entries {
+        if e.path == "f" {
+            e.size = e.size.map(|s| s + 1);
+        }
+    }
+    forged.totals.total_bytes += 1;
+    let p = plan(&now, &forged);
+    assert!(p.ops.contains(&RestoreOp::WriteFile { path: "f".into() }));
+    let err = apply(&fx.ws_fd(), &fx.store_fd(), &forged, &p).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::SizeMismatch { path, expected: 9, actual: 8 } if path == "f"),
+        "{err}"
+    );
+    assert_eq!(fs::read(fx.ws.join("f")).unwrap(), b"changed");
+    assert_eq!(names(&fx.ws), ["f", "g"]);
+}
+
+#[test]
+fn a_directory_swapped_for_a_symlink_after_planning_is_not_followed() {
     let fx = Fixture::new();
+    if root_guard(&fx) {
+        return;
+    }
     create_dir(&fx.ws.join("sub"));
     fs::write(fx.ws.join("sub/file"), b"orig").unwrap();
     let base = fx.capture(0);
@@ -702,10 +761,10 @@ fn a_directory_swapped_for_a_symlink_after_planning_is_not_followed() {
 
 #[test]
 fn an_outside_hard_link_is_never_written_through() {
-    if is_root() {
+    let fx = Fixture::new();
+    if root_guard(&fx) {
         return;
     }
-    let fx = Fixture::new();
     fs::write(fx.ws.join("f"), b"orig").unwrap();
     let outside = fx.outside("outside-link");
     fs::hard_link(fx.ws.join("f"), &outside).unwrap();
@@ -1232,4 +1291,179 @@ fn a_scan_lists_an_unreadable_directory_instead_of_failing() {
             .iter()
             .any(|e| e.path == "locked" && e.kind == EntryKind::Dir)
     );
+}
+
+// ---- ownership, final-component swaps, recovery ----
+
+#[test]
+fn a_gid_outside_the_callers_groups_is_refused_in_preflight() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("f"), b"orig").unwrap();
+    fs::write(fx.ws.join("later"), b"later").unwrap();
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    fs::remove_file(fx.ws.join("later")).unwrap();
+    fs::write(fx.ws.join("f"), b"changed").unwrap();
+    let now = fx.capture(1);
+
+    let me = RestoreContext::from_process().unwrap();
+    // same uid, but the manifest group is neither the primary nor a supplementary group
+    let ctx = RestoreContext {
+        euid: me.euid,
+        egid: me.egid.wrapping_add(7),
+        groups: vec![],
+    };
+    let p = plan(&now, &base);
+    let err = apply_with_context(&fx.ws_fd(), &fx.store_fd(), &base, &p, &ctx).unwrap_err();
+    assert!(matches!(err, RestoreError::Ownership { .. }), "{err}");
+    // nothing was written, not even the removal that comes first in the plan
+    assert_eq!(names(&fx.ws), ["f"]);
+    assert_eq!(fs::read(fx.ws.join("f")).unwrap(), b"changed");
+}
+
+#[test]
+fn fchown_to_the_callers_own_supplementary_group_succeeds() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("f"), b"orig").unwrap();
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    let me = RestoreContext::from_process().unwrap();
+    let Some(other) = me.groups.iter().copied().find(|g| *g != me.egid) else {
+        eprintln!(
+            "SKIPPED fchown coverage: the caller has no supplementary group besides gid {}",
+            me.egid
+        );
+        return;
+    };
+    // the agent regroups the file to another group of the same user; restoring it is an
+    // fchown to an owner the caller may create
+    let c_path = CString::new(fx.ws.join("f").as_os_str().as_bytes()).unwrap();
+    // SAFETY: c_path is NUL-terminated; uid -1 leaves the owner unchanged.
+    let rc = unsafe { libc::chown(c_path.as_ptr(), u32::MAX, other) };
+    assert_eq!(rc, 0, "chown: {}", std::io::Error::last_os_error());
+    let now = fx.capture(1);
+    let p = plan(&now, &base);
+    assert!(p.ops.iter().any(|op| matches!(
+        op,
+        RestoreOp::SetMetadata { path, change } if path == "f" && change.owner
+    )));
+    apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap();
+    assert_eq!(fx.capture(2).entries, base.entries);
+}
+
+#[test]
+fn a_destination_swapped_for_a_symlink_is_replaced_not_followed() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("f"), b"orig").unwrap();
+    fs::write(fx.ws.join("m"), b"meta").unwrap();
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    fs::write(fx.ws.join("f"), b"changed").unwrap();
+    chmod(&fx.ws.join("m"), 0o600);
+    let now = fx.capture(1);
+    let p = plan(&now, &base);
+    // f is rewritten, m only has its mode fixed in place
+    assert!(p.ops.contains(&RestoreOp::WriteFile { path: "f".into() }));
+    assert!(
+        p.ops
+            .iter()
+            .any(|op| matches!(op, RestoreOp::SetMetadata { path, .. } if path == "m"))
+    );
+
+    // between plan and apply the agent swaps both final components for symlinks to a file
+    // outside the workspace
+    let outside = fx.outside("outside-target");
+    fs::write(&outside, b"outside").unwrap();
+    chmod(&outside, 0o640);
+    for name in ["f", "m"] {
+        fs::remove_file(fx.ws.join(name)).unwrap();
+        symlink(&outside, fx.ws.join(name)).unwrap();
+    }
+
+    // f is renamed over, so the symlink is replaced by the restored file. m is opened with
+    // O_NOFOLLOW, so the in-place fix fails instead of chmodding the outside file.
+    let err = apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::Io { op: "openat", path, .. } if path == "m"),
+        "{err}"
+    );
+    assert!(
+        !fs::symlink_metadata(fx.ws.join("f"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(fx.ws.join("f")).unwrap(), b"orig");
+    assert!(
+        fs::symlink_metadata(fx.ws.join("m"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"outside");
+    assert_eq!(mode_of(&outside), 0o640);
+}
+
+#[test]
+fn a_failed_apply_is_undone_by_restoring_the_safety_snapshot() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("a"), b"a-old").unwrap();
+    create_dir(&fx.ws.join("d"));
+    fs::write(fx.ws.join("d/inner"), b"inner-old").unwrap();
+    fs::write(fx.ws.join("zz"), b"zz-old").unwrap();
+    set_mtime(&fx.ws.join("a"), 1_600_000_000, 1);
+    set_mtime(&fx.ws.join("d/inner"), 1_600_000_001, 2);
+    set_mtime(&fx.ws.join("d"), 1_600_000_002, 3);
+    set_mtime(&fx.ws.join("zz"), 1_600_000_003, 4);
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    // the workspace the user has when they rewind
+    fs::write(fx.ws.join("a"), b"a-new").unwrap();
+    fs::write(fx.ws.join("d/inner"), b"inner-new").unwrap();
+    fs::remove_file(fx.ws.join("zz")).unwrap();
+    fs::write(fx.ws.join("zz"), b"zz-new!").unwrap();
+    fs::write(fx.ws.join("added"), b"added").unwrap();
+    chmod(&fx.ws.join("a"), 0o600);
+
+    // 1. the safety snapshot, in a scratch store
+    let scratch_path = fx.outside("safety-store");
+    fs::create_dir(&scratch_path).unwrap();
+    let scratch = open_dir(&scratch_path);
+    let safety = current_manifest(&fx.ws_fd(), &scratch, 1, &Limits::default()).unwrap();
+
+    // 2. an apply that fails on its last file: its manifest size is wrong
+    let mut forged = base.clone();
+    for e in &mut forged.entries {
+        if e.path == "zz" {
+            e.size = e.size.map(|s| s + 1);
+        }
+    }
+    forged.totals.total_bytes += 1;
+    let p = plan(&safety, &forged);
+    let err = apply(&fx.ws_fd(), &fx.store_fd(), &forged, &p).unwrap_err();
+    assert!(matches!(err, RestoreError::SizeMismatch { .. }), "{err}");
+    // the workspace is partially restored: earlier operations ran
+    assert_eq!(fs::read(fx.ws.join("a")).unwrap(), b"a-old");
+    assert!(!fx.ws.join("added").exists());
+    assert_eq!(fs::read(fx.ws.join("zz")).unwrap(), b"zz-new!");
+
+    // 3. restore the safety snapshot from the scratch store
+    let partial =
+        current_manifest(&fx.ws_fd(), &open_dir(&scratch_path), 2, &Limits::default()).unwrap();
+    let undo = plan(&partial, &safety);
+    apply(&fx.ws_fd(), &scratch, &safety, &undo).unwrap();
+    let after =
+        current_manifest(&fx.ws_fd(), &open_dir(&scratch_path), 3, &Limits::default()).unwrap();
+    assert_eq!(after.entries, safety.entries);
+    assert_eq!(fs::read(fx.ws.join("a")).unwrap(), b"a-new");
+    assert_eq!(fs::read(fx.ws.join("added")).unwrap(), b"added");
+    assert_eq!(fs::read(fx.ws.join("zz")).unwrap(), b"zz-new!");
 }
