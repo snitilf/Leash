@@ -128,10 +128,10 @@ fn recorded_cgroup(run: &RunResult) -> PathBuf {
 
 #[test]
 fn the_agent_tree_is_in_the_run_cgroup_and_the_supervisor_and_broker_are_not() {
+    let _guard = spawn_lock();
     if !common::delegated_cgroup_or_skip("agent_tree_cgroup") {
         return;
     }
-    let _guard = spawn_lock();
     let session = Session::new();
     let supervisor = own_cgroup();
     let script = format!(
@@ -179,10 +179,10 @@ fn the_agent_tree_is_in_the_run_cgroup_and_the_supervisor_and_broker_are_not() {
 
 #[test]
 fn a_backgrounded_grandchild_is_killed_at_root_exit_and_the_run_returns_promptly() {
+    let _guard = spawn_lock();
     if !common::delegated_cgroup_or_skip("grandchild_killed") {
         return;
     }
-    let _guard = spawn_lock();
     let session = Session::new();
     let started = Instant::now();
     let run = session
@@ -245,10 +245,10 @@ impl TraceSink for TripSink {
 
 #[test]
 fn an_abort_kills_the_whole_tree_and_removes_the_cgroup() {
+    let _guard = spawn_lock();
     if !common::delegated_cgroup_or_skip("abort_kills_tree") {
         return;
     }
-    let _guard = spawn_lock();
     let parent = CgroupParent::locate().unwrap();
     let id = generate_run_id(SystemTime::now()).unwrap();
     let cgroup = RunCgroup::create(&parent, &id).unwrap();
@@ -301,10 +301,10 @@ fn an_abort_kills_the_whole_tree_and_removes_the_cgroup() {
 
 #[test]
 fn a_cgroup_that_cannot_be_entered_aborts_before_the_agent_runs() {
+    let _guard = spawn_lock();
     if !common::delegated_cgroup_or_skip("attach_failure") {
         return;
     }
-    let _guard = spawn_lock();
     let parent = CgroupParent::locate().unwrap();
     let id = generate_run_id(SystemTime::now()).unwrap();
     let cgroup = RunCgroup::create(&parent, &id).unwrap();
@@ -334,6 +334,7 @@ fn a_cgroup_that_cannot_be_entered_aborts_before_the_agent_runs() {
 
 #[test]
 fn a_parent_cgroup_that_is_not_writable_refuses_before_any_run_directory() {
+    let _guard = spawn_lock();
     if !common::delegated_cgroup_or_skip("not_writable") {
         return;
     }
@@ -342,7 +343,6 @@ fn a_parent_cgroup_that_is_not_writable_refuses_before_any_run_directory() {
         eprintln!("skipping not_writable: root ignores directory permissions");
         return;
     }
-    let _guard = spawn_lock();
     let parent = CgroupParent::locate().unwrap();
     let dir = parent.path().to_path_buf();
     struct Restore(PathBuf);
@@ -376,10 +376,10 @@ fn a_parent_cgroup_that_is_not_writable_refuses_before_any_run_directory() {
 
 #[test]
 fn the_attach_descriptor_and_run_lock_do_not_survive_into_the_agent() {
+    let _guard = spawn_lock();
     if !common::delegated_cgroup_or_skip("fd_leak") {
         return;
     }
-    let _guard = spawn_lock();
     let session = Session::new();
     let run = session
         .python(
@@ -402,10 +402,10 @@ fn the_attach_descriptor_and_run_lock_do_not_survive_into_the_agent() {
 /// implicit cgroup2 deny of ADR-0024 decision 4 is a follow-up slice.
 #[test]
 fn the_agent_cannot_write_cgroup_procs_or_freeze_under_the_default_policy() {
+    let _guard = spawn_lock();
     if !common::delegated_cgroup_or_skip("agent_cgroup_writes") {
         return;
     }
-    let _guard = spawn_lock();
     let session = Session::new();
     let supervisor = own_cgroup();
     let script = format!(
@@ -442,10 +442,10 @@ fn the_agent_cannot_write_cgroup_procs_or_freeze_under_the_default_policy() {
 #[test]
 #[ignore = "ADR-0024 decisions 4 and 5: the cgroup2 implicit deny and the overlap refusal are a follow-up slice"]
 fn a_policy_grant_that_overlaps_the_cgroup_control_plane_is_refused() {
+    let _guard = spawn_lock();
     if !common::delegated_cgroup_or_skip("overlap_refused") {
         return;
     }
-    let _guard = spawn_lock();
     let session = Session::new();
     std::fs::write(
         session.state.path().join("policy.toml"),
@@ -505,10 +505,10 @@ fn dead_run_dir(state_root: &Path, id: &str) -> PathBuf {
 
 #[test]
 fn a_stale_cgroup_from_a_dead_run_is_cleaned_at_the_next_run() {
+    let _guard = spawn_lock();
     if !common::delegated_cgroup_or_skip("stale_cleanup") {
         return;
     }
-    let _guard = spawn_lock();
     let session = Session::new();
     let parent = CgroupParent::locate().unwrap();
     let id = generate_run_id(SystemTime::now()).unwrap();
@@ -538,10 +538,10 @@ fn a_stale_cgroup_from_a_dead_run_is_cleaned_at_the_next_run() {
 
 #[test]
 fn a_cgroup_whose_lock_is_held_or_unprovable_is_left_alone() {
+    let _guard = spawn_lock();
     if !common::delegated_cgroup_or_skip("stale_untouched") {
         return;
     }
-    let _guard = spawn_lock();
     let session = Session::new();
     let parent = CgroupParent::locate().unwrap();
 
