@@ -1,150 +1,134 @@
 # Snapshots, rewind, and diff
 
-- Status: settled (2026-07-08). The x86-64 leg of the ADR-0009 M0 spike passed on Ubuntu 24.04 /
-  kernel 6.8: privileged overlay mount, capture, rewind, whiteout, cross-directory rename, hard
-  link, and copy-fallback equivalence all validated; the rootless overlay path was blocked by the
-  host's unprivileged-userns restriction and that skip is accepted as a documented host-class
-  limitation (section 3, ADR-0014). The ARM64 leg was cancelled with the target deferral
-  (ADR-0014, spec OQ-9), which narrows ADR-0009's gate to the x86-64 leg; with that gate met, this
-  file settles (issue #13).
-- Governs: how workspace state is captured at step boundaries, how rewind restores it, and how
-  diff compares two runs or steps.
-- Cites: FR-11, FR-12, FR-13, FR-17, FR-21; NFR-4, NFR-5; SR-2; ADR-0005, ADR-0006, ADR-0009.
-  Invariants I1, I5 are defined in [`architecture.md`](architecture.md).
+- Status: architecture revised 2026-11-01 by ADR-0022; exact-capture implementation and
+  adversarial validation pending. The historical M0 results below do not prove concurrent
+  capture correctness.
+- Governs: FR-11, FR-12, FR-13, FR-17, FR-21; ADR-0005, ADR-0009, ADR-0022.
 
-Time travel in Leash operates on effects, not the agent (ADR-0005): the **workspace**'s write
-layer is captured as **snapshots** at **step** boundaries (FR-11), **rewind** restores the
-workspace to one of them (FR-12), and **diff** compares the filesystem effects of two runs or
-steps from theirs (FR-13). The agent is never re-run; a language model is non-deterministic, so
-re-execution would not reproduce the run and no such claim is made. Everything in this file is
-owned by the `snapshot` module ([`architecture.md`](architecture.md) section 4): it mounts and
-captures the overlay or the copy fallback and implements rewind and diff, and none of it sits on
-the decision loop's hot path. Snapshots persist under the per-run directory (FR-21,
-[`trace.md`](trace.md) section 1). Terms in **bold** are defined in
-[`../CONTEXT.md`](../CONTEXT.md).
+## 1. Consistency contract and step detection
 
-## 1. Step detection (FR-17)
+Exactness requires exclusive workspace ownership throughout run and rewind. External
+writers, including editors, build daemons, shared mappings and hard-link aliases, must
+be stopped by the operator. The Leash workspace lock excludes other Leash operations;
+it does not enforce or reliably detect external-writer exclusion.
 
-A **step** is a coalesced burst of the child's mediated filesystem writes. Steps are derived from
-the timestamps of the mutating mediated **events** the notify loop already produces: open-for-write
-([`syscalls.md`](syscalls.md) section 2) and the mutation family, create, rename, unlink, mkdir,
-link, symlink, truncate ([`syscalls.md`](syscalls.md) section 3.2). This is exactly the
-"supervisor-observed events" FR-17 requires (ADR-0006), and it needs no per-`write` trap: Leash
-does not mediate `read`/`write` at all, per the fd-authorization model, so per-byte activity is
-invisible by design and the step clock ticks on the events that introduce or mutate paths. Because
-every process in the tree is mediated (I1), the step clock sees a grandchild's writes as readily as
-the agent's; a subshell writing files is not a blind spot.
+A step is derived from mediated mutating events. The coalescing window remains 250 ms,
+chosen from the M1 measurements in `../measurements/0001-m1-overhead.md`; confirmation
+against a real agent session remains pending. Event quiescence proposes a boundary,
+not proof of filesystem quiescence. Writes through existing descriptors and shared
+mappings do not necessarily tick this clock. The barrier below makes captures exact
+within ADR-0022's supported filesystem state, regardless of those timing gaps. It does
+not make an application transaction atomic. Initial and final snapshots are mandatory.
 
-The boundary falls when mutating-event activity quiesces for longer than a coalescing window. The
-window is **250 ms**, set from the M1 measurements
-([`../measurements/0001-m1-overhead.md`](../measurements/0001-m1-overhead.md) section 4.3): on a
-continuous write burst the inter-mutating-event gaps topped out at 10 ms (p99 3 ms) on the loaded
-reference box, so 250 ms carries a 25x margin against splitting a burst while sitting well below
-agent think time between tool calls, which model inference bounds at hundreds of milliseconds. One
-confirming input stays named: the first real agent-session trace validates the value; until then
-it is measured-and-chosen, not confirmed against a live agent. Two properties are fixed
-regardless of the value: the boundary MUST NOT fall inside a burst, and run start and run end are
-always step boundaries, so every run has at least the initial and final snapshots even if the agent
-never writes. Each boundary emits a `step` event into the trace ([`trace.md`](trace.md) section 2)
-and triggers a capture (section 2).
+## 2. Capture barrier
 
-One gap, stated honestly: writes through a `mmap(MAP_SHARED)` mapping are not syscalls. They
-produce no mediated event, so they cannot drive step timing; a burst of shared-mapping stores looks
-like quiescence to the step clock. Content is not lost: the snapshot captures the actual resulting
-filesystem state at the next boundary (the overlay holds real file content, not syscall-derived
-state), so what the agent produced is always in some snapshot. The cost is granularity only: for an
-mmap-heavy writer, changes land in the step whose boundary follows them rather than defining steps
-of their own. This is a named residual, enumerated in [`escapes.md`](escapes.md).
+Before spawn, verify delegated cgroup v2, usable freezer completion, whole-tree
+termination, and protection against child migration or control-plane modification.
+Both modes must protect baselines, staged and committed snapshots, and their authoritative
+metadata from same-uid child mutation; permissions alone do not suffice. These controls
+and their escape tests are prerequisites to enabling exact snapshots.
+Place the child in the run cgroup before untrusted execution; keep the supervisor
+outside. Descendants inherit membership. Snapshot-enabled runs refuse if these
+prerequisites are unavailable, in both modes. Process enumeration and SIGSTOP are not
+substitutes for this barrier.
 
-## 2. Overlay mechanism (ADR-0009)
+At a candidate boundary:
 
-For the duration of a run the workspace is mounted with an overlayfs write layer: the real
-workspace directory is the `lowerdir` and stays untouched, the child's writes land in an
-`upperdir`, and overlayfs uses a `workdir` for its internal atomicity. A **snapshot** is a capture
-of the upper layer at a step boundary. Because the upper layer contains only what changed, snapshot
-cost scales with the size of the change, not the size of the workspace, which is what makes
-frequent step boundaries affordable on modest hardware (NFR-4) and on workspaces with large
-dependency trees.
+1. Stop dispatching broker mutations and finish outstanding broker operations.
+2. Request `cgroup.freeze=1` and wait boundedly for `cgroup.events` `frozen=1`.
+3. Establish that no supported asynchronous mutation remains outstanding. Deny
+   unsupported submission paths, including legacy AIO, or prove a completion barrier;
+   stopping userspace tasks alone does not establish this.
+4. Capture into a staging location, preserving all supported content and metadata.
+5. Durably publish the snapshot, then durably record its successful step event.
+6. Thaw and resume dispatch.
 
-Upper-layer semantics are not a plain file tree, and everything downstream inherits them:
+A barrier, capture, publication or thaw error aborts the run closed and terminates its
+whole cgroup. Incomplete captures must never appear as successful steps. Recovery
+ignores unpublished staging data; a published snapshot without a committed step is
+an orphan, not a successful boundary. Initial capture precedes spawn. Final capture
+waits for the entire run cgroup to become empty, not merely the initial child to exit.
 
-- A deletion is a **whiteout**: a character device with device number 0/0 in the upper layer, not
-  an absence. A naive reader sees a device node where the agent deleted a file.
-- A directory whose lower contents should stop showing through carries an **opaque marker**
-  (the `trusted.overlay.opaque` xattr, or its user-namespace equivalent); readers must treat the
-  directory as replacing, not merging with, the lower one.
-- A rename or hard link that crosses layers forces a copy-up, so the upper layer records it as new
-  content plus a whiteout at the old name, not as a rename.
+## 3. Copy backend and supported state
 
-The mechanism actually in use (overlay or the fallback of section 3) is selected at preflight and
-stamped into the trace via `meta.json` ([`architecture.md`](architecture.md) section 5.1), so a
-reader of a run always knows which semantics its snapshots carry.
+Copy is the initial backend. It uses the same barrier as overlay and may pause the
+agent for time proportional to workspace size. The fallback is a storage choice,
+never weaker consistency. Snapshot metadata records the mechanism and consistency
+contract; historical live copies must not be relabeled exact.
 
-## 3. Copy fallback (ADR-0009)
+ADR-0022 defines supported state: names, file bytes, symlink targets, directories,
+within-workspace hard-link topology, modes, ownership, modification timestamps and
+supported xattrs/ACLs. Unsupported objects or metadata fail explicitly. Raw inode
+numbers, ctime, access times, open descriptors and process state are excluded. A copy
+must not silently skip an unreadable entry or unsupported metadata.
 
-Overlay mounting needs either privilege or an unprivileged user namespace with overlay support,
-and availability varies by kernel config, distro policy, and filesystem. The M0 spike found one
-common instance: stock Ubuntu 24.04 sets `kernel.apparmor_restrict_unprivileged_userns=1`, which
-blocks unprivileged user-namespace creation outright, so the rootless overlay route is unavailable
-there and a privileged mount or the copy fallback carries the mechanism (2026-07-08). Preflight
-probes both routes; where neither works, Leash falls back to a documented plain-copy mechanism: the
-workspace is copied per step instead of layered. The fallback MUST have the same observable rewind and diff
-behavior as the overlay (ADR-0009), which is a shared test obligation: the equivalence suite runs
-against both mechanisms, and a behavior only one of them exhibits is a bug in one of them. The
-fallback's cost scales with workspace size rather than change size, which is exactly why it is the
-fallback and not the default; it exists because rewind is a headline capability and refusing to
-snapshot on an unsupported host fails the operator harder than a slower mechanism does.
 
-## 4. Rewind (FR-12)
+### Protected storage prerequisite
 
-`leash rewind` restores the workspace to a chosen earlier snapshot. With the overlay it is layer
-manipulation, not file surgery: the current upper layer is swapped for the captured one, which is
-fast, proportional to change size, and easy to reason about. With the copy fallback it is restoring
-the copied tree. Rewind targets are step boundaries; there is nothing between boundaries to rewind
-to, because the boundary is where state was captured.
+ADR-0022 selects a separately provisioned custodian under a distinct host UID as the
+design direction for canonical baselines, snapshots and authoritative manifests. It
+is unimplemented. Exact snapshots refuse before spawn until provisioning, authenticated
+private control, storage-ancestor protection and adversarial tests succeed. The agent
+keeps the operator UID. Operator-owned exports and discovery indexes are not canonical
+state, and a later run must not be able to corrupt earlier retained captures.
 
-Rewind reverses filesystem effects only. It MUST NOT claim to reverse effects already emitted
-off-host: a network send, an external API call, a pushed commit. Those are recorded in the trace
-but are not reversible, and no Leash output implies otherwise (FR-12, ADR-0005). The word for this
-operation is rewind; it never means re-running the agent.
+The supervisor retains a private control capability, becomes non-dumpable, and leaks
+no storage or control descriptor through child inheritance or stdio. Custodian requests
+are validated against pinned run/workspace handles; no writable canonical handles are
+returned. UID-only authorization is insufficient because the child shares the operator
+UID. Namespace-only hiding and a policy-independent Landlock ruleset are not substitutes
+for this complete storage boundary. Required tests include proc/ptrace access, metadata
+and ancestor mutations, inherited/transferred handles, forged requests, service failure,
+and cross-run corruption attempts, while ordinary record-only access remains available.
 
-## 5. Diff (FR-13)
 
-`leash diff` compares the filesystem effects of two runs, or two steps, computed from their
-snapshots. It MUST interpret write-layer semantics, never naively compare file trees. Each of the
-following is a named case the diff handles and tests:
+Custodian activation additionally requires the bootstrap authorization, capability
+revocation, independent cgroup-termination monitor, staging recovery and bounded
+import/restore gates in ADR-0022. Their concrete authentication and privilege protocol
+is not selected. No cross-run history read, export, rewind source or prune is available
+until independent authorization outside the child's authority is validated. Same-UID
+read-only access is not a safe fallback. A socketpair does not authenticate bootstrap,
+and no_new_privs alone does not prevent indirect launch through unconfined services.
 
-- **Whiteouts.** A char 0/0 device in the upper layer reads as "deleted", not as a created device
-  node.
-- **Opaque directories.** An opaque-marked directory reads as a replacement of the lower directory,
-  so lower entries absent from it are deletions, not unchanged files.
-- **Cross-layer renames.** A copied-up file plus a whiteout at the old name reads as a rename where
-  that is recoverable, and at minimum never reads as an unrelated create-plus-delete of identical
-  content without noting the relation.
-- **Hard links.** Two upper-layer names for one inode read as one change, not two independent
-  files; link count changes are reported as such.
+## 4. Overlay backend
 
-The same cases apply to the copy fallback through the equivalence obligation of section 3: the
-fallback's capture format must preserve enough to answer them identically.
+ADR-0009 remains the intended optimized backend, gated on complete lifecycle and
+copy-equivalence validation. Historical mount-spike success does not enable it.
+The live lower tree must not change; snapshots retain an immutable baseline sufficient
+to reconstruct old visible states independently of the original workspace. Upper-layer
+captures preserve cumulative changed state, not necessarily only the latest delta.
 
-## 6. Escape and fault surface (SR-2, NFR-5)
+Whiteouts may be device nodes or xattr-marked files. Opaque directories, redirects,
+copy-up and hard-link topology require explicit interpretation. Mount options must be
+chosen and tested for the supported semantics: disabling inode indexing can break
+lower-layer hard links during copy-up. Neither lower nor upper storage may be directly
+modified while mounted. Capturing a layer still requires the section 2 barrier.
 
-Two families of hostile input bear on this file, both enumerated and tested in
-[`escapes.md`](escapes.md), the traceability layer over the rest of the design:
+## 5. Rewind and diff
 
-- **Rename and hard-link races on the overlay** (SR-2): the child racing capture with renames or
-  link games to smuggle content past a snapshot boundary or to make the diff misattribute a change.
-  The single-threaded decision loop and supervisor-side execution of the mutation family bound what
-  a race can do, but the overlay-level behavior is claimed only when the escape tests pass.
-- **Resource exhaustion**: a fork bomb or a deliberate fill-the-upper-layer loop turning the
-  snapshot mechanism into a disk-exhaustion vector. The backstop is an upperdir size limit, fixed
-  at slate 3: 2 GiB by default, operator-configurable, with preflight warning when free disk on the
-  state directory's filesystem is below the cap. Hitting it resolves per fail-closed, the run stops
-  rather than the host filling.
+Rewind requires an ended run, exclusive workspace ownership, and no live overlay mount
+or remaining references that could mutate the restored state. Restore the selected
+supported state; never replace a mounted upperdir. Failures must be explicit, with
+recoverable staging and the prior state retained until restoration can be committed.
+Rewind reverses filesystem effects only, not effects already emitted off-host.
 
-Per I5 and NFR-5, no reversibility claim is made anywhere (docs, report, pitch) until the
-write-layer-semantics tests of section 5 pass. Until then, rewind and diff are described as
-implemented, not as correct.
+Diff compares reconstructed visible states. Whiteouts mean deletion, opaque directories
+replace hidden lower entries, recoverable rename relations are reported, and hard links
+are treated as shared objects. Copy and overlay must produce equivalent results over
+their supported state, backed by the same fixtures and behavioral cases.
+
+## 6. Validation and fault surface
+
+Before any exactness claim, Linux tests must cover continuous existing-fd writes,
+shared mappings, concurrent rename and hard-link activity, forking descendants,
+cgroup escape attempts, unsupported asynchronous I/O, freezer timeout, capture and
+publication failure, and descendants surviving their initial parent. Restore and diff
+must preserve the full supported state. Tests run against each enabled backend.
+
+The 2 GiB default configurable upper-layer limit from ADR-0009 remains a requirement
+for overlay; polling size is not proof of a hard bound. Capacity enforcement and
+capture-storage exhaustion need explicit fail-closed tests before a bounded-storage
+claim. No backend may publish partial state on ENOSPC.
 
 ## 7. The M0 spike checklist
 

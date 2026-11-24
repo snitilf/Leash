@@ -875,6 +875,7 @@ fn enforce_mode_without_policy_is_refused() {
         root_pid: pid as u32,
         broker: None,
         resolved_hosts: None,
+        capture: None,
     };
     let result = run_loop(child, config, &mut writer);
     assert!(matches!(result, Err(RunError::EnforceWithoutPolicy)));

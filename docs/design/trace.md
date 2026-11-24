@@ -107,8 +107,16 @@ In a run with no policy, `matched_rule` carries a fixed base id naming what deci
 collide with them because they carry a `:` and rule ids are plain names.
 
 `run_start` carries the same facts as `meta.json` so the stream is self-contained. `step` marks a
-**step** boundary with the step index (FR-17, [`snapshot.md`](snapshot.md)). `run_end` carries the
-exit status of the child tree and the final step index.
+committed **step** boundary with the step index (FR-17, [`snapshot.md`](snapshot.md)). `run_end`
+carries the exit status of the child tree and the final committed step index.
+
+ADR-0022 requires snapshot-enabled runs to record their backend and consistency-contract
+version, and to bind each successful step to its durably published snapshot. These additions
+are required design, with schema implementation and validation pending. Existing live-copy
+captures must not be relabeled exact. A failed or unpublished capture must not produce a
+successful step; a published snapshot without its committed step is an orphan during recovery.
+A failed final capture must be represented as failure, not as a successful final boundary.
+
 
 The `fact` is what the supervisor resolved, not what the child's memory said after the fact: the
 trace records the kernel-trusted value the decision used (I4), so the trace and the decision cannot

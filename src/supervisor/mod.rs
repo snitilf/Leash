@@ -10,6 +10,8 @@
 pub mod ask;
 #[cfg(target_os = "linux")]
 pub mod broker;
+#[cfg(target_os = "linux")]
+pub mod cgroup;
 pub mod fact;
 pub mod mem;
 pub mod notify;

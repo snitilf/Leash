@@ -9,6 +9,16 @@
 
 use crate::recorder::{Mode, SnapshotMechanism};
 
+/// behaviorally verify a delegated cgroup v2 subtree for future exact snapshots.
+/// this probe is separate from ordinary runs while snapshot capture is unavailable.
+#[cfg(target_os = "linux")]
+pub fn probe_snapshot_cgroup(
+    parent: &std::path::Path,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    crate::supervisor::cgroup::probe_delegation(parent, timeout)
+}
+
 /// the kernel floor: Linux 5.19 (ADR-0012). below this leash refuses to run.
 pub const KERNEL_FLOOR: (u32, u32) = (5, 19);
 

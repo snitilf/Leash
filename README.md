@@ -61,7 +61,8 @@ A camera, not a bouncer.
 | --- | --- |
 | Record | Working and tested. |
 | Enforce | Working and tested. |
-| Rewind | Planned for milestone M3: workspace snapshots, rewind to a step, diff two runs. `leash rewind` and `leash diff` print "not implemented yet". |
+| Run history | `leash runs` lists recorded runs with their mode, command, and exit. Pruning is not available yet. |
+| Rewind | Planned for milestone M3: workspace snapshots, rewind to a step, diff two runs. The copy-based snapshot primitives exist; capture in a live run stays switched off until it is proven exact ([ADR-0022](docs/adr/0022-exact-snapshot-capture-barrier.md)). `leash rewind` and `leash diff` print "not implemented yet". |
 | Platform | Linux 5.19 or later, x86-64. |
 
 ## Quick start
@@ -131,7 +132,7 @@ The project is documentation-driven: every decision is written down before it is
 
 - [Specification](docs/spec/SPEC.md): numbered requirements, the security ones included.
 - [Design](docs/design/): architecture, the notify loop, syscalls, policy, trace, and the escape inventory.
-- [Decision records](docs/adr/): 21 ADRs, from "why Rust" to which kernel races to accept.
+- [Decision records](docs/adr/): 22 ADRs, from "why Rust" to which kernel races to accept.
 - [Measurements](docs/measurements/): overhead and kernel behavior, with the method behind each number.
 - [Glossary](docs/CONTEXT.md): the project's vocabulary, used exactly.
 

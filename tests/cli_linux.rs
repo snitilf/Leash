@@ -240,10 +240,7 @@ fn usage_and_reserved_subcommands_exit_2() {
             vec!["rewind"],
             "leash: 'rewind' is not implemented yet (planned: time-travel milestone M3)",
         ),
-        (
-            vec!["runs"],
-            "leash: 'runs' is not implemented yet (planned: FR-21 run management)",
-        ),
+        (vec!["runs", "prune"], "requires at least one run id"),
     ] {
         let out = run_leash(&args, ws.path());
         assert_eq!(out.status.code(), Some(2), "args {args:?}");

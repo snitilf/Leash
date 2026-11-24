@@ -102,6 +102,8 @@ pub mod rule {
 pub struct RunOutcome {
     /// raw wait status of the direct child.
     pub wait_status: i32,
+    /// index of the final step boundary (FR-17); 0 when no snapshot capture was wired
+    pub final_step: u64,
 }
 
 /// fatal loop errors. every one aborts the run fail-closed (I3): the notify fd is
@@ -125,6 +127,13 @@ pub enum RunError {
     #[cfg(target_os = "linux")]
     #[error("confined realization broker failed: {0}")]
     Broker(#[from] crate::supervisor::broker::BrokerError),
+    /// snapshot capture is disabled until coherent, race-safe capture is available.
+    #[error("snapshot capture is not available")]
+    CaptureUnavailable,
+    /// a step-boundary capture failed; the run aborts fail-closed rather than record a
+    /// boundary whose snapshot does not exist (snapshot.md section 6)
+    #[error("snapshot capture failed; run aborted: {0}")]
+    Snapshot(#[from] crate::snapshot::SnapshotError),
 }
 
 /// immutable inputs for one notify-loop run.
@@ -143,6 +152,10 @@ pub struct RunConfig<'a> {
     pub prompter: &'a dyn Fn(&[ask::PendingAsk], Duration) -> AskResolution,
     /// root of the supervised process tree
     pub root_pid: u32,
+    /// step-boundary capture target (FR-11). when present, the loop runs the step clock
+    /// and captures at every boundary; when absent, no steps exist and the final step
+    /// index is 0.
+    pub capture: Option<&'a dyn crate::snapshot::BoundaryCapture>,
     /// confined side-effect broker; required in enforce mode
     #[cfg(target_os = "linux")]
     pub broker: Option<&'a RefCell<crate::supervisor::broker::Broker>>,
@@ -172,6 +185,7 @@ impl<'a> RunConfig<'a> {
             ask_timeout: DEFAULT_ASK_TIMEOUT,
             prompter: &ask::tty_prompt,
             root_pid,
+            capture: None,
             #[cfg(target_os = "linux")]
             broker: None,
             resolved_hosts: None,
@@ -187,6 +201,7 @@ impl<'a> RunConfig<'a> {
             ask_timeout: DEFAULT_ASK_TIMEOUT,
             prompter: &ask::tty_prompt,
             root_pid,
+            capture: None,
             #[cfg(target_os = "linux")]
             broker: None,
             resolved_hosts: None,
@@ -209,6 +224,7 @@ impl<'a> RunConfig<'a> {
             ask_timeout: DEFAULT_ASK_TIMEOUT,
             prompter: &ask::tty_prompt,
             root_pid,
+            capture: None,
             broker: Some(broker),
             resolved_hosts: Some(resolved_hosts),
         }
@@ -220,7 +236,16 @@ impl<'a> RunConfig<'a> {
         self
     }
 
+    /// wire step-boundary capture (FR-11); the session passes the run-directory target.
+    pub fn with_capture(mut self, capture: &'a dyn crate::snapshot::BoundaryCapture) -> Self {
+        self.capture = Some(capture);
+        self
+    }
+
     fn validate(self) -> Result<Self, RunError> {
+        if self.capture.is_some() {
+            return Err(RunError::CaptureUnavailable);
+        }
         if self.mode == crate::recorder::Mode::Enforce && self.policy.is_none() {
             return Err(RunError::EnforceWithoutPolicy);
         }
@@ -278,8 +303,12 @@ pub(crate) enum DirAnchor {
 /// outcome of one handled notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Handled {
-    /// a response was sent (an event was recorded unless the syscall is silent)
+    /// a response was sent for an action that cannot mutate the workspace
+    /// (an event was recorded unless the syscall is silent)
     Responded,
+    /// a response was sent and the action may have mutated the workspace: an allowed
+    /// filesystem write or mutation (FR-17 step-clock input, snapshot.md section 1)
+    RespondedMutation,
     /// case B: the notification died mid-handling; no event, no response
     Dropped,
 }
@@ -642,7 +671,7 @@ fn handle_fs<N: Notifier, S: TraceSink>(
             };
             record(writer, ts, notif, shape.name, fact, &decision)?;
             respond_continue_or_deny(kernel, notif.id, &decision)?;
-            Ok(Handled::Responded)
+            Ok(mutation_handled(decision.response_decision, &access))
         }
         // case C: a fact that cannot be trusted cannot be allowed (I4).
         Err(_) => {
@@ -851,7 +880,19 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
         }
     };
     respond_broker_result(kernel, notif.id, result, close_on_exec)?;
-    Ok(Handled::Responded)
+    Ok(mutation_handled(decision.response_decision, &access))
+}
+
+/// classify one handled filesystem action for the step clock (snapshot.md section 1):
+/// mutating means the response let it proceed and the access writes, creates, or
+/// deletes. reads and denials never tick the clock.
+fn mutation_handled(response: Decision, access: &[crate::recorder::FsAccess]) -> Handled {
+    let writes = access.iter().any(|a| *a != crate::recorder::FsAccess::Read);
+    if response == Decision::Allow && writes {
+        Handled::RespondedMutation
+    } else {
+        Handled::Responded
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1552,7 +1593,7 @@ mod linux {
     use crate::supervisor::notify::NotifyFd;
     use crate::supervisor::spawn::SupervisedChild;
     use std::os::fd::AsRawFd;
-    use std::time::SystemTime;
+    use std::time::{Instant, SystemTime};
 
     /// the real kernel side: the notify fd plus per-notification /proc reads.
     struct ProcNotifier<'a> {
@@ -1641,8 +1682,31 @@ mod linux {
         let kernel = ProcNotifier {
             notify: &child.notify,
         };
+        // the step clock runs only when a capture target is wired (FR-11, FR-17);
+        // without one there are no boundaries and the final step index stays 0.
+        let mut clock = config
+            .capture
+            .map(|_| crate::snapshot::StepClock::new(crate::snapshot::STEP_WINDOW));
 
         loop {
+            // close a step boundary if activity has quiesced. capture first, then the
+            // step event, then fsync (trace.md section 4): a recorded boundary always
+            // has its snapshot on disk, and a capture failure stops the run closed.
+            if let (Some(clock), Some(capture)) = (clock.as_mut(), config.capture)
+                && let Some(step) = clock.poll(Instant::now())
+            {
+                if let Err(e) = capture.capture(step) {
+                    abort_run(&child);
+                    return Err(e.into());
+                }
+                if let Err(e) = writer
+                    .append(now_ms(), EventBody::Step { step })
+                    .and_then(|_| writer.sync())
+                {
+                    abort_run(&child);
+                    return Err(e.into());
+                }
+            }
             let mut pfd = libc::pollfd {
                 fd: child.notify.as_raw_fd(),
                 events: libc::POLLIN,
@@ -1672,7 +1736,13 @@ mod linux {
                     }
                 };
                 match handle_notification(&kernel, &notif, writer, &config, now_ms()) {
-                    Ok(_) => {}
+                    Ok(handled) => {
+                        if handled == Handled::RespondedMutation
+                            && let Some(clock) = clock.as_mut()
+                        {
+                            clock.on_mutation(Instant::now());
+                        }
+                    }
                     Err(e) => {
                         // case E (or a dead fd): deny the pending action best-effort,
                         // then tear down; an unrecordable allow is not an allow
@@ -1693,7 +1763,22 @@ mod linux {
         }
 
         let wait_status = child.wait().map_err(RunError::Notify)?;
-        Ok(RunOutcome { wait_status })
+        // run end is always a boundary (snapshot.md section 1): the final capture lands
+        // after the tree is reaped, so no write can slip past it.
+        let final_step = match (clock.as_mut(), config.capture) {
+            (Some(clock), Some(capture)) => {
+                let step = clock.finish();
+                capture.capture(step)?;
+                writer.append(now_ms(), EventBody::Step { step })?;
+                writer.sync()?;
+                step
+            }
+            _ => 0,
+        };
+        Ok(RunOutcome {
+            wait_status,
+            final_step,
+        })
     }
 
     /// kill the direct child and reap it; the notify fd closes when `child` drops.
@@ -1756,6 +1841,22 @@ mod linux {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    #[test]
+    fn snapshot_capture_cannot_be_activated() {
+        struct Capture;
+        impl crate::snapshot::BoundaryCapture for Capture {
+            fn capture(&self, _: u64) -> Result<(), crate::snapshot::SnapshotError> {
+                panic!("capture must not run")
+            }
+        }
+        let capture = Capture;
+        let config = super::RunConfig::record_only(1, crate::recorder::Attendance::Unattended)
+            .with_capture(&capture);
+        assert!(matches!(
+            config.validate(),
+            Err(super::RunError::CaptureUnavailable)
+        ));
+    }
     use super::*;
     use crate::supervisor::notify::SeccompData;
     use serde_json::Value;
@@ -2028,7 +2129,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(handled, Handled::Responded);
+        assert_eq!(handled, Handled::RespondedMutation);
         assert_eq!(kernel.sent(), vec!["continue:7"]);
         let ev = &events(w)[0];
         assert_eq!(ev["fact"]["path"], "out.txt", "recorded unanchored");

@@ -7,6 +7,7 @@ pub mod cli;
 pub mod measure;
 pub mod policy;
 pub mod recorder;
+pub mod runs;
 pub mod sandbox;
 pub mod snapshot;
 pub mod supervisor;

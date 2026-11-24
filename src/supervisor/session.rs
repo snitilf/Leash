@@ -190,7 +190,6 @@ mod linux {
             } => (caps, mechanism, mechanism_reason),
             Outcome::Refuse(message) => return Err(SessionError::Refused(message)),
         };
-
         let enforcement = prepare_enforcement(&spec, caps.landlock_abi)?;
 
         let meta = RunMeta {
@@ -393,9 +392,7 @@ mod linux {
             EventBody::RunEnd {
                 exit_code,
                 signal,
-                // step detection is the snapshot slice; run start and end are the only
-                // boundaries, so the final step index is 0 (FR-17 deferred)
-                final_step: 0,
+                final_step: outcome.final_step,
             },
         )?;
         writer.sync()?;
