@@ -857,6 +857,9 @@ fn open_dir_chunk(base: &File, rel: &str, path: &str) -> Result<File, RestoreErr
 /// flags from the previous chunk's handle, so a path longer than PATH_MAX (a deep tree an
 /// agent built with relative `mkdirat`) is still reachable.
 fn open_dir_beneath(root: &File, rel: &str, path: &str) -> Result<File, RestoreError> {
+    if rel.is_empty() {
+        return open_dir_chunk(root, ".", path);
+    }
     let mut chunks = path_chunks(rel).into_iter();
     let Some(first) = chunks.next() else {
         return open_dir_chunk(root, ".", path);

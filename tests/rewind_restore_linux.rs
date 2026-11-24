@@ -901,6 +901,7 @@ fn metadata_of_an_entry_owned_by_someone_else_fails_in_preflight() {
     fs::write(fx.ws.join("g"), b"gee").unwrap();
     create_dir(&fx.ws.join("d"));
     fs::write(fx.ws.join("d/inner"), b"i").unwrap();
+    let g_mode = mode_of(&fx.ws.join("g"));
     let base = fx.capture(0);
     if root_refused(&fx, &base) {
         return;
@@ -924,7 +925,7 @@ fn metadata_of_an_entry_owned_by_someone_else_fails_in_preflight() {
     assert_eq!(mode_of(&fx.ws.join("g")), 0o600);
 
     // an existing directory whose mtime alone differs is checked the same way
-    chmod(&fx.ws.join("g"), 0o644);
+    chmod(&fx.ws.join("g"), g_mode);
     set_mtime(&fx.ws.join("d"), 1_700_000_000, 1);
     let now = fx.capture(2);
     let p = plan(&now, &base);
