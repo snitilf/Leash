@@ -28,6 +28,10 @@ fn spawn_guard() -> MutexGuard<'static, ()> {
 
 #[test]
 fn landlock_agent_dispatch() {
+    // take the spawn lock first, like the other dispatchers: in the parent test process
+    // this test runs alongside the one that sets the env var, and reading it mid-window
+    // would make the parent itself write the outside file and exit 7
+    let _g = spawn_guard();
     let Some(path) = std::env::var_os("LEASH_LANDLOCK_OUTSIDE") else {
         return;
     };
