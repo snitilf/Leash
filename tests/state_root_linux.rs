@@ -629,21 +629,12 @@ fn comm_of(pid: u32) -> String {
         .to_string()
 }
 
-/// what every descriptor of `pid` points at. panics when the table cannot be read, so a
-/// check never passes by seeing nothing.
-fn fd_targets(pid: u32) -> Vec<String> {
-    let dir = std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .unwrap_or_else(|e| panic!("cannot read /proc/{pid}/fd: {e}"));
-    dir.filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
-        .map(|t| t.to_string_lossy().into_owned())
-        .collect()
-}
-
-/// the broker is a forked copy of the supervisor, so it inherited the live trace descriptor
-/// unless it closed it. and neither process's `/proc/<pid>` tree may be reached by the agent,
-/// whatever it is granted: `mem` there is the supervisor's memory.
+/// neither the supervisor's nor the broker's `/proc/<pid>` tree may be reached by the agent,
+/// whatever it is granted: `mem` there is the supervisor's memory. (that the broker holds no
+/// inherited trace descriptor is proved in tests/broker_linux.rs: both processes are
+/// non-dumpable in a real run, so their descriptor tables cannot be read from here.)
 #[test]
-fn broker_holds_no_trace_descriptor_and_the_supervisor_proc_tree_is_denied() {
+fn the_supervisor_and_broker_proc_trees_are_denied() {
     let l = Layout::new();
     let prev = l.previous_run();
     let pids = std::sync::Mutex::new(None::<(u32, u32)>);
@@ -654,25 +645,6 @@ fn broker_holds_no_trace_descriptor_and_the_supervisor_proc_tree_is_denied() {
             .copied()
             .find(|pid| comm_of(*pid) == "leash")
             .unwrap_or_else(|| panic!("no broker among {kids:?}"));
-        // the supervisor holds the trace, which proves the check below can see one
-        let sup = fd_targets(ctx.leash_pid);
-        assert!(
-            sup.iter().any(|t| t.ends_with("/trace.jsonl")),
-            "the supervisor's own descriptors show no trace: {sup:?}"
-        );
-        let held = fd_targets(broker);
-        assert!(
-            held.len() >= 4,
-            "the broker keeps stdio and its socket at least: {held:?}"
-        );
-        assert!(
-            held.iter().all(|t| !t.contains("trace.jsonl")),
-            "the broker inherited the live trace: {held:?}"
-        );
-        assert!(
-            held.iter().all(|t| !t.contains("/runs/")),
-            "the broker inherited a run directory descriptor: {held:?}"
-        );
         std::fs::write(
             ctx.ws.join("pids"),
             format!("{} {}\n", ctx.leash_pid, broker),

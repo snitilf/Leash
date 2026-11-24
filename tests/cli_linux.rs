@@ -1307,6 +1307,7 @@ fn enforce_session_without_a_resolvable_state_root_refuses_before_spawn() {
             workspace: ws.path().to_path_buf(),
             policy_path: None,
             ask_timeout: Duration::from_secs(60),
+            snapshot_integrity: false,
         };
         let mut writer = run_dir.trace_writer().unwrap();
         let result = run_session_with_writer(&spec, meta, &run_dir, &mut writer);

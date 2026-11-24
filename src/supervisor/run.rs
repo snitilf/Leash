@@ -2580,8 +2580,8 @@ mod tests {
     #[test]
     fn snapshot_run_answers_clone3_enosys_without_reading_the_struct() {
         let p = policy("schema_version = 1\n");
-        let config =
-            RunConfig::enforce(4242, Attendance::Unattended, &p).with_snapshot_integrity(true);
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
+            .with_snapshot_integrity(true);
         // an unmapped struct pointer: any read would surface as memory_read, not the snapshot rule
         for args in [
             [0xdead, CLONE_ARGS_MIN_SIZE, 0, 0, 0, 0],
@@ -2602,8 +2602,8 @@ mod tests {
     #[test]
     fn snapshot_run_denies_aio_and_leaves_clone_alone() {
         let p = policy("schema_version = 1\n");
-        let config =
-            RunConfig::enforce(4242, Attendance::Unattended, &p).with_snapshot_integrity(true);
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
+            .with_snapshot_integrity(true);
         for (sys_nr, name) in [(nr::IO_SETUP, "io_setup"), (nr::IO_SUBMIT, "io_submit")] {
             let kernel = FakeNotifier::default();
             let mut w = writer();
@@ -2624,7 +2624,7 @@ mod tests {
     #[test]
     fn snapshot_filter_syscalls_are_denied_and_recorded_even_with_the_flag_off() {
         let p = policy("schema_version = 1\n");
-        let config = RunConfig::enforce(4242, Attendance::Unattended, &p);
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root());
         for sys_nr in [nr::IO_SETUP, nr::IO_SUBMIT] {
             let kernel = FakeNotifier::default();
             let mut w = writer();
