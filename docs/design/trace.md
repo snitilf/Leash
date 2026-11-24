@@ -28,9 +28,10 @@ $XDG_STATE_HOME/leash/runs/<run-id>/
 
 The state directory lies outside the **workspace**, and in **enforce** mode the child is denied
 access to it (FR-21, FR-3).
-Today no code denies it: measurement 0003 question 1 found the traces readable under the example policy, and writable under a broad write grant.
-ADR-0024 specifies an implicit, first-ranked seccomp deny of every open of the state root, reads included, which is not yet implemented.
-Landlock backs up writes only, and a snapshot run refuses before spawn when a write-class grant overlaps the state root.
+Measurement 0003 question 1 found the traces readable under the example policy, and writable under a broad write grant, before this deny existed.
+An implicit, first-ranked seccomp deny (`implicit:state_root`, ADR-0024) now refuses every access to the state root, reads included, and the moving, replacing or altering of its ancestors, before any policy rule.
+Landlock backs it up only where no policy grant overlaps the root, and where none overlaps it denies reads as well as writes.
+A snapshot run will refuse before spawn when a write-class grant overlaps the state root (ADR-0024, not yet implemented).
 An escape test confirms the child cannot open `trace.jsonl` under any path,
 including `/proc` self-reference ([`escapes.md`](escapes.md), I2).
 
@@ -107,7 +108,7 @@ In a run with no policy, `matched_rule` carries a fixed base id naming what deci
 `base:record_only` (the record-only base allow, [`policy.md`](policy.md) section 3),
 `sr4:io_uring`, `sr4:pidfd_getfd`, and `sr3:foreign_abi` (the denied-and-recorded set), and
 `failsafe:memory_read` (a case-C deny), and `failsafe:realization` (an enforce-mode path preparation failure, with its `errno`).
-An enforce run with a policy adds `implicit:state_root`, the implicit deny of the state root and of moving its ancestors, which is ranked before every policy rule (FR-21, ADR-0024).
+An enforce run with a policy adds `implicit:state_root`, the implicit deny of the state root and of moving, replacing or altering its ancestors, and `implicit:supervisor_proc`, the implicit deny of the supervisor's and broker's `/proc/<pid>/` trees; both rank before every policy rule (FR-21, ADR-0024).
 These are trace vocabulary, not policy rules; a loaded policy's rule ids never
 collide with them because they carry a `:` and rule ids are plain names.
 

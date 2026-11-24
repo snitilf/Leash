@@ -66,9 +66,13 @@ by ID. ADR-0002 already refers to I2 by this number; the full list is fixed here
 - **I2** - The supervisor is the sole author of the **trace** and the sole owner of the decision
   path.
   In **enforce** mode the child is denied the state directory (FR-3, FR-21), so the policy boundary protects the trace.
-  The two layers do different jobs (specified by ADR-0024, not yet implemented).
-  The seccomp layer applies an implicit, first-ranked deny of every open of the state root, reads included, and of every mutation of it or its ancestors, before any policy rule.
-  Landlock backs up writes only, and a snapshot run refuses before spawn when a write-class grant overlaps the state root.
+  The two layers do different jobs (ADR-0024 decision 3).
+  The seccomp layer applies an implicit, first-ranked deny, matched id `implicit:state_root`, of every access to the resolved state root and to anything beneath it, reads included, before any policy rule.
+  The same rule denies removing, replacing or altering (chmod, chown, truncate) an ancestor of the root, and each symlink the operator's `--state-dir` spelling traversed, and exec of a file beneath the root.
+  An enforce run cannot be built without the resolved root, which is resolved once before any process exists.
+  A sibling rule, `implicit:supervisor_proc`, denies every path under `/proc/<pid>/` of the supervisor and of its broker, and the broker closes every descriptor it does not need, so it holds no handle on the trace.
+  Landlock backs the state-root deny up only where no policy grant overlaps the root, because its grants never subtract; where none overlaps it denies reads as well as writes, and where one does, only the seccomp layer holds.
+  A snapshot run will refuse before spawn when a write-class grant overlaps the state root (ADR-0024, not yet implemented).
   Ordinary **record-only** trace integrity still rests on filesystem permissions and does not resist hostile same-uid tampering.
   Snapshots exist only in enforce mode (ADR-0024).
   Their retained state is protected during the run.
