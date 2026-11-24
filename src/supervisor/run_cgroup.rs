@@ -543,16 +543,16 @@ mod tests {
 
     #[test]
     fn run_ids_validate_strictly() {
-        assert!(is_valid_run_id("20260708T183005Z-7k3m9q"));
+        assert!(is_valid_run_id("20260708T183005Z-7k3m4q"));
         for bad in [
             "",
             "probe-0123456789abcdef",
-            "20260708T183005Z-7k3m9Q",
-            "20260708T183005Z-7k3m91",
-            "20260708T183005Z-7k3m9",
-            "20260708T183005Z-7k3m9qq",
+            "20260708T183005Z-7k3m4Q",
+            "20260708T183005Z-7k3m41",
+            "20260708T183005Z-7k3m4",
+            "20260708T183005Z-7k3m4qq",
             "../../etc/passwd/20260708T183005Z",
-            "20260708T183005Z-7k3m9q/",
+            "20260708T183005Z-7k3m4q/",
         ] {
             assert!(!is_valid_run_id(bad), "{bad:?}");
         }
@@ -611,9 +611,9 @@ mod tests {
 
     #[test]
     fn the_run_cgroup_gone_check_refuses_a_mismatched_path() {
-        let id = "20260708T183005Z-7k3m9q";
+        let id = "20260708T183005Z-7k3m4q";
         assert!(
-            run_cgroup_gone(Path::new("/nonexistent/leash-20260708T183005Z-7k3m9q"), id).unwrap()
+            run_cgroup_gone(Path::new("/nonexistent/leash-20260708T183005Z-7k3m4q"), id).unwrap()
         );
         assert!(run_cgroup_gone(Path::new("/nonexistent/leash-other"), id).is_err());
         assert!(run_cgroup_gone(Path::new("/nonexistent/x"), "not-an-id").is_err());
