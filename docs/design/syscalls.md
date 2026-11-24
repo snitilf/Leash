@@ -206,6 +206,8 @@ The unrestricted supervisor never performs a policy-governed side effect.
 Filesystem opens and mutations use a broker prepare phase with retained handles, followed by record, final `ID_VALID`, and broker commit.
 Network operations use a `pidfd_getfd` duplicate of the actual child socket and execute in the broker without replacing the child fd.
 An operation that exceeds the broker deadline aborts the run fail-closed.
+A prepare phase that fails before policy evaluation is a fail-closed `deny` under `failsafe:realization`, and the child receives the broker's errno.
+The event records that errno ([`trace.md`](trace.md) section 2) so the report can separate a missing path (`ENOENT`, `ENOTDIR`) from a refused resolution (`ELOOP`, `EXDEV`); the decision itself does not change.
 
 One rule governs every "allow" response, and it is the load-bearing security decision of this file
 (I4). It is stated once here and once in [`notify-loop.md`](notify-loop.md); the two must agree.
