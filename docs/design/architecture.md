@@ -63,12 +63,16 @@ by ID. ADR-0002 already refers to I2 by this number; the full list is fixed here
   a grandchild is mediated exactly as the agent is. Any change to process handling re-verifies this.
   (FR-1, FR-4, SR-2.)
 - **I2** - The supervisor is the sole author of the **trace** and the sole owner of the decision
-  path. In **enforce** mode the child is denied the state directory by both layers (FR-3, FR-21), so
-  the policy boundary protects the trace. Ordinary **record-only** trace integrity still
-  rests on filesystem permissions and does not resist hostile same-uid tampering. Exact
-  snapshot-enabled runs in both modes additionally require verified protection of retained
-  baselines, captures and authoritative metadata (ADR-0022, FR-21); these controls remain
-  pending. The distinction and residual are named in [`escapes.md`](escapes.md).
+  path. In **enforce** mode the child is denied the state directory by both layers (FR-3, FR-21),
+  so the policy boundary protects the trace. Each layer does a specific job (ADR-0024). The
+  seccomp layer applies an implicit, first-ranked deny of every access to the state root, reads
+  included, before any policy rule. Landlock backs up writes only, and a snapshot run refuses
+  before spawn when a write-class grant overlaps the state root. Ordinary **record-only** trace
+  integrity still rests on filesystem permissions and does not resist hostile same-uid
+  tampering. Snapshots exist only in enforce mode (ADR-0024). Their retained state is protected
+  during the run, detected as tampered at rest by recorded digests, and not protected against
+  other same-uid processes between runs; the ADR-0022 custodian is the deferred path to that.
+  The distinction and residual are named in [`escapes.md`](escapes.md).
 
 - **I3** - Every decision **fails closed**. Any supervisor error, crash, or decision timeout
   resolves the pending action to deny; the child never gets a default-allow. One arc is scoped by
