@@ -152,11 +152,27 @@ It applies changes with `openat2` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` fr
 It writes a temporary file and renames it into place, and never writes in place.
 It hashes the bytes it writes, and refuses to run as root.
 A forged store can therefore only produce workspace content, never a write elsewhere.
+The root refusal checks the real effective uid of the process as well as the identity the caller passes in.
+A parent path is opened in chunks of components, each with the same resolve flags, so a tree deeper than `PATH_MAX` still restores.
+A file with a hard link outside the workspace is never changed in place, because that would change the outside name too.
+Rewind replaces it with a new inode and relinks its other workspace names to the new one.
+Ownership and permission problems are found in a preflight pass before the first write.
+A killed rewind can leave `.leash-restore-*` temporary names behind.
+The next rewind removes them from the directories it touches, except names the target itself contains.
+It fsyncs each directory it changed before it applies directory metadata.
 `--expect <digest>` refuses a store whose digest does not match.
 
 Rewind first snapshots the current workspace, so every rewind can be undone.
 The agent can plant an entry that capture refuses, for example `mknod(S_IFSOCK)`, a mode-000 file, or a cap overrun.
 If that snapshot cannot be taken, rewind refuses and names `--no-undo`, which skips it.
+With `--no-undo`, rewind plans from a tolerant scan of the workspace instead (`scan_current`).
+The scan walks the workspace the way capture does, but it stores no object and no manifest, and its output is never a snapshot.
+It hashes only readable regular files within the size caps.
+An entry it cannot capture is reported as refused and appears in the plan as a removal.
+When the target has a regular file at that path, the refused entry is rewritten from the target instead.
+That covers sockets, fifos, devices, mount points, unreadable files, files over a cap, and unsupported extended attributes.
+An unreadable directory is reported too, and a plan that must write inside it fails when applied.
+The entry count cap and names that are not UTF-8 still fail the scan, because a plan cannot name such entries.
 It prints a change summary before it applies anything.
 It restores the selected supported state and never replaces a mounted upperdir.
 Failures are explicit, with recoverable staging and the prior state retained until restoration can be committed.
