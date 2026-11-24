@@ -42,6 +42,9 @@ pub struct SupervisedChild {
     pub pid: libc::pid_t,
     /// the supervisor's end of the seccomp notify listener.
     pub notify: NotifyFd,
+    /// whether the installed filter is the snapshot-run one (legacy AIO trapped); the
+    /// notify loop refuses to serve when this disagrees with the run's flag.
+    pub snapshot_filter: bool,
 }
 
 impl SupervisedChild {
@@ -90,7 +93,9 @@ pub fn spawn_supervised_with(
     snapshot_integrity: bool,
 ) -> Result<SupervisedChild, SpawnError> {
     let filter = build_filter_with(snapshot_integrity);
-    spawn_with_filter(spec, &filter)
+    let mut child = spawn_with_filter(spec, &filter)?;
+    child.snapshot_filter = snapshot_integrity;
+    Ok(child)
 }
 
 /// the same as `spawn_supervised` but with a caller-supplied filter program. the seam the
@@ -193,7 +198,11 @@ fn parent_handshake(
     }
 
     let notify = NotifyFd::new(notify_fd).map_err(SpawnError::Handshake)?;
-    Ok(SupervisedChild { pid, notify })
+    Ok(SupervisedChild {
+        pid,
+        notify,
+        snapshot_filter: false,
+    })
 }
 
 /// resolve `argv0` to a nul-terminated executable path, mirroring `execvp` search but in

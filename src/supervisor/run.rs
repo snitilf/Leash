@@ -129,6 +129,14 @@ pub enum RunError {
     /// snapshot integrity restrictions were requested outside enforce mode.
     #[error("snapshot integrity restrictions require enforce mode")]
     SnapshotIntegrityNeedsEnforce,
+    /// the installed seccomp filter and the run's snapshot flag disagree.
+    #[error("snapshot filter mismatch: filter installed {installed}, run requires {required}")]
+    SnapshotFilterMismatch {
+        /// whether the child's filter traps the snapshot-only syscalls
+        installed: bool,
+        /// whether the run's `snapshot_integrity` flag is set
+        required: bool,
+    },
     /// enforce mode reached the loop without a loaded policy.
     #[error("enforce mode requires a loaded policy")]
     EnforceWithoutPolicy,
@@ -559,7 +567,9 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
     // is read: the struct lives in agent memory, so a CLONE_INTO_CGROUP flag check would
     // race the agent rewriting it. libc falls back to clone, which has no cgroup argument.
     // AIO is denied because the freezer stops tasks, not in-flight I/O.
-    if config.snapshot_integrity && (sys_nr == nr::CLONE3 || SNAPSHOT_TRAPPED.contains(&sys_nr)) {
+    // a trapped snapshot-filter syscall is denied and recorded whatever the flag says, so
+    // a filter and flag that disagree can never allow it unrecorded.
+    if SNAPSHOT_TRAPPED.contains(&sys_nr) || (config.snapshot_integrity && sys_nr == nr::CLONE3) {
         let matched_rule = if sys_nr == nr::CLONE3 {
             rule::SNAPSHOT_CLONE3
         } else {
@@ -1629,6 +1639,21 @@ fn record_event<S: TraceSink>(
     Ok(())
 }
 
+/// the child's filter must be the one the run's flag calls for: a default filter under a
+/// snapshot run leaves AIO unmediated, and a snapshot filter under a plain run is
+/// unexpected. either way the loop refuses before serving a single notification.
+#[cfg(any(target_os = "linux", test))]
+fn require_matching_filter(installed: bool, required: bool) -> Result<(), RunError> {
+    if installed == required {
+        Ok(())
+    } else {
+        Err(RunError::SnapshotFilterMismatch {
+            installed,
+            required,
+        })
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub use linux::run_loop;
 
@@ -1725,6 +1750,10 @@ mod linux {
                 return Err(e);
             }
         };
+        if let Err(e) = require_matching_filter(child.snapshot_filter, config.snapshot_integrity) {
+            abort_run(&child);
+            return Err(e);
+        }
         let kernel = ProcNotifier {
             notify: &child.notify,
         };
@@ -2500,6 +2529,32 @@ mod tests {
         super::handle_notification(&kernel, &notif(nr::CLONE, [0; 6]), &mut w, &config, 1_000)
             .unwrap();
         assert_eq!(kernel.sent(), vec!["continue:7"]);
+    }
+
+    #[test]
+    fn snapshot_filter_syscalls_are_denied_and_recorded_even_with_the_flag_off() {
+        let p = policy("schema_version = 1\n");
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p);
+        for sys_nr in [nr::IO_SETUP, nr::IO_SUBMIT] {
+            let kernel = FakeNotifier::default();
+            let mut w = writer();
+            super::handle_notification(&kernel, &notif(sys_nr, [0; 6]), &mut w, &config, 1_000)
+                .unwrap();
+            assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::ENOSYS)]);
+            assert_eq!(events(w)[0]["matched_rule"], rule::SNAPSHOT_AIO);
+        }
+    }
+
+    #[test]
+    fn a_filter_and_flag_that_disagree_are_refused_in_both_directions() {
+        assert!(require_matching_filter(true, true).is_ok());
+        assert!(require_matching_filter(false, false).is_ok());
+        for (installed, required) in [(false, true), (true, false)] {
+            assert!(matches!(
+                require_matching_filter(installed, required),
+                Err(RunError::SnapshotFilterMismatch { .. })
+            ));
+        }
     }
 
     #[test]

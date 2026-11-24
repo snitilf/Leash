@@ -143,7 +143,7 @@ fn drive_with<F>(child: SupervisedChild, mut on_trap: F) -> (Vec<Trap>, i32)
 where
     F: FnMut(&NotifyFd, &SeccompNotif) -> Handling,
 {
-    let SupervisedChild { pid, notify } = child;
+    let SupervisedChild { pid, notify, .. } = child;
     let mut traps = Vec::new();
     let start = Instant::now();
     loop {
