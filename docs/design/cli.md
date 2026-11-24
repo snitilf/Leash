@@ -43,7 +43,7 @@ normative set:
 |---|---|
 | no subcommand | `leash` invoked with no arguments, or a bare option before any subcommand other than `--help`/`-h` and `--version`/`-V` |
 | top-level option with extra arguments | `--help`, `-h`, `--version`, or `-V` followed by any further argument |
-| unknown subcommand or flag | a subcommand that is not `run` or `runs` (and not a reserved name below), or a flag `run` does not accept |
+| unknown subcommand or flag | a subcommand that is not `run`, `runs` or `diff` (and not a reserved name below), or a flag `run` does not accept |
 | `run` without `--` | `run` invoked with no `--` separator |
 | empty command after `--` | `--` present but nothing follows it |
 | a flag given twice | `--unattended`, `--state-dir`, `--policy`, or `--ask-timeout` repeated |
