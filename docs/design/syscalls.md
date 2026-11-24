@@ -243,9 +243,13 @@ links are refused explicitly. Resolution against any other allowed root uses
 `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` (which implies `NO_MAGICLINKS`): out-of-workspace allows
 are rare, explicit paths and get the strictest treatment. Policy is always evaluated against the
 final resolved path. This is what defeats the symlink and `/proc` self-reference escapes (SR-2).
-The namespace-root (`/`) anchor is the one non-workspace exception: it uses
-`RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS` because no ordinary symlink can escape above `/`, and
-this preserves standard layouts such as `/lib` pointing into `/usr/lib`.
+The namespace-root (`/`) anchor is the one non-workspace exception (ADR-0023): it uses
+`RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS`. `RESOLVE_BENEATH` rejects every absolute symlink, so it
+would refuse `/usr/share/locale/locale.alias -> /etc/locale.alias` and `/etc/localtime` for a path the
+policy allows. With the root dirfd being the real `/`, `RESOLVE_IN_ROOT` gives ordinary path semantics
+(absolute symlinks restart at `/`, `..` at `/` stays at `/`) while magic links stay refused. The
+identity the policy sees is still read back from the opened handle, so a symlink into a denied path is
+denied.
 For a child `openat2`, v1 accepts the base `open_how` layout plus zero-filled extension bytes.
 Nonzero extension bytes return `E2BIG`.
 Nonzero caller `resolve` flags return `EOPNOTSUPP` until their exact interaction with the broker's mandatory resolution flags is specified and tested.
