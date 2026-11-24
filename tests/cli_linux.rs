@@ -615,7 +615,7 @@ fn enforce_denies_an_absolute_symlink_to_a_denied_path() {
         events.iter().any(|event| {
             event["fact"]["path"] == secret.to_string_lossy().as_ref()
                 && event["decision"] == "deny"
-                && event["matched_rule"] == "fs.0"
+                && event["matched_rule"] == "fs.1"
         }),
         "deny on the resolved target missing from trace: {events:#?}"
     );
