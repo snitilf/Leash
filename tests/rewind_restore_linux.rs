@@ -12,7 +12,7 @@ use std::path::Path;
 
 use leash::snapshot::restore::{
     ChangeAction, RestoreContext, RestoreError, RestoreOp, apply, apply_with_context, chain_head,
-    current_manifest, plan, recompute_chain,
+    current_manifest, plan, recompute_chain, scan_current,
 };
 use leash::snapshot::store::{EntryKind, Limits, Manifest, StoreError, capture, load_manifest};
 
@@ -1129,4 +1129,108 @@ fn a_tree_deeper_than_path_max_is_restored() {
     assert_eq!(read_deep(&fx.ws_fd(), &names[..30], "mid").unwrap(), b"mid");
     assert_eq!(read_deep(&fx.ws_fd(), &names, "extra"), None);
     assert_eq!(fx.capture(2).entries, base.entries);
+}
+
+// ---- scan_current: the planning input when the safety snapshot is skipped ----
+
+fn count_store_files(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let p = e.unwrap().path();
+            if p.is_dir() { count_store_files(&p) } else { 1 }
+        })
+        .sum()
+}
+
+#[test]
+fn scan_current_matches_capture_when_nothing_is_refused() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("a"), b"pair").unwrap();
+    fs::hard_link(fx.ws.join("a"), fx.ws.join("b")).unwrap();
+    create_dir(&fx.ws.join("d"));
+    fs::write(fx.ws.join("d/empty"), b"").unwrap();
+    symlink("a", fx.ws.join("lnk")).unwrap();
+    chmod(&fx.ws.join("d/empty"), 0o4755);
+    if try_set_user_xattr(&fx.ws.join("a"), "user.k", b"v") {
+        // the group shares one inode, so both names carry it
+    }
+    let captured = fx.capture(0);
+    let (scanned, refused) = scan_current(&fx.ws_fd(), &Limits::default()).unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(scanned.entries, captured.entries);
+    assert_eq!(scanned.totals, captured.totals);
+}
+
+#[test]
+fn a_no_undo_scan_stores_nothing_and_plans_around_entries_capture_refuses() {
+    use std::os::unix::net::UnixListener;
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("keep"), b"keep").unwrap();
+    fs::write(fx.ws.join("secret"), b"secret").unwrap();
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    // the agent plants entries that capture refuses and edits what is already there
+    let _listener = UnixListener::bind(fx.ws.join("sock")).unwrap();
+    fs::write(fx.ws.join("huge"), vec![7u8; 64]).unwrap();
+    fs::write(fx.ws.join("keep"), b"edited").unwrap();
+    chmod(&fx.ws.join("secret"), 0o000);
+    let err = capture(&fx.ws_fd(), &fx.store_fd(), 1, &Limits::default()).unwrap_err();
+    assert!(matches!(err, StoreError::UnsupportedEntry { .. }), "{err}");
+
+    let before = count_store_files(&fx.store_path);
+    let limits = Limits {
+        max_file_size: 16,
+        ..Limits::default()
+    };
+    let (current, refused) = scan_current(&fx.ws_fd(), &limits).unwrap();
+    let refused_paths: Vec<&str> = refused.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(refused_paths, ["huge", "secret", "sock"], "{refused:?}");
+    // scanning writes no object and no manifest
+    assert_eq!(count_store_files(&fx.store_path), before);
+
+    let p = plan(&current, &base);
+    assert!(p.ops.contains(&RestoreOp::Remove {
+        path: "sock".into(),
+        kind: EntryKind::File
+    }));
+    assert!(p.ops.contains(&RestoreOp::Remove {
+        path: "huge".into(),
+        kind: EntryKind::File
+    }));
+    // the unreadable file is rewritten from the target
+    assert!(p.ops.contains(&RestoreOp::WriteFile {
+        path: "secret".into()
+    }));
+    apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap();
+
+    assert_eq!(names(&fx.ws), ["keep", "secret"]);
+    assert_eq!(fs::read(fx.ws.join("keep")).unwrap(), b"keep");
+    assert_eq!(fs::read(fx.ws.join("secret")).unwrap(), b"secret");
+    assert_eq!(fx.capture(2).entries, base.entries);
+}
+
+#[test]
+fn a_scan_lists_an_unreadable_directory_instead_of_failing() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("keep"), b"keep").unwrap();
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    create_dir(&fx.ws.join("locked"));
+    fs::write(fx.ws.join("locked/inner"), b"i").unwrap();
+    chmod(&fx.ws.join("locked"), 0o000);
+    let (current, refused) = scan_current(&fx.ws_fd(), &Limits::default()).unwrap();
+    chmod(&fx.ws.join("locked"), 0o700);
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].path, "locked");
+    assert!(
+        current
+            .entries
+            .iter()
+            .any(|e| e.path == "locked" && e.kind == EntryKind::Dir)
+    );
 }

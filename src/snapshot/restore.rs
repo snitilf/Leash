@@ -20,6 +20,8 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
 use sha2::{Digest, Sha256};
 
+pub use super::store::{RefusedEntry, UNCAPTURED_SHA256, scan_current};
+
 use super::diff::display_path;
 use super::store::{
     EntryKind, Limits, Manifest, ManifestEntry, StoreError, capture, committed_steps, hex_encode,

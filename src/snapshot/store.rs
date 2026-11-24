@@ -54,6 +54,20 @@ pub const DEFAULT_MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 /// workspaces and tuned alongside operator configuration.
 pub const DEFAULT_MAX_STORE_GROWTH: u64 = 4 * 1024 * 1024 * 1024;
 
+/// the placeholder digest `scan_current` gives an entry it could not hash. no content
+/// hashes to it, and `scan_current` output is never stored.
+pub const UNCAPTURED_SHA256: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// an entry `scan_current` could not describe exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedEntry {
+    /// relative path.
+    pub path: String,
+    /// why the entry was not captured.
+    pub reason: &'static str,
+}
+
 /// resource bounds enforced fail-closed during snapshot capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
@@ -689,7 +703,7 @@ pub(crate) fn step_manifest_filename(step: u64) -> String {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{capture, committed_steps, load_manifest, verify_object};
+pub use linux::{capture, committed_steps, load_manifest, scan_current, verify_object};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -703,9 +717,10 @@ mod linux {
 
     use super::{
         CaptureStats, EntryKind, FileFingerprint, Limits, MANIFEST_READ_CAP,
-        MANIFEST_SCHEMA_VERSION, Manifest, ManifestEntry, ManifestTotals, Published, StoreError,
-        XattrAction, check_file_unchanged, classify_xattr, hex_encode, is_valid_sha256_hex,
-        manifest_digest, parse_manifest, parse_step_filename, step_manifest_filename,
+        MANIFEST_SCHEMA_VERSION, Manifest, ManifestEntry, ManifestTotals, Published, RefusedEntry,
+        StoreError, UNCAPTURED_SHA256, XattrAction, check_file_unchanged, classify_xattr,
+        hex_encode, is_valid_sha256_hex, manifest_digest, parse_manifest, parse_step_filename,
+        step_manifest_filename,
     };
 
     const COPY_BUF_LEN: usize = 64 * 1024;
@@ -1685,6 +1700,391 @@ mod linux {
         }
 
         Ok(sha256_hex)
+    }
+
+    fn fstatat_nofollow(dir_fd: RawFd, name: &CStr, path: &str) -> Result<libc::stat, StoreError> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: dir_fd is a live directory descriptor, name is NUL-terminated, and
+        // AT_SYMLINK_NOFOLLOW stats a symlink itself.
+        let rc = unsafe {
+            libc::fstatat(
+                dir_fd,
+                name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return Err(io_err("fstatat", path, io::Error::last_os_error()));
+        }
+        // SAFETY: fstatat returned 0, so `st` is fully initialized.
+        Ok(unsafe { st.assume_init() })
+    }
+
+    /// a placeholder for an entry that cannot be captured: a regular file whose digest no
+    /// content has, so a plan always replaces or removes it.
+    fn uncaptured_record(
+        rel_path: String,
+        st: &libc::stat,
+        reason: &'static str,
+        refused: &mut Vec<RefusedEntry>,
+    ) -> CapturedRecord {
+        refused.push(RefusedEntry {
+            path: rel_path.clone(),
+            reason,
+        });
+        CapturedRecord {
+            entry: ManifestEntry {
+                path: rel_path,
+                kind: EntryKind::File,
+                mode: st.st_mode & 0o7777,
+                uid: st.st_uid,
+                gid: st.st_gid,
+                mtime_sec: st.st_mtime,
+                mtime_nsec: st.st_mtime_nsec,
+                size: Some(u64::try_from(st.st_size).unwrap_or(0)),
+                sha256: Some(UNCAPTURED_SHA256.to_owned()),
+                target: None,
+                link_group: None,
+                xattrs: BTreeMap::new(),
+            },
+            hardlink_inode: None,
+        }
+    }
+
+    /// read the xattrs of a regular file and, when `buf` is given, hash its content, without
+    /// storing anything. an `Err` names why the file cannot be described exactly.
+    fn hash_regular_file(
+        dir_fd: RawFd,
+        name: &CStr,
+        size: u64,
+        buf: Option<&mut [u8]>,
+    ) -> Result<(Option<String>, BTreeMap<String, String>), &'static str> {
+        // SAFETY: dir_fd and name are live; O_NOFOLLOW | O_NONBLOCK keeps a swapped-in
+        // symlink or fifo from being followed or blocking.
+        let fd = unsafe {
+            libc::openat(
+                dir_fd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err("unreadable file");
+        }
+        // SAFETY: fd was returned by openat and is uniquely owned here.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let st = fstat_fd(file.as_raw_fd(), "fstat", "").map_err(|_| "unreadable file")?;
+        if !is_reg_mode(st.st_mode) || u64::try_from(st.st_size).ok() != Some(size) {
+            return Err("changed while scanning");
+        }
+        let xattrs = read_xattrs(file.as_raw_fd(), "").map_err(|e| match e {
+            StoreError::UnsupportedMetadata { .. } => "unsupported extended attribute",
+            _ => "unreadable file",
+        })?;
+        let Some(buf) = buf else {
+            return Ok((None, xattrs));
+        };
+        let mut hasher = Sha256::new();
+        let mut read = 0u64;
+        loop {
+            match file.read(buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    read = read.saturating_add(n as u64);
+                    hasher.update(&buf[..n]);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return Err("unreadable file"),
+            }
+        }
+        if read != size {
+            return Err("changed while scanning");
+        }
+        Ok((Some(hex_encode(&hasher.finalize())), xattrs))
+    }
+
+    /// describe the current workspace for planning, without storing anything.
+    ///
+    /// this is the `--no-undo` counterpart of `capture`: it walks the workspace with the same
+    /// descriptor-relative traversal and returns a manifest in the same shape, but it writes no
+    /// object and no manifest, and its output must never be stored or verified as a snapshot.
+    /// regular files are hashed only when they are readable and within `limits`
+    /// (`max_file_size`, `max_total_bytes`).
+    ///
+    /// an entry that `capture` would refuse is reported in the returned list and appears in the
+    /// manifest as a regular file with the placeholder digest `UNCAPTURED_SHA256`, so a plan
+    /// removes it when the target has no such regular file and rewrites it from the target
+    /// when it has one. that covers sockets, fifos and devices, mount points, unreadable files
+    /// and directories, files over a cap, and unsupported extended attributes. an unreadable
+    /// directory is listed but its children are unknown, so a plan that must write inside it
+    /// fails at apply. the entry count cap and non-UTF-8 names stay hard errors, because a
+    /// manifest and a plan cannot name such entries.
+    pub fn scan_current(
+        workspace: &File,
+        limits: &Limits,
+    ) -> Result<(Manifest, Vec<RefusedEntry>), StoreError> {
+        let ws_stat = fstat_fd(workspace.as_raw_fd(), "fstat", "<workspace>")?;
+        if !is_dir_mode(ws_stat.st_mode) {
+            return Err(StoreError::InvalidRoot);
+        }
+        let root_dev = ws_stat.st_dev;
+        let mut records: Vec<CapturedRecord> = Vec::new();
+        let mut refused: Vec<RefusedEntry> = Vec::new();
+        let mut hashes: HashMap<(u64, u64), String> = HashMap::new();
+        let mut total_bytes = 0u64;
+        let mut buf = vec![0u8; COPY_BUF_LEN];
+
+        let root_names = DirStream::open_from_dir_fd(workspace.as_raw_fd(), "<workspace>")?
+            .read_names("<workspace>")?;
+        let mut stack: Vec<DirFrame> = Vec::new();
+        let mut root_idx = 0usize;
+
+        loop {
+            let (parent_fd, rel_prefix, c_name) = if let Some(frame) = stack.last_mut() {
+                if frame.next_idx >= frame.names.len() {
+                    stack.pop();
+                    continue;
+                }
+                let name = frame.names[frame.next_idx].clone();
+                frame.next_idx += 1;
+                (frame.dir.as_raw_fd(), frame.rel_prefix.clone(), name)
+            } else if root_idx < root_names.len() {
+                let name = root_names[root_idx].clone();
+                root_idx += 1;
+                (workspace.as_raw_fd(), String::new(), name)
+            } else {
+                break;
+            };
+
+            let name = std::str::from_utf8(c_name.as_bytes()).map_err(|_| {
+                let lossy = String::from_utf8_lossy(c_name.as_bytes());
+                StoreError::UnsupportedName {
+                    path: join_rel(&rel_prefix, &lossy),
+                }
+            })?;
+            let rel_path = join_rel(&rel_prefix, name);
+            if records.len() as u64 >= limits.max_entries {
+                return Err(StoreError::EntryLimitExceeded {
+                    limit: limits.max_entries,
+                });
+            }
+            let st = fstatat_nofollow(parent_fd, &c_name, &rel_path)?;
+            let fmt = st.st_mode & libc::S_IFMT;
+            if st.st_dev != root_dev {
+                records.push(uncaptured_record(
+                    rel_path,
+                    &st,
+                    "mount point",
+                    &mut refused,
+                ));
+                continue;
+            }
+
+            match fmt {
+                libc::S_IFDIR => {
+                    let mut dir_entry = ManifestEntry {
+                        path: rel_path.clone(),
+                        kind: EntryKind::Dir,
+                        mode: st.st_mode & 0o7777,
+                        uid: st.st_uid,
+                        gid: st.st_gid,
+                        mtime_sec: st.st_mtime,
+                        mtime_nsec: st.st_mtime_nsec,
+                        size: None,
+                        sha256: None,
+                        target: None,
+                        link_group: None,
+                        xattrs: BTreeMap::new(),
+                    };
+                    match openat_dir(parent_fd, &c_name, &rel_path) {
+                        Ok(dir) => {
+                            match read_xattrs(dir.as_raw_fd(), &rel_path) {
+                                Ok(xattrs) => dir_entry.xattrs = xattrs,
+                                Err(StoreError::UnsupportedMetadata { .. }) => {
+                                    refused.push(RefusedEntry {
+                                        path: rel_path.clone(),
+                                        reason: "unsupported extended attribute (left in place)",
+                                    });
+                                }
+                                Err(e) => return Err(e),
+                            }
+                            let child_names =
+                                DirStream::open_from_dir_fd(dir.as_raw_fd(), &rel_path)?
+                                    .read_names(&rel_path)?;
+                            records.push(CapturedRecord {
+                                entry: dir_entry,
+                                hardlink_inode: None,
+                            });
+                            stack.push(DirFrame {
+                                dir,
+                                rel_prefix: rel_path,
+                                names: child_names,
+                                next_idx: 0,
+                            });
+                        }
+                        Err(_) => {
+                            refused.push(RefusedEntry {
+                                path: rel_path,
+                                reason: "unreadable directory (contents unknown)",
+                            });
+                            records.push(CapturedRecord {
+                                entry: dir_entry,
+                                hardlink_inode: None,
+                            });
+                        }
+                    }
+                }
+                libc::S_IFREG => {
+                    let size = u64::try_from(st.st_size).unwrap_or(0);
+                    let inode_key = (st.st_nlink > 1).then_some((st.st_dev, st.st_ino));
+                    let over_file_cap = size > limits.max_file_size;
+                    let next_total = total_bytes.saturating_add(size);
+                    let over_total_cap = next_total > limits.max_total_bytes;
+                    if over_file_cap || over_total_cap {
+                        let reason = if over_file_cap {
+                            "file larger than the size cap"
+                        } else {
+                            "total size cap reached"
+                        };
+                        records.push(uncaptured_record(rel_path, &st, reason, &mut refused));
+                        continue;
+                    }
+                    let cached = inode_key.and_then(|key| hashes.get(&key).cloned());
+                    // another name of an already hashed inode needs its xattrs, not a
+                    // second read of the content
+                    let hashed = hash_regular_file(
+                        parent_fd,
+                        &c_name,
+                        size,
+                        cached.is_none().then_some(&mut buf[..]),
+                    )
+                    .map(|(sha, xattrs)| (sha.or(cached), xattrs))
+                    .and_then(|(sha, xattrs)| {
+                        sha.map(|sha| (sha, xattrs)).ok_or("changed while scanning")
+                    });
+                    match hashed {
+                        Ok((sha, xattrs)) => {
+                            total_bytes = next_total;
+                            if let Some(key) = inode_key {
+                                hashes.insert(key, sha.clone());
+                            }
+                            records.push(CapturedRecord {
+                                entry: ManifestEntry {
+                                    path: rel_path,
+                                    kind: EntryKind::File,
+                                    mode: st.st_mode & 0o7777,
+                                    uid: st.st_uid,
+                                    gid: st.st_gid,
+                                    mtime_sec: st.st_mtime,
+                                    mtime_nsec: st.st_mtime_nsec,
+                                    size: Some(size),
+                                    sha256: Some(sha),
+                                    target: None,
+                                    link_group: None,
+                                    xattrs,
+                                },
+                                hardlink_inode: inode_key,
+                            });
+                        }
+                        Err(reason) => {
+                            records.push(uncaptured_record(rel_path, &st, reason, &mut refused));
+                        }
+                    }
+                }
+                libc::S_IFLNK => {
+                    // SAFETY: parent_fd and c_name are live; O_PATH | O_NOFOLLOW opens the
+                    // link itself without following it.
+                    let fd = unsafe {
+                        libc::openat(
+                            parent_fd,
+                            c_name.as_ptr(),
+                            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        )
+                    };
+                    let target = if fd < 0 {
+                        None
+                    } else {
+                        // SAFETY: fd was returned by openat and is uniquely owned here.
+                        let link = unsafe { File::from_raw_fd(fd) };
+                        read_symlink_target(link.as_raw_fd(), st.st_size, &rel_path).ok()
+                    };
+                    match target {
+                        Some(target) => records.push(CapturedRecord {
+                            entry: ManifestEntry {
+                                path: rel_path,
+                                kind: EntryKind::Symlink,
+                                mode: st.st_mode & 0o7777,
+                                uid: st.st_uid,
+                                gid: st.st_gid,
+                                mtime_sec: st.st_mtime,
+                                mtime_nsec: st.st_mtime_nsec,
+                                size: None,
+                                sha256: None,
+                                target: Some(target),
+                                link_group: None,
+                                xattrs: BTreeMap::new(),
+                            },
+                            hardlink_inode: None,
+                        }),
+                        None => records.push(uncaptured_record(
+                            rel_path,
+                            &st,
+                            "unreadable symlink",
+                            &mut refused,
+                        )),
+                    }
+                }
+                other => {
+                    records.push(uncaptured_record(
+                        rel_path,
+                        &st,
+                        unsupported_kind_label(other),
+                        &mut refused,
+                    ));
+                }
+            }
+        }
+
+        records.sort_by(|a, b| a.entry.path.cmp(&b.entry.path));
+        refused.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut inode_counts: HashMap<(u64, u64), usize> = HashMap::new();
+        for rec in &records {
+            if let Some(key) = rec.hardlink_inode {
+                *inode_counts.entry(key).or_insert(0) += 1;
+            }
+        }
+        let mut group_ids: HashMap<(u64, u64), u64> = HashMap::new();
+        let mut next_group_id = 1u64;
+        let mut entries = Vec::with_capacity(records.len());
+        for mut rec in records {
+            if let Some(key) = rec.hardlink_inode
+                && inode_counts.get(&key).copied().unwrap_or(0) > 1
+            {
+                let id = *group_ids.entry(key).or_insert_with(|| {
+                    let id = next_group_id;
+                    next_group_id += 1;
+                    id
+                });
+                rec.entry.link_group = Some(id);
+            }
+            entries.push(rec.entry);
+        }
+
+        let count = |kind: EntryKind| entries.iter().filter(|e| e.kind == kind).count() as u64;
+        let manifest = Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            step: 0,
+            totals: ManifestTotals {
+                entries: entries.len() as u64,
+                files: count(EntryKind::File),
+                dirs: count(EntryKind::Dir),
+                symlinks: count(EntryKind::Symlink),
+                total_bytes,
+            },
+            entries,
+        };
+        Ok((manifest, refused))
     }
 
     /// load and validate the committed manifest for `step` from `store`.
