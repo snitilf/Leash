@@ -28,7 +28,14 @@ Snapshots exist only in enforce mode, and only when the operator passes `--snaps
 Before spawn, verify a writable delegated cgroup v2 with working `cgroup.freeze` and `cgroup.kill`.
 Also verify Landlock ABI 3 or higher, and that no write-class Landlock grant overlaps the state root or any cgroup2 mount.
 Place the child in the run cgroup before untrusted execution; keep the supervisor outside.
+Leash creates the child directly inside the cgroup with `clone3(CLONE_INTO_CGROUP)` and a descriptor on the pinned run cgroup, so membership is atomic: the child is a member before it runs one instruction, before it installs its filter, and before `execve`.
+No `cgroup.procs` write is involved, no attach descriptor is handed to the child, and a failed entry fails the spawn before any agent code exists.
+The child also closes every inherited descriptor above 2 before `execve`, as it does for all descriptors.
 Descendants inherit membership.
+The setup probe proves freeze, thaw and kill on a sacrificial cgroup holding a real process, never on the run cgroup, because on Linux 6.8 a cgroup that has been written `cgroup.kill` SIGKILLs every later `CLONE_INTO_CGROUP` child, even when it was empty at the time.
+A per-run `flock` on `<run_dir>/run.lock`, held for the whole run, marks the run alive.
+At the start of every snapshot run Leash kills and removes the sibling `leash-<run-id>` cgroups whose name validates and whose run lock under its state root can be taken, and records each in the new trace.
+It never touches a cgroup whose lock is held, whose lock file does not exist under its state root, or whose name is not exactly `leash-` and a generated run id.
 Snapshot-enabled runs refuse before spawn when any prerequisite is unavailable.
 Process enumeration and SIGSTOP are not substitutes for this barrier.
 
