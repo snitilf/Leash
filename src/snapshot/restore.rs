@@ -1428,9 +1428,9 @@ impl<'a> Applier<'a> {
         for rel in std::mem::take(&mut self.dirty) {
             let dir = match open_dir_beneath(self.workspace, &rel, &rel) {
                 Ok(dir) => dir,
-                // removed by a later operation, so there is nothing left to sync
+                // removed, or replaced by a file, by a later operation: nothing to sync
                 Err(RestoreError::Io { source, .. })
-                    if source.kind() == io::ErrorKind::NotFound =>
+                    if matches!(source.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) =>
                 {
                     continue;
                 }
