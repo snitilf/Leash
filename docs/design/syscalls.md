@@ -108,7 +108,9 @@ allowed.
 | Syscall | Also on ARM64 | Decision basis | Allow realized by | Landlock backstop |
 |---|---|---|---|---|
 | `fork`, `vfork` | no (x86-64) | none (creation itself) | `CONTINUE` (scalar decision) | none (I1 is automatic) |
-| `clone`, `clone3` | yes | flags (scalar / struct) | `CONTINUE`; in a snapshot run `clone3` is answered `ENOSYS` (specified by ADR-0024, not yet implemented) | none (I1 is automatic) |
+| `clone`, `clone3` | yes | flags (scalar / struct) | `CONTINUE` | none (I1 is automatic) |
+| `clone3`, snapshot run | yes | none (answered unread) | `ENOSYS`, recorded as `snapshot:clone3` | none |
+| `io_setup`, `io_submit`, snapshot run | no (x86-64) | none (denied unread) | `ENOSYS`, recorded as `snapshot:aio` | none |
 | `execve`, `execveat` | yes | binary path (pointer) | `CONTINUE`, backstopped by Landlock | `FS_EXECUTE` |
 
 `execve` cannot be injected: there is no fd to `ADDFD` and the exec replaces the address space. The
@@ -122,7 +124,17 @@ trace and any **ask**; the kernel drives enforcement. This split is stated as a 
 decision is on that read value. Because the enforcing property (filter inheritance) is automatic, a
 swapped flag after the read cannot escape mediation; it can at most misrecord the flags in the trace,
 which the notify loop bounds by reading once and recording what it read (I4).
-In a snapshot run, `clone3` is instead answered `ENOSYS` before the struct is read and the denial is recorded as an event, so `CLONE_INTO_CGROUP` cannot be requested and C libraries fall back to `clone` (ADR-0024 rule 7, specified, not yet implemented).
+
+A snapshot run (ADR-0024 decisions 7 and 8) changes two rows, and only that run.
+`clone3` is answered `ENOSYS` before the supervisor reads the `clone_args` struct.
+The struct lives in agent memory, so a check for `CLONE_INTO_CGROUP` would race the agent rewriting it, and seccomp sees only the pointer.
+C libraries fall back to `clone`, which has no cgroup argument.
+The denial is recorded with the rule id `snapshot:clone3`.
+`io_setup` and `io_submit` are trapped only in a snapshot run and answered `ENOSYS`, recorded as `snapshot:aio`.
+`ENOSYS` matches the `io_uring` denial and tells a caller the facility is absent, which is how libaio and glibc already handle a kernel without AIO.
+The freezer stops tasks, not in-flight I/O, so no AIO context may exist.
+`io_getevents`, `io_pgetevents`, `io_cancel` and `io_destroy` need a context and fail with `EINVAL` on their own.
+A run without snapshots keeps the filter and the trace unchanged: the AIO numbers are not in its filter.
 
 ### 3.4 Cross-process control
 
