@@ -581,11 +581,17 @@ pub fn run() -> ExitCode {
         crate::recorder::Mode::RecordOnly
     };
 
+    let state_root_spelling = if candidate.is_absolute() {
+        candidate
+    } else {
+        cwd.join(candidate)
+    };
     dispatch_run(crate::supervisor::session::SessionSpec {
         argv: run_args.command,
         mode,
         attendance,
         state_root,
+        state_root_spelling,
         workspace,
         policy_path: run_args.policy_path,
         ask_timeout: run_args

@@ -186,7 +186,8 @@ pub struct RunConfig<'a> {
     /// answered ENOSYS unread and legacy AIO is denied. enforce mode only.
     pub snapshot_integrity: bool,
     /// the resolved state root of an enforce run; evaluated as an implicit deny before any
-    /// policy rule (FR-21, ADR-0024). required in enforce mode, absent in record-only.
+    /// policy rule (FR-21, ADR-0024). the enforce constructors require it, so an enforce
+    /// run cannot be built without one; record-only runs carry none.
     pub state_root: Option<&'a crate::supervisor::state_root::StateRoot>,
 }
 
@@ -222,7 +223,12 @@ impl<'a> RunConfig<'a> {
     }
 
     /// enforce with a validated policy.
-    pub fn enforce(root_pid: u32, attendance: Attendance, policy: &'a Policy) -> Self {
+    pub fn enforce(
+        root_pid: u32,
+        attendance: Attendance,
+        policy: &'a Policy,
+        state_root: &'a crate::supervisor::state_root::StateRoot,
+    ) -> Self {
         Self {
             mode: crate::recorder::Mode::Enforce,
             policy: Some(policy),
@@ -235,7 +241,7 @@ impl<'a> RunConfig<'a> {
             broker: None,
             resolved_hosts: None,
             snapshot_integrity: false,
-            state_root: None,
+            state_root: Some(state_root),
         }
     }
 
@@ -247,6 +253,7 @@ impl<'a> RunConfig<'a> {
         policy: &'a Policy,
         broker: &'a RefCell<crate::supervisor::broker::Broker>,
         resolved_hosts: &'a HashMap<String, Vec<IpAddr>>,
+        state_root: &'a crate::supervisor::state_root::StateRoot,
     ) -> Self {
         Self {
             mode: crate::recorder::Mode::Enforce,
@@ -259,7 +266,7 @@ impl<'a> RunConfig<'a> {
             broker: Some(broker),
             resolved_hosts: Some(resolved_hosts),
             snapshot_integrity: false,
-            state_root: None,
+            state_root: Some(state_root),
         }
     }
 
@@ -281,12 +288,6 @@ impl<'a> RunConfig<'a> {
         self
     }
 
-    /// name the resolved state root the implicit deny protects (FR-21, ADR-0024).
-    pub fn with_state_root(mut self, root: &'a crate::supervisor::state_root::StateRoot) -> Self {
-        self.state_root = Some(root);
-        self
-    }
-
     fn validate(self) -> Result<Self, RunError> {
         if self.capture.is_some() {
             return Err(RunError::CaptureUnavailable);
@@ -297,12 +298,12 @@ impl<'a> RunConfig<'a> {
         if self.mode == crate::recorder::Mode::Enforce && self.policy.is_none() {
             return Err(RunError::EnforceWithoutPolicy);
         }
+        if self.mode == crate::recorder::Mode::Enforce && self.state_root.is_none() {
+            return Err(RunError::EnforceWithoutStateRoot);
+        }
         #[cfg(target_os = "linux")]
         if self.mode == crate::recorder::Mode::Enforce && self.broker.is_none() {
             return Err(RunError::MissingBroker);
-        }
-        if self.mode == crate::recorder::Mode::Enforce && self.state_root.is_none() {
-            return Err(RunError::EnforceWithoutStateRoot);
         }
         Ok(self)
     }
@@ -484,16 +485,30 @@ fn implicit_state_root_deny(
         return None;
     }
     let root = config.state_root?;
-    let denied = match request {
+    let (state_root, supervisor_proc) = match request {
         Request::Fs { path, access } => {
-            root.denies_fs(std::path::Path::new(path), access, destination)
+            let path = std::path::Path::new(path);
+            (
+                root.denies_fs(path, access, destination),
+                root.denies_proc(path),
+            )
         }
-        Request::Exec { binary } => root.denies_exec(std::path::Path::new(binary)),
-        Request::Net { .. } => false,
+        Request::Exec { binary } => {
+            let binary = std::path::Path::new(binary);
+            (root.denies_exec(binary), root.denies_proc(binary))
+        }
+        Request::Net { .. } => (false, false),
     };
-    denied.then_some(Evaluation {
+    let matched = if state_root {
+        crate::policy::MatchId::ImplicitStateRoot
+    } else if supervisor_proc {
+        crate::policy::MatchId::ImplicitSupervisorProc
+    } else {
+        return None;
+    };
+    Some(Evaluation {
         decision: Decision::Deny,
-        matched: crate::policy::MatchId::ImplicitStateRoot,
+        matched,
         would_deny: None,
     })
 }
@@ -1998,6 +2013,18 @@ mod tests {
     use super::*;
     use crate::supervisor::notify::SeccompData;
     use serde_json::Value;
+
+    /// a state root no unit-test path falls under, for configs that must carry one.
+    fn test_root() -> &'static crate::supervisor::state_root::StateRoot {
+        static ROOT: std::sync::OnceLock<crate::supervisor::state_root::StateRoot> =
+            std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            crate::supervisor::state_root::StateRoot::from_resolved(
+                "/nonexistent/leash-test".into(),
+            )
+            .unwrap()
+        })
+    }
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::io::Write;
@@ -2654,7 +2681,7 @@ mod tests {
     #[test]
     fn an_enforce_run_without_a_broker_is_refused() {
         let p = policy("schema_version = 1\n");
-        let refused = RunConfig::enforce(4242, Attendance::Unattended, &p)
+        let refused = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
             .validate()
             .expect_err("enforce must not validate");
         assert!(matches!(refused, RunError::MissingBroker), "{refused:?}");
@@ -2667,6 +2694,20 @@ mod tests {
             .expect("record-only is the mode that serves");
     }
 
+    /// an enforce config whose state root has been cleared must refuse, whatever else it has:
+    /// the implicit deny cannot be silently absent (FR-21).
+    #[test]
+    fn an_enforce_run_without_a_state_root_is_refused() {
+        let p = policy("schema_version = 1\n");
+        let mut config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root());
+        config.state_root = None;
+        let refused = config.validate().expect_err("enforce must not validate");
+        assert!(
+            matches!(refused, RunError::EnforceWithoutStateRoot),
+            "{refused:?}"
+        );
+    }
+
     /// the enforce leg of the same arc. ADR-0019 scopes exactly one arc of the
     /// fail-closed enumeration by mode; the record-only leg above allows, and here the
     /// identical untrusted fact denies fail-closed under `failsafe:memory_read`
@@ -2675,7 +2716,7 @@ mod tests {
     fn network_unreadable_sockaddr_records_raw_and_denies_in_enforce() {
         let kernel = FakeNotifier::default();
         let p = policy("schema_version = 1\n");
-        let config = RunConfig::enforce(4242, Attendance::Unattended, &p);
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root());
         let mut w = writer();
         super::handle_notification(
             &kernel,
@@ -2700,7 +2741,7 @@ mod tests {
             let kernel = FakeNotifier::default();
             let p = policy("schema_version = 1\n");
             let config = if enforce {
-                RunConfig::enforce(4242, Attendance::Unattended, &p)
+                RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
             } else {
                 RunConfig::record_only(4242, Attendance::Unattended)
             };
@@ -2782,7 +2823,7 @@ mod tests {
         let p = policy("schema_version = 1\n");
         for config in [
             RunConfig::record_only(4242, Attendance::Unattended),
-            RunConfig::enforce(4242, Attendance::Unattended, &p),
+            RunConfig::enforce(4242, Attendance::Unattended, &p, test_root()),
         ] {
             let kernel = FakeNotifier::default();
             let mut w = writer();
@@ -2806,7 +2847,7 @@ mod tests {
     #[test]
     fn enforce_unmatched_outside_fs_denies_by_default() {
         let p = policy("schema_version = 1\n");
-        let config = RunConfig::enforce(4242, Attendance::Unattended, &p);
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root());
         let decision = resolve_decision(
             &config,
             &Request::Fs {
@@ -2830,7 +2871,7 @@ mod tests {
         );
         let root =
             crate::supervisor::state_root::StateRoot::from_resolved("/var/leash".into()).unwrap();
-        let config = RunConfig::enforce(4242, Attendance::Unattended, &p).with_state_root(&root);
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, &root);
         let denied = |path: &str, access: &[crate::recorder::FsAccess], destination: bool| {
             let mut asks = Vec::new();
             let eval = evaluate_operand(
@@ -2875,6 +2916,47 @@ mod tests {
     }
 
     #[test]
+    fn the_supervisor_proc_tree_is_denied_before_policy_under_its_own_rule() {
+        let p = policy(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/**\"\nmode=[\"read\",\"write\",\"create\",\"delete\"]\naction=\"allow\"\n",
+        );
+        let root = crate::supervisor::state_root::StateRoot::from_resolved("/var/leash".into())
+            .unwrap()
+            .with_supervisor_pids([100, 200]);
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, &root);
+        for path in ["/proc/100/mem", "/proc/200/task/201/fd/3", "/proc/100"] {
+            let mut asks = Vec::new();
+            let eval = evaluate_operand(
+                &config,
+                &Request::Fs {
+                    path,
+                    access: &[crate::recorder::FsAccess::Read],
+                },
+                false,
+                &mut asks,
+            );
+            assert_eq!(eval.decision, Decision::Deny, "{path}");
+            assert_eq!(
+                eval.matched.to_string(),
+                "implicit:supervisor_proc",
+                "{path}"
+            );
+        }
+        let mut asks = Vec::new();
+        let other = evaluate_operand(
+            &config,
+            &Request::Fs {
+                path: "/proc/1000/mem",
+                access: &[crate::recorder::FsAccess::Read],
+            },
+            false,
+            &mut asks,
+        );
+        assert_eq!(other.decision, Decision::Allow);
+    }
+
+    #[test]
     fn a_run_without_a_state_root_is_not_subject_to_the_implicit_deny() {
         let config = RunConfig::record_only(4242, Attendance::Unattended);
         let decision = resolve_decision(
@@ -2893,7 +2975,7 @@ mod tests {
             "schema_version = 1\n\
              [[fs]]\npath=\"/etc/**\"\nmode=[\"read\"]\naction=\"ask\"\n",
         );
-        let config = RunConfig::enforce(4242, Attendance::Unattended, &p);
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root());
         let decision = resolve_decision(
             &config,
             &Request::Fs {
@@ -2912,7 +2994,7 @@ mod tests {
         policy: &'a Policy,
         prompter: &'a dyn Fn(&[crate::supervisor::ask::PendingAsk], Duration) -> AskResolution,
     ) -> RunConfig<'a> {
-        let mut config = RunConfig::enforce(4242, Attendance::Attended, policy);
+        let mut config = RunConfig::enforce(4242, Attendance::Attended, policy, test_root());
         config.prompter = prompter;
         config
     }
@@ -3013,7 +3095,7 @@ mod tests {
             "schema_version = 1\n\
              [[fs]]\npath=\"/etc/**\"\nmode=[\"read\"]\naction=\"ask\"\n",
         );
-        let mut config = RunConfig::enforce(4242, Attendance::Unattended, &p);
+        let mut config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root());
         config.prompter = &|_asks, _timeout| panic!("unattended runs must not prompt");
         let decision = resolve_decision(
             &config,
@@ -3030,7 +3112,7 @@ mod tests {
     #[test]
     fn no_ask_means_no_prompt() {
         let p = policy("schema_version = 1\n");
-        let mut config = RunConfig::enforce(4242, Attendance::Attended, &p);
+        let mut config = RunConfig::enforce(4242, Attendance::Attended, &p, test_root());
         config.prompter = &|_asks, _timeout| panic!("a run without asks must not prompt");
         let decision = resolve_decision(
             &config,
