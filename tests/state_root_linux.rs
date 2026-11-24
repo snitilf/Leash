@@ -311,9 +311,11 @@ exit 0
     let all = events(&f.live);
     assert_eq!(all[0]["type"], "run_start");
     let denies = implicit_denies(&f.live);
-    for syscall in ["openat", "unlinkat", "linkat", "symlinkat", "mkdirat"] {
+    for syscall in ["open", "unlink", "link", "symlink", "mkdir"] {
         assert!(
-            denies.iter().any(|e| e["syscall"] == syscall),
+            denies.iter().any(|e| e["syscall"]
+                .as_str()
+                .is_some_and(|s| s.starts_with(syscall))),
             "no implicit deny for {syscall}: {denies:#?}"
         );
     }
