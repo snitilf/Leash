@@ -26,6 +26,7 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_IN_ROOT: u64 = 0x10;
 
 #[repr(C)]
 struct OpenHow {
@@ -588,13 +589,7 @@ impl BrokerState<'_> {
             CString::new(relative).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         let workspace_anchor = anchor.root() == self.workspace;
         let namespace_root = anchor.root() == Path::new("/");
-        let resolve = RESOLVE_BENEATH
-            | RESOLVE_NO_MAGICLINKS
-            | if workspace_anchor || namespace_root {
-                0
-            } else {
-                RESOLVE_NO_SYMLINKS
-            };
+        let resolve = anchor_resolve_flags(workspace_anchor, namespace_root);
 
         let target = if relative.is_empty() {
             dup_fd(anchor.as_fd()).map(Some)
@@ -970,6 +965,21 @@ fn rc_zero(rc: i32) -> io::Result<i64> {
     }
 }
 
+/// openat2 resolve flags per anchor (adr-0020, adr-0023). the workspace follows in-tree
+/// symlinks but stays beneath; the namespace root is the real `/`, so in-root resolution
+/// gives ordinary semantics and lets absolute symlinks restart at `/` (beneath would
+/// reject all of them); every narrower root refuses symlinks outright. magic links are
+/// refused everywhere.
+fn anchor_resolve_flags(workspace_anchor: bool, namespace_root: bool) -> u64 {
+    if namespace_root && !workspace_anchor {
+        RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS
+    } else if workspace_anchor {
+        RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS
+    } else {
+        RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS
+    }
+}
+
 fn open_missing(
     parent: BorrowedFd<'_>,
     basename: &CStr,
@@ -1188,5 +1198,34 @@ fn poll_readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
         Err(io::Error::last_os_error())
     } else {
         Ok(rc > 0 && pollfd.revents & libc::POLLIN != 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn namespace_root_resolves_in_root_and_still_refuses_magic_links() {
+        let flags = anchor_resolve_flags(false, true);
+        assert_eq!(flags, RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS);
+        assert_eq!(flags & RESOLVE_BENEATH, 0);
+    }
+
+    #[test]
+    fn workspace_stays_beneath_and_narrow_roots_refuse_symlinks() {
+        assert_eq!(
+            anchor_resolve_flags(true, false),
+            RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS
+        );
+        assert_eq!(
+            anchor_resolve_flags(false, false),
+            RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS
+        );
+        // a workspace that is itself `/` keeps the stricter beneath rule
+        assert_eq!(
+            anchor_resolve_flags(true, true),
+            RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS
+        );
     }
 }
