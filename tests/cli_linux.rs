@@ -524,6 +524,130 @@ fn enforce_reports_a_missing_path_as_not_found_not_denied() {
     );
 }
 
+/// run an enforce-mode agent with a one-off policy and return the output and state dir.
+fn run_enforce(policy: &str, ws: &Path, agent: &[&str]) -> (Output, tempfile::TempDir) {
+    let state = tempfile::tempdir().unwrap();
+    let policy_path = state.path().join("policy.toml");
+    std::fs::write(&policy_path, policy).unwrap();
+    let mut args = vec![
+        "run",
+        "--unattended",
+        "--state-dir",
+        state.path().to_str().unwrap(),
+        "--policy",
+        policy_path.to_str().unwrap(),
+        "--",
+    ];
+    args.extend_from_slice(agent);
+    (run_leash(&args, ws), state)
+}
+
+/// adr-0023: an absolute symlink reached through the namespace-root anchor resolves from
+/// `/` (the shape of /usr/share/locale/locale.alias -> /etc/locale.alias) and the policy
+/// is evaluated on the resolved target.
+#[test]
+fn enforce_follows_an_absolute_symlink_under_the_root_anchor() {
+    use std::os::unix::fs::symlink;
+
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let real = outside.path().join("real.txt");
+    std::fs::write(&real, b"through-the-link").unwrap();
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("alias.txt");
+    symlink(&real, &link).unwrap();
+
+    let (out, state) = run_enforce(
+        "schema_version = 1\n\
+         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+         [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+        ws.path(),
+        &["/bin/cat", link.to_str().unwrap()],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"through-the-link");
+    let events = trace_events(&only_run_dir(state.path()));
+    assert!(
+        events.iter().any(|event| {
+            event["fact"]["path"] == real.to_string_lossy().as_ref() && event["decision"] == "allow"
+        }),
+        "allow on the resolved target missing from trace: {events:#?}"
+    );
+}
+
+/// adr-0023: policy applies to the final resolved path, so an absolute symlink at a denied
+/// target is denied even though the root anchor now follows absolute symlinks.
+#[test]
+fn enforce_denies_an_absolute_symlink_to_a_denied_path() {
+    use std::os::unix::fs::symlink;
+
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, b"secret").unwrap();
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("innocent.txt");
+    symlink(&secret, &link).unwrap();
+
+    let (out, state) = run_enforce(
+        &format!(
+            "schema_version = 1\n\
+             [[fs]]\npath={:?}\nmode=[\"read\"]\naction=\"deny\"\n\
+             [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+             [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+            secret.to_string_lossy()
+        ),
+        ws.path(),
+        &["/bin/cat", link.to_str().unwrap()],
+    );
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("secret"),
+        "the denied target must not be read through the link"
+    );
+    let events = trace_events(&only_run_dir(state.path()));
+    assert!(
+        events.iter().any(|event| {
+            event["fact"]["path"] == secret.to_string_lossy().as_ref()
+                && event["decision"] == "deny"
+                && event["matched_rule"] == "fs.0"
+        }),
+        "deny on the resolved target missing from trace: {events:#?}"
+    );
+}
+
+/// adr-0023: the workspace anchor keeps RESOLVE_BENEATH, so an absolute symlink that leaves
+/// the workspace is refused even when the policy allows writes inside the workspace.
+#[test]
+fn enforce_refuses_a_workspace_absolute_symlink_that_leaves_the_workspace() {
+    use std::os::unix::fs::symlink;
+
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let protected = outside.path().join("protected.txt");
+    std::fs::write(&protected, b"protected").unwrap();
+    symlink(&protected, ws.path().join("escape")).unwrap();
+
+    let (out, _state) = run_enforce(
+        &format!(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+             [[fs]]\npath={:?}\nmode=[\"read\", \"write\", \"create\"]\naction=\"allow\"\n\
+             [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+            format!("{}/**", ws.path().to_string_lossy())
+        ),
+        ws.path(),
+        &["/bin/sh", "-c", "printf escaped > escape"],
+    );
+    assert_ne!(out.status.code(), Some(0));
+    assert_eq!(std::fs::read(&protected).unwrap(), b"protected");
+}
+
 #[test]
 fn enforce_canonicalizes_a_missing_creation_before_policy_evaluation() {
     let ws = tempfile::tempdir().unwrap();
