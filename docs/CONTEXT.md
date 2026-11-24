@@ -67,15 +67,21 @@ The human-readable summary produced at the end of a **run** (FR-5): the files to
 _Avoid_: run report, summary (the canonical compound is "session report")
 
 **Snapshot**:
-The supported filesystem state of the workspace captured at a **step** boundary, enabling rewind and diff. Exactness requires exclusive workspace ownership and a completed capture barrier (ADR-0022); snapshots exist only in enforce runs that pass `--snapshots` (ADR-0024). It does not include process state or application transactions.
+The supported filesystem state of the workspace captured at a **step** boundary, enabling rewind and diff. Exactness requires exclusive workspace ownership and a completed capture barrier (ADR-0022).
+Snapshots exist only in enforce runs that pass `--snapshots` (ADR-0024).
+It does not include process state or application transactions.
 _Avoid_: checkpoint, backup
 
 **Step**:
-One coalesced burst of the child's mediated filesystem writes; event quiescence proposes a boundary whose snapshot requires a completed capture barrier (FR-17, ADR-0022). Writes through existing descriptors or mappings need not produce their own steps; rewind targets only steps with a committed step event (ADR-0024).
+One coalesced burst of the child's mediated filesystem writes; event quiescence proposes a boundary whose snapshot requires a completed capture barrier (FR-17, ADR-0022).
+Writes through existing descriptors or mappings need not produce their own steps.
+Rewind targets only steps with a committed step event (ADR-0024).
 _Avoid_: tick, frame
 
 **Rewind**:
-Restoring the supported workspace filesystem state to an earlier snapshot, offline under exclusive ownership, after the run's cgroup is gone (ADR-0022, ADR-0024). The store is treated as untrusted input and nothing is written outside the workspace. Reverses *effects on the filesystem*; it does **not** re-run the agent.
+Restoring the supported workspace filesystem state to an earlier snapshot, offline under exclusive ownership, after the run's cgroup is gone (ADR-0022, ADR-0024).
+The store is treated as untrusted input and nothing is written outside the workspace.
+Reverses *effects on the filesystem*; it does **not** re-run the agent.
 _Avoid_: replay (forbidden — implies deterministic re-execution of the model, which Leash never does), rollback, undo (informal only)
 
 **Diff** (of runs):

@@ -1,7 +1,10 @@
 # Snapshots, rewind, and diff
 
-- Status: architecture revised 2026-11-01 by ADR-0022; snapshot scope, protected storage and rewind rules revised 2026-11-24 by ADR-0024 (enforce-mode snapshots without a custodian).
-  Exact-capture implementation and adversarial validation pending. The historical M0 results below do not prove concurrent capture correctness.
+- Status: architecture revised 2026-11-01 by ADR-0022.
+  Snapshot scope, protected storage and rewind rules revised 2026-11-24 by ADR-0024 (enforce-mode snapshots without a custodian).
+  The ADR-0024 controls in sections 2, 3 and 5 are specified, not yet implemented.
+  Exact-capture implementation and adversarial validation pending.
+  The historical M0 results below do not prove concurrent capture correctness.
 - Governs: FR-11, FR-12, FR-13, FR-17, FR-21; ADR-0005, ADR-0009, ADR-0022, ADR-0024.
 
 ## 1. Consistency contract and step detection
@@ -23,7 +26,7 @@ not make an application transaction atomic. Initial and final snapshots are mand
 
 Snapshots exist only in enforce mode, and only when the operator passes `--snapshots` (ADR-0024).
 Before spawn, verify a writable delegated cgroup v2 with working `cgroup.freeze` and `cgroup.kill`.
-Also verify Landlock ABI 3 or higher, and that no write-class Landlock grant overlaps the state root or the cgroup2 mount.
+Also verify Landlock ABI 3 or higher, and that no write-class Landlock grant overlaps the state root or any cgroup2 mount.
 Place the child in the run cgroup before untrusted execution; keep the supervisor outside.
 Descendants inherit membership.
 Snapshot-enabled runs refuse before spawn when any prerequisite is unavailable.
@@ -47,7 +50,7 @@ The supervisor never receives a notification between freeze and thaw.
 Answering notifications during the freeze wait would let mutations in after the boundary decision.
 
 Legacy AIO (`io_setup`, `io_submit`) is denied and recorded in a snapshot run, because the freezer stops tasks, not in-flight I/O.
-`clone3` is answered `ENOSYS` before its argument struct is read, so a task cannot enter the run cgroup's control plane through `CLONE_INTO_CGROUP`.
+`clone3` is answered `ENOSYS` before its argument struct is read and the denial is recorded as an event, so a task cannot enter the run cgroup's control plane through `CLONE_INTO_CGROUP`.
 The supervisor marks itself non-dumpable before it starts the broker.
 
 A freeze that does not complete in time aborts the run closed and kills the whole cgroup.
@@ -57,8 +60,8 @@ Incomplete captures never appear as successful steps.
 Recovery ignores unpublished staging data.
 A published snapshot without a committed step event is an orphan, not a successful boundary.
 
-The run ends when the root process exits.
-Leash then writes `cgroup.kill`, records that, waits for `populated=0`, and takes the final snapshot.
+In a `--snapshots` run, the run ends when the root process exits.
+Leash then writes `cgroup.kill`, records that, waits boundedly for `populated=0`, and takes the final snapshot.
 Every abort path kills the whole cgroup.
 Initial capture precedes spawn.
 
@@ -79,6 +82,9 @@ Objects are keyed by sha256 of their bytes, and each step has one manifest that 
 A capture is written to staging and then renamed into place, so a reader never sees a partial snapshot.
 Hard caps on entries, bytes, apparent file size and store growth bound every capture, and exhaustion fails the capture closed.
 Each step event carries the manifest digest, and `run_end` carries a chain head over all digests, printed at run end.
+The chain is recomputed from the manifests, never read from the trace.
+Each step digest is printed when committed, so a crashed run has one.
+Pre-rewind snapshots are outside the chain.
 
 ADR-0022 defines supported state: names, file bytes, symlink targets, directories, within-workspace hard-link topology, modes, ownership, modification timestamps and supported xattrs/ACLs.
 Unsupported objects or metadata fail explicitly.
@@ -90,12 +96,16 @@ A copy must not silently skip an unreadable entry or unsupported metadata.
 ADR-0024 replaces the ADR-0022 protected-storage prerequisite for this implementation.
 Protection during the run comes from three controls.
 Every enforce run adds an implicit, first-ranked deny for the state root that covers every access, read included.
-A snapshot run adds the same kind of deny for the whole cgroup2 mount, read included, because a cgroup directory descriptor is enough for `CLONE_INTO_CGROUP`.
-Landlock cannot subtract a subtree from a grant, so a snapshot run refuses before spawn when any grant with write, truncate, make, remove or refer rights overlaps the state root or the cgroup2 mount.
+A snapshot run adds the same kind of deny for every cgroup2 mount in the mount namespace, read included, as depth.
+`clone3` returning `ENOSYS` is what closes `CLONE_INTO_CGROUP`, because `open_tree` and descriptor passing can still yield a directory descriptor.
+The state-root deny also covers rename, removal and replacement of every ancestor directory of the state root.
+It matches by path identity, so a second mount of the same directory is a residual, and metadata reads (`stat`, `readlink`, `inotify_add_watch`) are unmediated.
+Landlock cannot subtract a subtree from a grant, so a snapshot run refuses before spawn when any grant with write, truncate, make, remove or refer rights overlaps the state root or any cgroup2 mount.
 A read-only overlap is allowed and is stamped into the trace as a single-layer residual.
 At rest, snapshots are ordinary files owned by the operator.
 Content hashes detect corruption, not forgery.
 Digests in step events, the chain head in `run_end`, and `leash rewind --expect <digest>` narrow forgery.
+At rest, a store is checkable only against a chain head the operator kept outside the store.
 
 The custodian design in ADR-0022 remains the deferred hardening path.
 It would restore protection of retained snapshots against same-uid processes between runs.
@@ -129,8 +139,11 @@ Rewind and diff follow ADR-0024 rules 17-22.
 
 Rewind requires the run's cgroup to be gone, not a `run_end` event, so a crashed run can be rewound.
 Every `leash run` and `leash rewind` kills and removes stale run cgroups that run metadata names.
+A run cgroup is stale when its run lock can be taken.
+Only a Leash-named child of Leash's own cgroup is killed; a name from metadata is validated first.
 Rewind also requires exclusive workspace ownership, and no live overlay mount or remaining references that could mutate the restored state.
 It targets only steps with a committed step event.
+Without `--step`, it restores step 0, the workspace as it was before the agent started.
 It takes the workspace from the working directory or a flag, and refuses when that differs from the run metadata.
 
 Rewind treats the store as hostile input.
@@ -142,6 +155,8 @@ A forged store can therefore only produce workspace content, never a write elsew
 `--expect <digest>` refuses a store whose digest does not match.
 
 Rewind first snapshots the current workspace, so every rewind can be undone.
+The agent can plant an entry that capture refuses, for example `mknod(S_IFSOCK)`, a mode-000 file, or a cap overrun.
+If that snapshot cannot be taken, rewind refuses and names `--no-undo`, which skips it.
 It prints a change summary before it applies anything.
 It restores the selected supported state and never replaces a mounted upperdir.
 Failures are explicit, with recoverable staging and the prior state retained until restoration can be committed.
@@ -158,6 +173,11 @@ shared mappings, concurrent rename and hard-link activity, forking descendants,
 cgroup escape attempts, unsupported asynchronous I/O, freezer timeout, capture and
 publication failure, and descendants surviving their initial parent. Restore and diff
 must preserve the full supported state. Tests run against each enabled backend.
+
+Snapshot tests need a delegated cgroup.
+A test first runs a sudo step that creates a delegated cgroup and chowns it to the test user, then runs the supervisor unprivileged inside it.
+The Landlock ABI-below-3 refusal is tested through an injected probe, because no available host has an ABI below 3.
+The `systemd-run` hint is unverified until a CI leg runs it.
 
 The 2 GiB default configurable upper-layer limit from ADR-0009 remains a requirement
 for overlay; polling size is not proof of a hard bound. Capacity enforcement and

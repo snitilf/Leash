@@ -79,22 +79,24 @@ Until they are, `diff` and `rewind` remain the reserved subcommands described ab
 
 ```
 leash run --snapshots [--unattended] [--state-dir <dir>] --policy <path> [--ask-timeout <seconds>] -- <command...>
-leash rewind <run-id> [--step N] [--expect <digest>] [--workspace <dir>] [--state-dir <dir>]
+leash rewind <run-id> [--step N] [--expect <digest>] [--no-undo] [--workspace <dir>] [--state-dir <dir>]
 leash diff <run-id>[:<step>] <run-id>[:<step>] [--state-dir <dir>]
 ```
 
 `--snapshots` is available in enforce mode only.
+`--snapshots` without `--policy` is a usage error that exits 2 (FR-22), not a supervisor failure.
 It refuses before spawn, as a supervisor failure with the message on stderr and no run directory created, in these cases:
 
-- the run is record-only (no `--policy`);
-- the host has no writable, delegated cgroup v2 with working `cgroup.freeze` and `cgroup.kill`; the message names the hint `systemd-run --user --scope -p Delegate=yes`;
-- the Landlock ABI is below 3;
-- a Landlock grant with write, truncate, make, remove or refer rights overlaps the state root or the cgroup2 mount, as an ancestor or a descendant.
+- the host has no writable, delegated cgroup v2 with working `cgroup.freeze` and `cgroup.kill`; the message names the hint `systemd-run --user --scope -p Delegate=yes`, which is unverified until a CI leg runs it;
+- the Landlock ABI is below 3, a refusal tested through an injected probe because no available host has an ABI below 3;
+- a Landlock grant with write, truncate, make, remove or refer rights overlaps the state root or any cgroup2 mount, as an ancestor or a descendant.
 
 `rewind` restores the workspace to step `N` of the run, or to step 0 (the workspace as it was before the agent started) when `--step` is omitted.
 It exits 2 for an unknown run or an unknown step.
+It first snapshots the current workspace so the rewind can be undone.
+When that snapshot cannot be taken, rewind refuses and names `--no-undo`, which skips it.
 It prints a change summary before it applies anything, and says that it reverses filesystem effects only.
-`--expect <digest>` refuses a store that does not match the recorded chain head or manifest digest.
+`--expect <digest>` refuses a store that does not match the chain head or manifest digest the operator kept outside the store.
 `--workspace <dir>` names the workspace when the working directory is not it; rewind refuses when the workspace differs from the run metadata.
 The rewind rules are in [`snapshot.md`](snapshot.md) section 5.
 
