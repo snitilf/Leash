@@ -20,6 +20,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
 use sha2::{Digest, Sha256};
 
+use super::diff::display_path;
 use super::store::{
     EntryKind, Limits, Manifest, ManifestEntry, StoreError, capture, committed_steps, hex_encode,
     is_valid_sha256_hex, load_manifest, validate_manifest, validate_relative_path, verify_object,
@@ -305,9 +306,15 @@ impl fmt::Display for PlanSummary {
         )?;
         for change in &self.changes {
             if change.detail.is_empty() {
-                writeln!(f, "  {} {}", change.action, change.path)?;
+                writeln!(f, "  {} {}", change.action, display_path(&change.path))?;
             } else {
-                writeln!(f, "  {} {} ({})", change.action, change.path, change.detail)?;
+                writeln!(
+                    f,
+                    "  {} {} ({})",
+                    change.action,
+                    display_path(&change.path),
+                    change.detail
+                )?;
             }
         }
         Ok(())
@@ -347,7 +354,11 @@ impl RestorePlan {
                 }
                 RestoreOp::LinkFile { path, source } => {
                     counts[3] += 1;
-                    push(ChangeAction::Link, path, format!("to {source}"));
+                    push(
+                        ChangeAction::Link,
+                        path,
+                        format!("to {}", display_path(source)),
+                    );
                 }
                 RestoreOp::Symlink { path } => {
                     counts[4] += 1;
@@ -576,7 +587,7 @@ pub enum RestoreError {
     #[error(transparent)]
     Store(#[from] StoreError),
     /// an I/O error with the operation and relative path.
-    #[error("{op} failed for {path}: {source}")]
+    #[error("{op} failed for {}: {source}", display_path(.path))]
     Io {
         /// operation being attempted.
         op: &'static str,
@@ -587,13 +598,13 @@ pub enum RestoreError {
         source: io::Error,
     },
     /// a directory on the way to `path` is a symlink, or resolution left the workspace.
-    #[error("refusing to follow a symlink or leave the workspace while resolving {path}")]
+    #[error("refusing to follow a symlink or leave the workspace while resolving {}", display_path(.path))]
     UnsafePath {
         /// relative path whose resolution was refused.
         path: String,
     },
     /// the target records an owner this unprivileged process cannot create.
-    #[error("cannot restore owner {uid}:{gid} of {path}: running as {euid}:{egid} without root")]
+    #[error("cannot restore owner {uid}:{gid} of {}: running as {euid}:{egid} without root", display_path(.path))]
     Ownership {
         /// relative path.
         path: String,
@@ -607,7 +618,7 @@ pub enum RestoreError {
         egid: u32,
     },
     /// the bytes written for a file do not hash to the manifest digest.
-    #[error("bytes written for {path} hash to {actual}, manifest says {expected}")]
+    #[error("bytes written for {} hash to {actual}, manifest says {expected}", display_path(.path))]
     ContentMismatch {
         /// relative path.
         path: String,
@@ -617,7 +628,7 @@ pub enum RestoreError {
         actual: String,
     },
     /// the bytes written for a file are not as long as the manifest says.
-    #[error("{path} is {actual} bytes in the store, manifest says {expected}")]
+    #[error("{} is {actual} bytes in the store, manifest says {expected}", display_path(.path))]
     SizeMismatch {
         /// relative path.
         path: String,
@@ -627,7 +638,7 @@ pub enum RestoreError {
         actual: u64,
     },
     /// the plan names a path the target manifest does not describe, or one of another kind.
-    #[error("restore plan does not match the target manifest at {path}: {reason}")]
+    #[error("restore plan does not match the target manifest at {}: {reason}", display_path(.path))]
     InvalidPlan {
         /// relative path.
         path: String,

@@ -22,6 +22,8 @@ use std::io;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::diff::display_path;
+
 /// current manifest schema version.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
@@ -80,7 +82,7 @@ impl Default for Limits {
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// an I/O error with the operation and relative path (or store component).
-    #[error("{op} failed for {path}: {source}")]
+    #[error("{op} failed for {}: {source}", display_path(.path))]
     Io {
         /// operation being attempted.
         op: &'static str,
@@ -97,7 +99,7 @@ pub enum StoreError {
     #[error("snapshot store handle is not a directory")]
     InvalidStore,
     /// an entry kind that exact snapshots refuse rather than omit.
-    #[error("unsupported entry at {path}: {kind}")]
+    #[error("unsupported entry at {}: {kind}", display_path(.path))]
     UnsupportedEntry {
         /// relative path of the unsupported entry.
         path: String,
@@ -105,19 +107,19 @@ pub enum StoreError {
         kind: &'static str,
     },
     /// an entry on a different filesystem device than the workspace root.
-    #[error("cross-device entry (mount point) at {path}")]
+    #[error("cross-device entry (mount point) at {}", display_path(.path))]
     CrossDevice {
         /// relative path of the cross-device entry.
         path: String,
     },
     /// a filename or symlink target that is not valid UTF-8.
-    #[error("non-UTF-8 name at {path}")]
+    #[error("non-UTF-8 name at {}", display_path(.path))]
     UnsupportedName {
         /// lossy or escaped relative path for diagnostics.
         path: String,
     },
     /// an unsupported extended attribute (anything other than `user.*` and `security.selinux`).
-    #[error("unsupported extended attribute {attr:?} at {path}")]
+    #[error("unsupported extended attribute {attr:?} at {}", display_path(.path))]
     UnsupportedMetadata {
         /// relative path of the entry.
         path: String,
@@ -125,7 +127,7 @@ pub enum StoreError {
         attr: String,
     },
     /// a regular file changed size or mtime while it was being read.
-    #[error("file modified during capture at {path}")]
+    #[error("file modified during capture at {}", display_path(.path))]
     ConcurrentModification {
         /// relative path of the modified file.
         path: String,
@@ -137,7 +139,7 @@ pub enum StoreError {
         limit: u64,
     },
     /// a single regular file exceeded `Limits::max_file_size`.
-    #[error("file {path} size {size} exceeds limit of {limit} bytes")]
+    #[error("file {} size {size} exceeds limit of {limit} bytes", display_path(.path))]
     FileSizeLimitExceeded {
         /// relative path of the oversized file.
         path: String,

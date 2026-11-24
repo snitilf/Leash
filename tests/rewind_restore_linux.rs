@@ -376,6 +376,64 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// under root, assert that `apply` refuses and return true so the caller skips the rest.
+/// as a normal user this does nothing and returns false.
+fn root_refused(fx: &Fixture, target: &Manifest) -> bool {
+    if !is_root() {
+        return false;
+    }
+    let err = apply(&fx.ws_fd(), &fx.store_fd(), target, &plan(target, target)).unwrap_err();
+    assert!(matches!(err, RestoreError::RunningAsRoot), "{err}");
+    true
+}
+
+const HOSTILE_NAME: &str = "evil\nA  fake-line \u{1b}[2Jname";
+
+fn assert_one_line_escaped(text: &str) {
+    assert!(!text.contains('\u{1b}'), "raw escape in {text:?}");
+    assert!(!text.contains("\nA  fake-line"), "spoofed line in {text:?}");
+}
+
+#[test]
+fn the_change_summary_escapes_hostile_paths_on_one_line() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("keep"), b"k").unwrap();
+    let base = fx.capture(0);
+    fs::write(fx.ws.join(HOSTILE_NAME), b"x").unwrap();
+    fs::hard_link(fx.ws.join(HOSTILE_NAME), fx.ws.join("peer")).unwrap();
+    let now = fx.capture(1);
+
+    // removal of the hostile names, and their creation including a link detail
+    for (from, to) in [(&now, &base), (&base, &now)] {
+        let summary = plan(from, to).summary();
+        let text = summary.to_string();
+        assert_one_line_escaped(&text);
+        assert!(text.contains("\\n"), "{text:?}");
+        // header line plus one line per change, nothing injected
+        assert_eq!(text.lines().count(), summary.changes.len() + 1, "{text:?}");
+    }
+}
+
+#[test]
+fn restore_errors_escape_hostile_paths() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("keep"), b"k").unwrap();
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    let mut p = plan(&base, &base);
+    p.ops.push(RestoreOp::SetMetadata {
+        path: HOSTILE_NAME.into(),
+        change: Default::default(),
+    });
+    let err = apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap_err();
+    let text = err.to_string();
+    assert!(matches!(err, RestoreError::InvalidPlan { .. }), "{text}");
+    assert_one_line_escaped(&text);
+    assert!(text.contains("\\n"), "{text:?}");
+}
+
 fn try_set_user_xattr(path: &Path, name: &str, value: &[u8]) -> bool {
     let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
     let c_name = CString::new(name).unwrap();
