@@ -25,6 +25,16 @@ fn open_dir(path: &Path) -> File {
         .unwrap()
 }
 
+/// create a test workspace directory and strip any inherited `system.posix_acl_default`
+/// from `/tmp` so newly created subdirectories inside the test fixture do not inherit
+/// host-level default ACLs (which `capture` intentionally refuses as unsupported metadata).
+fn create_workspace_dir(path: &Path) {
+    fs::create_dir(path).unwrap();
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: c_path and the static attribute name are NUL-terminated.
+    let _ = unsafe { libc::removexattr(c_path.as_ptr(), c"system.posix_acl_default".as_ptr()) };
+}
+
 fn set_mtime(path: &Path, sec: i64, nsec: i64) {
     let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
     let times = [
@@ -77,7 +87,7 @@ fn exact_round_trip_preserves_content_metadata_symlink_empty_dir_and_xattr() {
     let tmp = tempfile::tempdir().unwrap();
     let ws_path = tmp.path().join("ws");
     let store_path = tmp.path().join("store");
-    fs::create_dir(&ws_path).unwrap();
+    create_workspace_dir(&ws_path);
     fs::create_dir(&store_path).unwrap();
 
     let hello_path = ws_path.join("hello.txt");
@@ -180,7 +190,7 @@ fn hard_links_are_stored_once_with_shared_link_group() {
     let tmp = tempfile::tempdir().unwrap();
     let ws_path = tmp.path().join("ws");
     let store_path = tmp.path().join("store");
-    fs::create_dir(&ws_path).unwrap();
+    create_workspace_dir(&ws_path);
     fs::create_dir(&store_path).unwrap();
 
     fs::write(ws_path.join("a.txt"), b"shared inode content").unwrap();
@@ -225,7 +235,7 @@ fn symlink_pointing_outside_workspace_is_recorded_and_not_followed() {
     let ws_path = tmp.path().join("ws");
     let store_path = tmp.path().join("store");
     let outside_dir = tmp.path().join("outside");
-    fs::create_dir(&ws_path).unwrap();
+    create_workspace_dir(&ws_path);
     fs::create_dir(&store_path).unwrap();
     fs::create_dir(&outside_dir).unwrap();
 
@@ -266,8 +276,8 @@ fn fifo_and_unix_socket_are_refused() {
     let ws_fifo = tmp.path().join("ws-fifo");
     let ws_sock = tmp.path().join("ws-sock");
     let store_path = tmp.path().join("store");
-    fs::create_dir(&ws_fifo).unwrap();
-    fs::create_dir(&ws_sock).unwrap();
+    create_workspace_dir(&ws_fifo);
+    create_workspace_dir(&ws_sock);
     fs::create_dir(&store_path).unwrap();
 
     let fifo_path = ws_fifo.join("pipe");
@@ -296,7 +306,7 @@ fn non_utf8_filename_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let ws_path = tmp.path().join("ws");
     let store_path = tmp.path().join("store");
-    fs::create_dir(&ws_path).unwrap();
+    create_workspace_dir(&ws_path);
     fs::create_dir(&store_path).unwrap();
 
     let bad_name = OsStr::from_bytes(b"bad-\xff-file.txt");
@@ -320,7 +330,7 @@ fn sparse_2gib_file_is_refused_by_max_file_size_without_reading() {
     let tmp = tempfile::tempdir().unwrap();
     let ws_path = tmp.path().join("ws");
     let store_path = tmp.path().join("store");
-    fs::create_dir(&ws_path).unwrap();
+    create_workspace_dir(&ws_path);
     fs::create_dir(&store_path).unwrap();
 
     let two_gib: u64 = 2 * 1024 * 1024 * 1024;
@@ -354,7 +364,7 @@ fn max_entries_and_max_store_growth_are_enforced() {
     let ws_path = tmp.path().join("ws");
     let store_a = tmp.path().join("store-a");
     let store_b = tmp.path().join("store-b");
-    fs::create_dir(&ws_path).unwrap();
+    create_workspace_dir(&ws_path);
     fs::create_dir(&store_a).unwrap();
     fs::create_dir(&store_b).unwrap();
 
@@ -390,7 +400,7 @@ fn second_capture_of_unchanged_tree_writes_zero_new_objects() {
     let tmp = tempfile::tempdir().unwrap();
     let ws_path = tmp.path().join("ws");
     let store_path = tmp.path().join("store");
-    fs::create_dir(&ws_path).unwrap();
+    create_workspace_dir(&ws_path);
     fs::create_dir(&store_path).unwrap();
 
     fs::write(ws_path.join("one.txt"), b"alpha").unwrap();
@@ -417,7 +427,7 @@ fn manifest_bytes_are_identical_across_two_stores_for_same_tree_and_step() {
     let ws_path = tmp.path().join("ws");
     let store_a = tmp.path().join("store-a");
     let store_b = tmp.path().join("store-b");
-    fs::create_dir(&ws_path).unwrap();
+    create_workspace_dir(&ws_path);
     fs::create_dir(&store_a).unwrap();
     fs::create_dir(&store_b).unwrap();
 
@@ -442,7 +452,7 @@ fn tampered_object_fails_verify_object() {
     let tmp = tempfile::tempdir().unwrap();
     let ws_path = tmp.path().join("ws");
     let store_path = tmp.path().join("store");
-    fs::create_dir(&ws_path).unwrap();
+    create_workspace_dir(&ws_path);
     fs::create_dir(&store_path).unwrap();
 
     fs::write(ws_path.join("data.txt"), b"integrity matters").unwrap();
@@ -469,7 +479,7 @@ fn symlinked_object_file_fails_verify_object() {
     let tmp = tempfile::tempdir().unwrap();
     let ws_path = tmp.path().join("ws");
     let store_path = tmp.path().join("store");
-    fs::create_dir(&ws_path).unwrap();
+    create_workspace_dir(&ws_path);
     fs::create_dir(&store_path).unwrap();
 
     let payload = b"genuine content";
@@ -498,7 +508,7 @@ fn capturing_same_step_twice_returns_manifest_exists() {
     let tmp = tempfile::tempdir().unwrap();
     let ws_path = tmp.path().join("ws");
     let store_path = tmp.path().join("store");
-    fs::create_dir(&ws_path).unwrap();
+    create_workspace_dir(&ws_path);
     fs::create_dir(&store_path).unwrap();
     fs::write(ws_path.join("a.txt"), b"hello").unwrap();
 
@@ -518,7 +528,7 @@ fn failed_capture_leaves_committed_steps_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
     let ws_path = tmp.path().join("ws");
     let store_path = tmp.path().join("store");
-    fs::create_dir(&ws_path).unwrap();
+    create_workspace_dir(&ws_path);
     fs::create_dir(&store_path).unwrap();
     fs::write(ws_path.join("ok.txt"), b"ok").unwrap();
 
