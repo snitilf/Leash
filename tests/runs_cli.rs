@@ -25,6 +25,7 @@ fn fixture(root: &Path, seconds: u64, complete: bool) -> RunDir {
         argv: vec!["echo".into(), "hello world".into()],
         workspace: "/workspace".into(),
         start_ts: seconds * 1000,
+        run_cgroup: None,
     };
     let dir = RunDir::create(
         root,

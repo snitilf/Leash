@@ -100,6 +100,10 @@ pub struct RunMeta {
     pub workspace: PathBuf,
     /// run start, unix epoch milliseconds utc
     pub start_ts: u64,
+    /// absolute path of the run cgroup (`leash-<run-id>`), present only in a snapshot run
+    /// (ADR-0024 decision 2). additive: older traces and non-snapshot runs omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_cgroup: Option<PathBuf>,
 }
 
 /// one trace event: the shared envelope plus a type-specific body (trace.md section 2).
@@ -136,6 +140,35 @@ pub enum EventBody {
         /// index of the final step
         final_step: u64,
     },
+    /// Leash wrote `cgroup.kill` on a run cgroup (ADR-0024 decisions 12 and 17)
+    CgroupKill(CgroupKillEvent),
+}
+
+/// why Leash killed a run cgroup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CgroupKillReason {
+    /// the root process exited; leftover descendants were killed
+    RunEnd,
+    /// the run aborted fail-closed; the whole tree was killed
+    Abort,
+    /// a dead run's cgroup was found at the start of this run and removed
+    StaleCleanup,
+}
+
+/// a `cgroup.kill` record (trace.md section 2).
+#[derive(Debug, Clone, Serialize)]
+pub struct CgroupKillEvent {
+    /// why the cgroup was killed
+    pub reason: CgroupKillReason,
+    /// the killed cgroup's name, `leash-<run-id>`
+    pub cgroup: String,
+    /// processes listed in `cgroup.procs` just before the kill, when it could be read
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processes: Option<u32>,
+    /// present when the kill or the removal failed or did not finish in time
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// a mediated syscall event (trace.md section 2).
@@ -368,6 +401,16 @@ impl RunDir {
         now: SystemTime,
     ) -> Result<RunDir, RecorderError> {
         let id = generate_run_id(now)?;
+        Self::create_with_id(state_root, meta, id)
+    }
+
+    /// the same as `create` with a caller-chosen id from `generate_run_id`. a snapshot run
+    /// needs its id before the directory exists, to name the run cgroup in `meta.json`.
+    pub fn create_with_id(
+        state_root: &Path,
+        meta: &RunMeta,
+        id: String,
+    ) -> Result<RunDir, RecorderError> {
         let runs = state_root.join("runs");
         std::fs::create_dir_all(&runs).map_err(RecorderError::Setup)?;
 
@@ -526,6 +569,7 @@ mod tests {
             argv: vec!["claude".into(), "--dangerously-skip-permissions".into()],
             workspace: "/home/op/project".into(),
             start_ts: 1_783_535_405_000,
+            run_cgroup: None,
         }
     }
 
