@@ -803,10 +803,12 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
             }
         };
     let secondary = if let Some(input) = secondary_input {
-        match broker
+        // bind the result first: a `borrow_mut()` temporary in the match scrutinee would
+        // live through the arms, and the arms release the primary through the same cell
+        let prepared = broker
             .borrow_mut()
-            .prepare_path(input, secondary_follow, secondary_missing)?
-        {
+            .prepare_path(input, secondary_follow, secondary_missing)?;
+        match prepared {
             BrokerResultOrPath::Path(path) => Some(path),
             BrokerResultOrPath::Result(BrokerResult::Errno(errno)) => {
                 broker.borrow_mut().release(primary)?;
