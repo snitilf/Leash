@@ -62,6 +62,7 @@ A `syscall` event, the common case, adds:
 | `ask_resolution` | present only for an `ask`: `approved`, `denied`, `timed_out`, or `unattended` |
 | `matched_rule` | the id of the policy rule that decided it, or the base rule ([`policy.md`](policy.md)) |
 | `would_deny` | present in record-only when a present policy would have denied (ADR-0010) |
+| `errno` | present only on an enforce-mode realization failure (`failsafe:realization`): the symbolic errno name the child received, e.g. `ENOENT` |
 | `operand_decisions` | present for enforce-mode two-path filesystem operations; one independent `path`/`dest` decision and matched-rule id per required access mode |
 
 Fact details fixed by the notify loop:
@@ -92,10 +93,17 @@ Fact details fixed by the notify loop:
   In record-only that raw network event is allowed, because record-only enforces nothing outside the denied-and-recorded set (ADR-0019, recorded 2026-07-23; FR-9 and I3 carry the same mode scope).
   In enforce mode the same untrusted network fact denies fail-closed.
 
+- A realization failure is an enforce-mode filesystem event whose path preparation by the confined broker failed before policy evaluation ([`syscalls.md`](syscalls.md) section 4).
+  It stays a fail-closed `deny` under `failsafe:realization`, and the child receives the errno the broker returned.
+  The event records that errno by symbolic name in `errno` (an unnamed value is written `errno_<n>`).
+  This is an additive optional field, so `schema_version` does not move; a reader that ignores it still decodes the event.
+  The field exists because the same decision covers two different situations: a path that does not exist (`ENOENT`, `ENOTDIR`), which the kernel would have answered the same way for an unconfined process, and a refused resolution (`ELOOP` from a magic link, `EXDEV` from an escape beneath the authoritative root), which is a security refusal.
+  The errno is what lets a reader tell them apart without changing what the decision means.
+
 In a run with no policy, `matched_rule` carries a fixed base id naming what decided the event:
 `base:record_only` (the record-only base allow, [`policy.md`](policy.md) section 3),
 `sr4:io_uring`, `sr4:pidfd_getfd`, and `sr3:foreign_abi` (the denied-and-recorded set), and
-`failsafe:memory_read` (a case-C deny). These are trace vocabulary, not policy rules; a loaded policy's rule ids never
+`failsafe:memory_read` (a case-C deny), and `failsafe:realization` (an enforce-mode path preparation failure, with its `errno`). These are trace vocabulary, not policy rules; a loaded policy's rule ids never
 collide with them because they carry a `:` and rule ids are plain names.
 
 `run_start` carries the same facts as `meta.json` so the stream is self-contained. `step` marks a
@@ -160,3 +168,9 @@ It lists the files touched, executed binaries, process-creation attempts, cross-
 It also lists the denied attempts that carry no typed fact, including the denied-and-recorded set and the case-C denies of section 2, so a refused action is visible even without a fact to name it.
 It names the active **mode** (FR-19); a record-only report says so in as many words and never uses enforcement language for a run that enforced nothing (ADR-0010).
 Because it is derived from the trace, the report is regenerable after the fact from `trace.jsonl` alone, so a run can be re-summarized without re-running the agent.
+
+A realization failure ([`errno`](#2-event-schema) present) is rendered by its errno, not by its `deny` decision alone.
+`ENOENT` and `ENOTDIR` mean the path, or a component of it, does not exist; the report shows such a path as `not found`, because the policy refused nothing and a reader must not take a glibc locale probe for a blocked access.
+Any other errno is a refusal and renders as `denied (<ERRNO>)`, for example `denied (ELOOP)`, so the cause stays visible.
+An event with no `errno` (every policy decision, and traces written before the field existed) renders as `denied` exactly as before.
+The decision recorded in the trace is unchanged in all cases; only the report's wording differs.

@@ -127,7 +127,17 @@ pub fn render_report(trace_jsonl: &str) -> Result<String, ReportError> {
                     },
                 )?;
 
-                let display = display_decision(&decision);
+                let errno = match value.get("errno") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(name)) => Some(name.as_str()),
+                    Some(_) => {
+                        return Err(ReportError::InvalidEvent {
+                            line,
+                            field: "errno",
+                        });
+                    }
+                };
+                let display = display_decision(&decision, errno);
 
                 match family {
                     "fs" => {
@@ -371,12 +381,16 @@ fn format_report(
 
 /// "allow" -> "allowed", "deny" -> "denied"; anything else passes through unnormalized
 /// rather than inventing a display form for a decision this slice does not yet emit
-/// (e.g. "ask").
-fn display_decision(raw: &str) -> String {
-    match raw {
-        "allow" => "allowed".to_string(),
-        "deny" => "denied".to_string(),
-        other => other.to_string(),
+/// (e.g. "ask"). a deny that carries a realization errno (trace.md section 6) renders by
+/// it: a missing path (ENOENT, ENOTDIR) is "not found" because nothing was refused, and any
+/// other errno is a refusal shown as "denied (ERRNO)".
+fn display_decision(raw: &str, errno: Option<&str>) -> String {
+    match (raw, errno) {
+        ("deny", Some("ENOENT" | "ENOTDIR")) => "not found".to_string(),
+        ("deny", Some(errno)) => format!("denied ({errno})"),
+        ("allow", _) => "allowed".to_string(),
+        ("deny", None) => "denied".to_string(),
+        (other, _) => other.to_string(),
     }
 }
 
@@ -748,5 +762,66 @@ mod tests {
         let report = render_report(&trace).unwrap();
         assert!(report.contains("  203.0.113.7:443  allowed\n"));
         assert!(!report.contains("not implemented"));
+    }
+
+    fn realization_line(seq: u64, path: &str, errno: Option<&str>) -> String {
+        let errno = errno.map_or(String::new(), |e| format!(r#","errno":"{e}""#));
+        format!(
+            r#"{{"seq":{seq},"ts":1000,"type":"syscall","pid":1,"syscall":"openat","decision":"deny","fact":{{"family":"fs","path":"{path}","access":["read"]}},"matched_rule":"failsafe:realization"{errno}}}"#
+        )
+    }
+
+    #[test]
+    fn realization_failure_with_a_missing_path_errno_renders_as_not_found() {
+        for errno in ["ENOENT", "ENOTDIR"] {
+            let trace = [
+                run_start_line("enforce", r#"["sh"]"#, "/w"),
+                realization_line(1, "/usr/lib/locale/C.UTF-8/LC_ADDRESS", Some(errno)),
+                run_end_line(2, "0", "null"),
+            ]
+            .join("\n");
+            let report = render_report(&trace).unwrap();
+            assert!(
+                report.contains("  /usr/lib/locale/C.UTF-8/LC_ADDRESS  [read]  not found\n"),
+                "{errno}: {report}"
+            );
+            assert!(!report.contains("]  denied"), "{errno}: {report}");
+        }
+    }
+
+    #[test]
+    fn realization_failure_with_a_refusal_errno_stays_denied_and_names_it() {
+        let trace = [
+            run_start_line("enforce", r#"["cat"]"#, "/w"),
+            realization_line(1, "/proc/self/fd/0", Some("ELOOP")),
+            realization_line(2, "/w/escape", Some("EXDEV")),
+            run_end_line(3, "1", "null"),
+        ]
+        .join("\n");
+        let report = render_report(&trace).unwrap();
+        assert!(
+            report.contains("  /proc/self/fd/0  [read]  denied (ELOOP)\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains("  /w/escape  [read]  denied (EXDEV)\n"),
+            "{report}"
+        );
+        assert!(!report.contains("not found"), "{report}");
+    }
+
+    #[test]
+    fn a_deny_without_errno_still_renders_plain_denied() {
+        let trace = [
+            run_start_line("enforce", r#"["sh"]"#, "/w"),
+            realization_line(1, "/etc/shadow", None),
+            run_end_line(2, "1", "null"),
+        ]
+        .join("\n");
+        let report = render_report(&trace).unwrap();
+        assert!(
+            report.contains("  /etc/shadow  [read]  denied\n"),
+            "{report}"
+        );
     }
 }
