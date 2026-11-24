@@ -1387,8 +1387,8 @@ fn enforce_survives_an_addfd_the_kernel_refuses() {
             "-c",
             // descriptors 0-5 fill the table, so the open for descriptor 6 cannot be
             // installed; the subshell keeps that failure from ending the shell
-            "ulimit -n 6; exec 3<one 4<two 5<three; (exec 6<four); \
-             exec 3<&- 4<&- 5<&-; cat one; exit 0",
+            "ulimit -S -n 6; exec 3<one 4<two 5<three; (exec 6<four); \
+             ulimit -S -n 1024; cat one; exit 0",
         ],
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
