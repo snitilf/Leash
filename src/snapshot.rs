@@ -26,6 +26,10 @@ pub mod store;
 /// pure comparison of two snapshot manifests (FR-13).
 pub mod diff;
 
+/// rewind restore engine: plan and apply a stored manifest onto the workspace (ADR-0024).
+#[cfg(target_os = "linux")]
+pub mod restore;
+
 /// errors from snapshot capture and restore.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {

@@ -605,7 +605,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn validate_relative_path(path: &str) -> Result<(), StoreError> {
+pub(crate) fn validate_relative_path(path: &str) -> Result<(), StoreError> {
     if path.is_empty() {
         return Err(StoreError::InvalidManifest {
             reason: "empty entry path".into(),
