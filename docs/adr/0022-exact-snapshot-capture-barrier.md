@@ -1,6 +1,6 @@
 # ADR-0022: Exact snapshots require exclusive ownership and a capture barrier
 
-- Status: accepted; implementation and adversarial validation pending
+- Status: accepted; partly superseded by ADR-0024 (mode scope, protected-storage prerequisite, historical-read authorization). The capture barrier and supported state still apply.
 - Date: 2026-11-01
 - Change-control tier: 3
 
