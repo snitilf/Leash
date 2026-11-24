@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::recorder::Attendance;
+use crate::run_diff::{DiffRunError, RefError, RunRef, parse_run_ref, run_diff};
 
 /// arguments to the `run` subcommand (docs/design/cli.md section 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +39,8 @@ pub enum Command {
     Version,
     /// list or explicitly prune recorded runs
     Runs(RunsArgs),
+    /// compare the filesystem effects of two runs or steps (FR-13)
+    Diff(DiffArgs),
     /// a reserved subcommand name that parses correctly but has no implementation yet
     NotImplemented {
         /// the subcommand name, e.g. "diff"
@@ -53,6 +56,17 @@ pub enum Command {
 pub struct RunsArgs {
     /// explicit ids to delete, or none to list
     pub prune: Option<Vec<String>>,
+    /// state directory override
+    pub state_dir: Option<PathBuf>,
+}
+
+/// arguments of `leash diff` (docs/design/cli.md section 1, FR-13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffArgs {
+    /// the older side
+    pub old: RunRef,
+    /// the newer side
+    pub new: RunRef,
     /// state directory override
     pub state_dir: Option<PathBuf>,
 }
@@ -98,6 +112,17 @@ pub enum UsageError {
     /// prune requires at least one run id
     #[error("leash: 'runs prune' requires at least one run id")]
     MissingPruneRunId,
+    /// `diff` given fewer than two run arguments
+    #[error("leash: 'diff' requires two runs: leash diff <run-id>[:<step>] <run-id>[:<step>]")]
+    MissingDiffRun,
+    /// a `diff` run id that is not a plain directory name
+    #[error(
+        "leash: invalid run id in {0:?}: it must be a plain name, not empty, '.', '..' or containing '/'"
+    )]
+    InvalidRunId(String),
+    /// a `diff` step that is not a non-negative whole number
+    #[error("leash: invalid step in {0:?}: expected a non-negative whole number after ':'")]
+    InvalidStep(String),
     /// a positional argument `runs` does not accept
     #[error("leash: unexpected argument '{0}'")]
     UnexpectedArgument(String),
@@ -119,8 +144,11 @@ run flags:
 everything after '--' is the command and is passed through verbatim.
 
   leash runs [--state-dir <dir>]   list recorded runs
+  leash diff <run-id>[:<step>] <run-id>[:<step>] [--state-dir <dir>]
+                            compare the filesystem effects of two runs or steps
+                            (a missing :<step> means the run's final committed step)
 
-reserved subcommands, not implemented yet: diff, rewind, runs prune
+reserved subcommands, not implemented yet: rewind, runs prune
 
 options:
   -h, --help                print this help and exit
@@ -158,16 +186,60 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
 
     match first.as_str() {
         "run" => parse_run(&args[1..]).map(Command::Run),
-        "diff" => Ok(Command::NotImplemented {
-            name: "diff",
-            message: "leash: 'diff' is not implemented yet (planned: time-travel milestone M3)",
-        }),
+        "diff" => parse_diff(&args[1..]).map(Command::Diff),
         "rewind" => Ok(Command::NotImplemented {
             name: "rewind",
             message: "leash: 'rewind' is not implemented yet (planned: time-travel milestone M3)",
         }),
         "runs" => parse_runs(&args[1..]).map(Command::Runs),
         other => Err(UsageError::UnknownSubcommand(other.to_string())),
+    }
+}
+
+fn parse_diff(rest: &[String]) -> Result<DiffArgs, UsageError> {
+    let mut state_dir = None;
+    let mut refs: Vec<RunRef> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let token = &rest[i];
+        if token == "--state-dir" || token.starts_with("--state-dir=") {
+            if state_dir.is_some() {
+                return Err(UsageError::DuplicateFlag("--state-dir"));
+            }
+            let value = if token == "--state-dir" {
+                i += 1;
+                rest.get(i)
+                    .filter(|v| !v.is_empty() && !v.starts_with('-'))
+                    .ok_or(UsageError::MissingStateDirValue)?
+                    .as_str()
+            } else {
+                let value = &token["--state-dir=".len()..];
+                if value.is_empty() {
+                    return Err(UsageError::MissingStateDirValue);
+                }
+                value
+            };
+            state_dir = Some(PathBuf::from(value));
+        } else if token.starts_with('-') {
+            return Err(UsageError::UnknownFlag(token.clone()));
+        } else if refs.len() == 2 {
+            return Err(UsageError::UnexpectedArgument(token.clone()));
+        } else {
+            refs.push(parse_run_ref(token).map_err(|e| match e {
+                RefError::BadRunId => UsageError::InvalidRunId(token.clone()),
+                RefError::BadStep => UsageError::InvalidStep(token.clone()),
+            })?);
+        }
+        i += 1;
+    }
+    let mut refs = refs.into_iter();
+    match (refs.next(), refs.next()) {
+        (Some(old), Some(new)) => Ok(DiffArgs {
+            old,
+            new,
+            state_dir,
+        }),
+        _ => Err(UsageError::MissingDiffRun),
     }
 }
 
@@ -445,6 +517,7 @@ pub fn run() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Command::Runs(args) => return dispatch_runs(args),
+        Command::Diff(args) => return dispatch_diff(args),
         Command::NotImplemented { message, .. } => {
             eprintln!("{message}");
             return ExitCode::from(EXIT_USAGE);
@@ -520,6 +593,34 @@ pub fn run() -> ExitCode {
             .map(std::time::Duration::from_secs)
             .unwrap_or(crate::supervisor::run::DEFAULT_ASK_TIMEOUT),
     })
+}
+
+fn dispatch_diff(args: DiffArgs) -> ExitCode {
+    let state_root = match args.state_dir.or_else(|| {
+        let xdg = std::env::var("XDG_STATE_HOME").ok();
+        let home = std::env::var("HOME").ok();
+        crate::recorder::default_state_root(xdg.as_deref(), home.as_deref())
+    }) {
+        Some(root) => root,
+        None => {
+            eprintln!("leash: no state directory: set XDG_STATE_HOME or HOME, or pass --state-dir");
+            return ExitCode::from(EXIT_SUPERVISOR_FAILURE);
+        }
+    };
+    match run_diff(&state_root, &args.old, &args.new) {
+        Ok(report) => {
+            print!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(e @ DiffRunError::Usage(_)) => {
+            eprintln!("{e}");
+            ExitCode::from(EXIT_USAGE)
+        }
+        Err(e @ DiffRunError::Failure(_)) => {
+            eprintln!("{e}");
+            ExitCode::from(EXIT_SUPERVISOR_FAILURE)
+        }
+    }
 }
 
 fn dispatch_runs(args: RunsArgs) -> ExitCode {
@@ -1024,7 +1125,8 @@ mod tests {
             "--ask-timeout",
             "-h, --help",
             "-V, --version",
-            "diff, rewind, runs",
+            "rewind, runs prune",
+            "leash diff <run-id>[:<step>] <run-id>[:<step>]",
         ] {
             assert!(HELP.contains(needle), "{needle}");
         }
@@ -1036,18 +1138,83 @@ mod tests {
 
     // --- parse: reserved subcommands ---
 
+    fn rr(id: &str, step: Option<u64>) -> RunRef {
+        RunRef {
+            run_id: id.into(),
+            step,
+        }
+    }
+
     #[test]
-    fn parse_diff_is_not_implemented() {
-        let cmd = parse(&args(&["diff"])).unwrap();
-        match cmd {
-            Command::NotImplemented { name, message } => {
-                assert_eq!(name, "diff");
-                assert_eq!(
-                    message,
-                    "leash: 'diff' is not implemented yet (planned: time-travel milestone M3)"
-                );
-            }
-            other => panic!("expected NotImplemented, got {other:?}"),
+    fn parse_diff_valid_forms() {
+        assert_eq!(
+            parse(&args(&["diff", "a", "b"])).unwrap(),
+            Command::Diff(DiffArgs {
+                old: rr("a", None),
+                new: rr("b", None),
+                state_dir: None
+            })
+        );
+        assert_eq!(
+            parse(&args(&["diff", "a:0", "a:3", "--state-dir", "/s"])).unwrap(),
+            Command::Diff(DiffArgs {
+                old: rr("a", Some(0)),
+                new: rr("a", Some(3)),
+                state_dir: Some("/s".into())
+            })
+        );
+        assert_eq!(
+            parse(&args(&["diff", "--state-dir=/s", "a", "b:2"])).unwrap(),
+            Command::Diff(DiffArgs {
+                old: rr("a", None),
+                new: rr("b", Some(2)),
+                state_dir: Some("/s".into())
+            })
+        );
+    }
+
+    #[test]
+    fn parse_diff_rejects_missing_and_extra_arguments() {
+        for case in [
+            &["diff"][..],
+            &["diff", "a"],
+            &["diff", "--state-dir=/s", "a"],
+        ] {
+            assert_eq!(parse(&args(case)), Err(UsageError::MissingDiffRun));
+        }
+        assert_eq!(
+            parse(&args(&["diff", "a", "b", "c"])),
+            Err(UsageError::UnexpectedArgument("c".into()))
+        );
+        assert_eq!(
+            parse(&args(&["diff", "a", "b", "--nope"])),
+            Err(UsageError::UnknownFlag("--nope".into()))
+        );
+        assert_eq!(
+            parse(&args(&["diff", "a", "b", "--state-dir"])),
+            Err(UsageError::MissingStateDirValue)
+        );
+        assert_eq!(
+            parse(&args(&["diff", "a", "b", "--state-dir=a", "--state-dir=b"])),
+            Err(UsageError::DuplicateFlag("--state-dir"))
+        );
+    }
+
+    #[test]
+    fn parse_diff_rejects_bad_run_ids_and_steps() {
+        for bad in ["../x", "a/b", "..", ".", ":1", "/abs"] {
+            assert_eq!(
+                parse(&args(&["diff", bad, "b"])),
+                Err(UsageError::InvalidRunId(bad.into())),
+                "{bad}"
+            );
+        }
+        for bad in ["a:x", "a:-1", "a:", "a:1:2"] {
+            assert_eq!(
+                parse(&args(&["diff", "b", bad])),
+                Err(UsageError::InvalidStep(bad.into())),
+                "{bad}"
+            );
         }
     }
 

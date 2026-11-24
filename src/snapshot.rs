@@ -23,6 +23,9 @@ use std::time::{Duration, Instant};
 /// content-addressed exact snapshot store (ADR-0022).
 pub mod store;
 
+/// pure comparison of two snapshot manifests (FR-13).
+pub mod diff;
+
 /// errors from snapshot capture and restore.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {

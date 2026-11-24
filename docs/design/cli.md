@@ -43,7 +43,7 @@ normative set:
 |---|---|
 | no subcommand | `leash` invoked with no arguments, or a bare option before any subcommand other than `--help`/`-h` and `--version`/`-V` |
 | top-level option with extra arguments | `--help`, `-h`, `--version`, or `-V` followed by any further argument |
-| unknown subcommand or flag | a subcommand that is not `run` or `runs` (and not a reserved name below), or a flag `run` does not accept |
+| unknown subcommand or flag | a subcommand that is not `run`, `runs` or `diff` (and not a reserved name below), or a flag `run` does not accept |
 | `run` without `--` | `run` invoked with no `--` separator |
 | empty command after `--` | `--` present but nothing follows it |
 | a flag given twice | `--unattended`, `--state-dir`, `--policy`, or `--ask-timeout` repeated |
@@ -69,18 +69,59 @@ can safely bind to the selected directories under concurrent changes. No retenti
 runs automatically. The state directory accepts the same space and equals forms as `run`; unknown flags,
 missing values, duplicate flags, and unexpected positional arguments are usage errors.
 
-Reserved subcommands `diff` and `rewind` parse but are not implemented in this slice. They
-exit 2 with a stable message naming the time-travel milestone (FR-12, FR-13).
+The reserved subcommand `rewind` parses but is not implemented in this slice. It
+exits 2 with a stable message naming the time-travel milestone (FR-12).
 
-### Time-travel commands (specified by ADR-0024, not yet implemented)
+### `diff` (implemented, FR-13)
 
-The flag and the two subcommands below are specified and not yet implemented.
-Until they are, `diff` and `rewind` remain the reserved subcommands described above, and `run` does not accept `--snapshots`.
+```
+leash diff <run-id>[:<step>] <run-id>[:<step>] [--state-dir <dir>]
+```
+
+`diff` compares the filesystem effects of two runs or two steps, old side first.
+A missing `:<step>` means the highest committed step of that run.
+The step is plain decimal digits; the run id is a plain directory name (not empty, not `.` or `..`, no `/`).
+Either violation is a usage error, as is a missing or extra run argument.
+The store is `<state-root>/runs/<run-id>/snapshots`.
+Every component below the state root is opened with `O_NOFOLLOW`, so a symlinked `runs`, run directory or `snapshots` is refused.
+An unknown run, a run with no snapshots or no committed step, and an unknown step exit 2 with a message naming the problem.
+A store or manifest that cannot be read or fails validation exits 125 with the reason.
+`diff` reads only the two manifests; it never reads the workspace or object contents.
+
+Output is one change per line, sorted by path (a rename by its old path), with two spaces after the status letter:
+
+| Line | Meaning |
+|---|---|
+| `A  <path>` | present only in the new state |
+| `D  <path>` | present only in the old state |
+| `M  <path>` | regular file content changed (sha256 or size), or symlink target changed |
+| `R  <old> -> <new>` | a regular file removed and one added with the same sha256 and size |
+| `T  <path> (<from> -> <to>)` | entry kind changed; kinds are `file`, `dir`, `symlink` |
+| `m  <path> (<fields>)` | metadata changed; fields in the order `mode`, `uid`, `gid`, `mtime`, `xattrs` |
+| `L  <path>` | only the hard-link grouping of an unchanged file changed |
+
+A summary line follows, listing the non-zero counts in the order added, removed, modified, renamed, type changed, metadata changed, link changed, for example `3 added, 1 removed, 2 modified, 1 renamed`.
+No changes prints `no differences` and exits 0; otherwise the exit code is also 0.
+A path containing a control character prints in quoted, escaped form, as `leash runs` does for ids.
+
+Rules the output follows:
+
+- A directory is reported as itself and for each entry inside it; nothing is collapsed.
+- A rename pairs removed and added files one to one; candidates sharing a hash pair in sorted path order and the leftovers stay `D` and `A`.
+- Hard links are one object: names of one inode that gain new content are each `M`, never a rename.
+  `L` considers only names present on both sides, so adding or removing one name does not flag its siblings.
+- A file with changed content does not report `mtime`; its mode, uid, gid and xattr changes still appear as `m`.
+- Directory mtimes change whenever an entry is added or removed, so they appear as `m` lines.
+
+### Snapshots and rewind (specified by ADR-0024, not yet implemented)
+
+The flag and the `rewind` subcommand below are specified and not yet implemented.
+Until they are, `rewind` remains a reserved subcommand, and `run` does not accept `--snapshots`.
+`diff` is implemented; see the `diff` section above.
 
 ```
 leash run --snapshots [--unattended] [--state-dir <dir>] --policy <path> [--ask-timeout <seconds>] -- <command...>
 leash rewind <run-id> [--step N] [--expect <digest>] [--no-undo] [--workspace <dir>] [--state-dir <dir>]
-leash diff <run-id>[:<step>] <run-id>[:<step>] [--state-dir <dir>]
 ```
 
 `--snapshots` is available in enforce mode only.
@@ -99,8 +140,6 @@ It prints a change summary before it applies anything, and says that it reverses
 `--expect <digest>` refuses a store that does not match the chain head or manifest digest the operator kept outside the store.
 `--workspace <dir>` names the workspace when the working directory is not it; rewind refuses when the workspace differs from the run metadata.
 The rewind rules are in [`snapshot.md`](snapshot.md) section 5.
-
-`diff` compares the filesystem effects of two runs or two steps, each named `<run-id>` or `<run-id>:<step>`.
 
 ## 2. Mode selection
 
