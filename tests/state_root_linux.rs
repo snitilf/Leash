@@ -120,7 +120,7 @@ fn run_enforce(layout: &Layout, policy: &Path, prev: &Path, script: &str) -> Fin
         "WS=$1; STATE=$2; PREV=$3; ROOT=$4\n\
          while [ ! -s \"$WS/live\" ]; do sleep 0.05; done\n\
          LIVE=$(cat \"$WS/live\")\n\
-         t() {{ if \"$@\" >/dev/null 2>&1; then echo \"OK $*\"; else echo \"DENIED $*\"; fi; }}\n\
+         t() {{ if \"$@\" >>\"$WS/.o\" 2>&1; then echo \"OK $*\"; else echo \"DENIED $*\"; fi; }}\n\
          {script}\n"
     );
     let mut child = Command::new(leash_exe())
@@ -186,6 +186,11 @@ fn implicit_denies(run_dir: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// everything the agent's probes wrote to stdout and stderr.
+fn probe_output(l: &Layout) -> String {
+    std::fs::read_to_string(l.ws().join(".o")).unwrap_or_default()
+}
+
 fn stdout(f: &Finished) -> String {
     String::from_utf8_lossy(&f.out.stdout).into_owned()
 }
@@ -241,7 +246,7 @@ exit 0
     }
     assert_denied(&text, "ls .");
     assert!(
-        !text.contains("\"type\""),
+        !probe_output(&l).contains("\"type\""),
         "trace content must not reach the agent: {text}"
     );
     let denies = implicit_denies(&f.live);
@@ -366,7 +371,7 @@ fn enforce_denies_a_symlink_that_resolves_into_the_state_root() {
     assert_denied(&text, &format!("{}/trace", links_path.display()));
     assert_denied(&text, &format!("{}/dir", links_path.display()));
     assert_denied(&text, "inws");
-    assert!(!text.contains("\"type\""), "{text}");
+    assert!(!probe_output(&l).contains("\"type\""));
     let denies = implicit_denies(&f.live);
     assert!(
         mentions(&denies, &prev.join("trace.jsonl")),
