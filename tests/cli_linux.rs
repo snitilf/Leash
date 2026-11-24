@@ -1218,7 +1218,7 @@ fn state_dir_inside_workspace_is_refused() {
 fn enforce_survives_a_rename_whose_destination_cannot_be_prepared() {
     let ws = tempfile::tempdir().unwrap();
     std::fs::write(ws.path().join("source.txt"), b"source").unwrap();
-    let (out, _state) = run_enforce(
+    let (out, state) = run_enforce(
         "schema_version = 1\n\
          [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
          [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
@@ -1235,4 +1235,114 @@ fn enforce_survives_a_rename_whose_destination_cannot_be_prepared() {
         "supervisor panicked: {stderr}"
     );
     assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    // the refused rename is recorded as a realization failure, not dropped, and the file
+    // the agent tried to move is still where it was
+    let runs: Vec<_> = std::fs::read_dir(state.path().join("runs"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let trace = std::fs::read_to_string(runs[0].join("trace.jsonl")).unwrap();
+    let refused = trace.lines().any(|line| {
+        let ev: serde_json::Value = serde_json::from_str(line).unwrap();
+        ev["syscall"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("rename"))
+            && ev["matched_rule"] == "failsafe:realization"
+    });
+    assert!(
+        refused,
+        "no rename event with failsafe:realization: {trace}"
+    );
+    assert_eq!(
+        std::fs::read(ws.path().join("source.txt")).unwrap(),
+        b"source",
+        "the source file must survive the refused rename"
+    );
+}
+
+/// FR-21 (ADR-0024): an enforce session whose state root cannot be resolved refuses before
+/// any event is written and before any process exists, because the implicit deny it would
+/// have armed cannot be built. a record-only session needs no root and still runs.
+#[test]
+fn enforce_session_without_a_resolvable_state_root_refuses_before_spawn() {
+    use leash::recorder::{
+        Attendance, Mode, RunMeta, SnapshotMechanism, TRACE_SCHEMA_VERSION, TraceSink, TraceWriter,
+    };
+    use leash::supervisor::session::{SessionError, SessionSpec, run_session_with_writer};
+    use std::io::{self as stdio, Write};
+
+    #[derive(Default)]
+    struct Bytes(Vec<u8>);
+    impl Write for Bytes {
+        fn write(&mut self, buf: &[u8]) -> stdio::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> stdio::Result<()> {
+            Ok(())
+        }
+    }
+    impl TraceSink for Bytes {
+        fn sync(&mut self) -> stdio::Result<()> {
+            Ok(())
+        }
+    }
+
+    let ws = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let marker = ws.path().join("spawned");
+    let argv = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        format!("touch {}", marker.display()),
+    ];
+    let session = |mode: Mode| {
+        let meta = RunMeta {
+            schema_version: TRACE_SCHEMA_VERSION,
+            mode,
+            attendance: Attendance::Unattended,
+            policy_digest: None,
+            kernel: "test".into(),
+            landlock_abi: None,
+            landlock_residuals: None,
+            snapshot_mechanism: SnapshotMechanism::Copy,
+            snapshot_reason: "test fixture".into(),
+            argv: argv.clone(),
+            workspace: ws.path().to_path_buf(),
+            start_ts: 1,
+        };
+        let run_dir =
+            leash::recorder::RunDir::create(state.path(), &meta, std::time::SystemTime::now())
+                .unwrap();
+        let spec = SessionSpec {
+            argv: argv.clone(),
+            mode,
+            attendance: Attendance::Unattended,
+            state_root: state.path().to_path_buf(),
+            // a spelling that does not resolve: the root the deny would protect is unknowable
+            state_root_spelling: state.path().join("does-not-exist"),
+            workspace: ws.path().to_path_buf(),
+            policy_path: None,
+            ask_timeout: Duration::from_secs(60),
+        };
+        let mut writer = TraceWriter::new(Bytes::default());
+        let result = run_session_with_writer(&spec, meta, &run_dir, &mut writer);
+        (result, writer.into_inner().0)
+    };
+
+    let (result, written) = session(Mode::Enforce);
+    assert!(
+        matches!(result, Err(SessionError::StateRoot(_))),
+        "enforce must refuse: {result:?}"
+    );
+    assert!(written.is_empty(), "no event may precede the refusal");
+    assert!(!marker.exists(), "the agent must never have been spawned");
+
+    let (result, _) = session(Mode::RecordOnly);
+    assert!(
+        result.is_ok(),
+        "record-only must not resolve a state root: {result:?}"
+    );
+    assert!(marker.exists(), "the record-only agent ran");
 }
