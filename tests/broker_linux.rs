@@ -347,6 +347,71 @@ fn production_broker_preserves_o_path_directory_validation() {
     }
 }
 
+/// issue #53: SECCOMP_IOCTL_NOTIF_ADDFD refuses an O_PATH source descriptor (the kernel's
+/// fget rejects FMODE_PATH files with EBADF), so the broker answers an O_PATH open with a
+/// read-only descriptor on the same pinned object instead.
+#[test]
+fn production_broker_realizes_o_path_as_a_read_only_descriptor() {
+    let _guard = fork_guard();
+    let workspace = tempfile::tempdir().unwrap();
+    let dir = workspace.path().join("dir");
+    std::fs::create_dir(&dir).unwrap();
+    let file = workspace.path().join("regular-file");
+    std::fs::write(&file, b"data").unwrap();
+    let fifo = workspace.path().join("fifo");
+    let fifo_c = CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: fifo_c is a valid nul-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    let policy = Policy::parse(
+        "schema_version = 1\n",
+        &ExpandContext {
+            workspace: workspace.path().to_str().unwrap(),
+            home: "/tmp",
+        },
+    )
+    .unwrap();
+    let prepared_ruleset = landlock::prepare_ruleset(&landlock::derive_hull(&policy, 4)).unwrap();
+    let mut broker = Broker::spawn(&prepared_ruleset, workspace.path()).unwrap();
+    let o_path = u64::try_from(libc::O_PATH | libc::O_CLOEXEC).unwrap();
+    let mut open = |path: &Path, flags: u64| {
+        let prepared = match broker.prepare_path(path, true, false).unwrap() {
+            BrokerResultOrPath::Path(path) => path,
+            other => panic!("expected prepared path, got {other:?}"),
+        };
+        broker.commit_open(prepared, flags, 0).unwrap()
+    };
+
+    for (path, flags, is_dir) in [
+        (
+            &dir,
+            o_path | u64::try_from(libc::O_DIRECTORY).unwrap(),
+            true,
+        ),
+        (&dir, o_path, true),
+        (&file, o_path, false),
+    ] {
+        let BrokerResult::Fd(fd) = open(path, flags) else {
+            panic!("O_PATH open of {path:?} must yield a descriptor");
+        };
+        // SAFETY: fd is a live descriptor.
+        let status = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        assert!(status >= 0);
+        assert_eq!(status & libc::O_PATH, 0, "must not be an O_PATH file");
+        assert_eq!(status & libc::O_ACCMODE, libc::O_RDONLY);
+        // SAFETY: fd is live and the flag read is a plain query.
+        let fd_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(fd_flags & libc::FD_CLOEXEC, 0, "O_CLOEXEC is preserved");
+        let metadata = std::fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
+        assert_eq!(metadata.is_dir(), is_dir);
+    }
+
+    // a node whose read-only open can block or has side effects is refused, not opened
+    match open(&fifo, o_path) {
+        BrokerResult::Errno(errno) => assert_eq!(errno, libc::EACCES),
+        other => panic!("expected EACCES for a fifo, got {other:?}"),
+    }
+}
+
 #[test]
 fn production_broker_realizes_the_filesystem_mutation_family() {
     let _guard = fork_guard();

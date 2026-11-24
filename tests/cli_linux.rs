@@ -1332,3 +1332,84 @@ fn enforce_session_without_a_resolvable_state_root_refuses_before_spawn() {
     );
     assert!(marker.exists(), "the record-only agent ran");
 }
+
+const READ_EXEC_POLICY: &str = "schema_version = 1\n\
+     [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+     [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n";
+
+/// issue #53: coreutils `mv dir existing-dir` opens the destination with O_PATH. the
+/// kernel refuses an O_PATH descriptor as an ADDFD source, so the allowed open used to
+/// end the notify loop. the move must now complete and be recorded.
+#[test]
+fn enforce_mv_moves_a_directory_into_an_existing_directory() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir(ws.path().join("a")).unwrap();
+    std::fs::write(ws.path().join("a/file.txt"), b"payload").unwrap();
+    std::fs::create_dir(ws.path().join("b")).unwrap();
+    let (out, state) = run_enforce(READ_EXEC_POLICY, ws.path(), &["/bin/mv", "a", "b"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("notify fd failed"),
+        "the notify loop must survive: {stderr}"
+    );
+    assert!(!ws.path().join("a").exists());
+    assert_eq!(
+        std::fs::read(ws.path().join("b/a/file.txt")).unwrap(),
+        b"payload"
+    );
+    let events = trace_events(&only_run_dir(state.path()));
+    assert!(
+        events.iter().any(|event| {
+            event["syscall"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("rename"))
+                && event["decision"] == "allow"
+        }),
+        "the move must be recorded as an allowed rename: {events:?}"
+    );
+}
+
+/// an ADDFD the kernel refuses (here EMFILE: the agent's descriptor table is full) fails
+/// only that one open, is recorded as a realization failure with the errno the agent
+/// received, and the next syscall is served normally.
+#[test]
+fn enforce_survives_an_addfd_the_kernel_refuses() {
+    let ws = tempfile::tempdir().unwrap();
+    for name in ["one", "two", "three", "four"] {
+        std::fs::write(ws.path().join(name), name).unwrap();
+    }
+    let (out, state) = run_enforce(
+        READ_EXEC_POLICY,
+        ws.path(),
+        &[
+            "/bin/sh",
+            "-c",
+            // descriptors 0-5 fill the table, so the open for descriptor 6 cannot be
+            // installed; the subshell keeps that failure from ending the shell
+            "ulimit -n 6; exec 3<one 4<two 5<three; (exec 6<four); \
+             exec 3<&- 4<&- 5<&-; cat one; exit 0",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("notify fd failed"),
+        "one refused injection must not end the loop: {stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "one", "{stderr}");
+    let events = trace_events(&only_run_dir(state.path()));
+    let failed: Vec<_> = events
+        .iter()
+        .filter(|event| event["matched_rule"] == "failsafe:realization")
+        .collect();
+    assert_eq!(failed.len(), 1, "one recorded failure: {events:?}");
+    assert_eq!(failed[0]["decision"], "deny");
+    assert_eq!(failed[0]["errno"], "EMFILE");
+    assert!(
+        failed[0]["fact"]["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("/four")),
+        "{failed:?}"
+    );
+}
