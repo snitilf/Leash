@@ -106,7 +106,9 @@ Fact details fixed by the notify loop:
 In a run with no policy, `matched_rule` carries a fixed base id naming what decided the event:
 `base:record_only` (the record-only base allow, [`policy.md`](policy.md) section 3),
 `sr4:io_uring`, `sr4:pidfd_getfd`, and `sr3:foreign_abi` (the denied-and-recorded set), and
-`failsafe:memory_read` (a case-C deny), and `failsafe:realization` (an enforce-mode path preparation failure, with its `errno`). These are trace vocabulary, not policy rules; a loaded policy's rule ids never
+`failsafe:memory_read` (a case-C deny), and `failsafe:realization` (an enforce-mode path preparation failure, with its `errno`).
+An enforce run with a policy adds `implicit:state_root`, the implicit deny of the state root and of moving its ancestors, which is ranked before every policy rule (FR-21, ADR-0024).
+These are trace vocabulary, not policy rules; a loaded policy's rule ids never
 collide with them because they carry a `:` and rule ids are plain names.
 
 `run_start` carries the same facts as `meta.json` so the stream is self-contained. `step` marks a
