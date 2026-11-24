@@ -1401,11 +1401,11 @@ fn enforce_survives_an_addfd_the_kernel_refuses() {
     let events = trace_events(&only_run_dir(state.path()));
     let failed: Vec<_> = events
         .iter()
-        .filter(|event| event["matched_rule"] == "failsafe:realization")
+        .filter(|event| event["errno"] == "EMFILE")
         .collect();
     assert_eq!(failed.len(), 1, "one recorded failure: {events:?}");
     assert_eq!(failed[0]["decision"], "deny");
-    assert_eq!(failed[0]["errno"], "EMFILE");
+    assert_eq!(failed[0]["matched_rule"], "failsafe:realization");
     assert!(
         failed[0]["fact"]["path"]
             .as_str()
