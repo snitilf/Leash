@@ -1,10 +1,16 @@
 //! enforce mode denies the agent the state root (FR-3, FR-21; ADR-0024 decision 3).
 //!
 //! these run only on linux and drive the real compiled binary: a previous run is produced
-//! first, then an enforce-mode agent (`sh -c`) tries to read, list, tamper with, move, and
-//! plant files in the state root, both the previous run and the live one. the live run's
-//! directory is handed to the agent through a workspace file once the harness sees the run
-//! directory appear, so the agent never needs to list the runs directory to find it.
+//! first, then an enforce-mode agent tries to read, list, tamper with, move, and plant files
+//! in the state root, both the previous run and the live one. the live run's directory is
+//! handed to the agent through a workspace file once the harness sees the run directory
+//! appear, so the agent never needs to list the runs directory to find it.
+//!
+//! two kinds of agent: `sh -c` scripts whose probes are named (`p NAME cmd...`), and this
+//! test binary re-exec'd (`agent_probes`, the pattern of notify_linux.rs) for syscalls a
+//! shell cannot make. every probe is asserted on its own: the agent reports `DENIED name`,
+//! and the trace holds a deny event for that probe with the expected syscall, path and
+//! `matched_rule`, so one failing probe cannot hide behind another.
 //!
 //! layout of every test: `<root>/p/state` is the state root, `<root>/p/state-other` is a
 //! sibling that shares its string prefix, `<root>/other` is an unrelated directory. the
@@ -21,6 +27,7 @@ use std::time::{Duration, Instant};
 
 const DEADLINE: Duration = Duration::from_secs(30);
 const IMPLICIT: &str = "implicit:state_root";
+const PROC_RULE: &str = "implicit:supervisor_proc";
 
 fn leash_exe() -> &'static str {
     env!("CARGO_BIN_EXE_leash")
@@ -41,6 +48,7 @@ impl Layout {
         std::fs::create_dir_all(layout.state().parent().unwrap()).unwrap();
         std::fs::create_dir_all(layout.sibling()).unwrap();
         std::fs::create_dir_all(layout.other()).unwrap();
+        std::fs::create_dir_all(layout.links()).unwrap();
         std::fs::write(layout.sibling().join("f"), b"sibling-data").unwrap();
         std::fs::write(layout.ws.path().join("file"), b"ws-data").unwrap();
         layout
@@ -62,12 +70,17 @@ impl Layout {
     fn other(&self) -> PathBuf {
         self.root().join("other")
     }
+    /// a directory for symlinks the agent is allowed to write in.
+    fn links(&self) -> PathBuf {
+        self.root().join("links")
+    }
     fn ws(&self) -> PathBuf {
         self.ws.path().canonicalize().unwrap()
     }
 
-    /// examples/policy.toml, optionally with write, create, and delete allowed under root.
-    fn policy(&self, with_writes: bool) -> PathBuf {
+    /// examples/policy.toml, optionally with write, create, and delete allowed under root,
+    /// and any extra policy text appended.
+    fn policy_with(&self, with_writes: bool, extra: &str) -> PathBuf {
         let mut text = include_str!("../examples/policy.toml").to_string();
         if with_writes {
             text.push_str(&format!(
@@ -75,9 +88,14 @@ impl Layout {
                 self.root().display()
             ));
         }
+        text.push_str(extra);
         let path = self.cfg.path().join("policy.toml");
         std::fs::write(&path, text).unwrap();
         path
+    }
+
+    fn policy(&self, with_writes: bool) -> PathBuf {
+        self.policy_with(with_writes, "")
     }
 
     /// one record-only run that leaves a finished previous run in the state root.
@@ -112,20 +130,53 @@ struct Finished {
     live: PathBuf,
 }
 
+/// what a hook sees while the agent is parked: the supervisor, the live run, the workspace.
+struct HookCtx {
+    leash_pid: u32,
+    ws: PathBuf,
+}
+
+/// optional knobs of one enforce run.
+#[derive(Default)]
+struct Opts<'a> {
+    /// the `--state-dir` argument, when it is not the plain state root.
+    state_arg: Option<PathBuf>,
+    /// runs once while the agent is parked after the live run appeared; the agent resumes
+    /// when it returns, and can read what the hook wrote to `$WS/pids`.
+    hook: Option<&'a dyn Fn(&HookCtx)>,
+}
+
 /// run an enforce agent script. the script receives `$1 ws`, `$2 state`, `$3 previous run`,
-/// `$4 root`, and finds the live run directory in the file `$ws/live`.
+/// `$4 root`, and finds the live run directory in the file `$ws/live`. `t cmd` and
+/// `p NAME cmd` print `OK` or `DENIED` for the command.
 fn run_enforce(layout: &Layout, policy: &Path, prev: &Path, script: &str) -> Finished {
+    run_enforce_with(layout, &Opts::default(), policy, prev, script)
+}
+
+fn run_enforce_with(
+    layout: &Layout,
+    opts: &Opts<'_>,
+    policy: &Path,
+    prev: &Path,
+    script: &str,
+) -> Finished {
     let known = run_names(&layout.state());
+    let park = if opts.hook.is_some() {
+        "echo up > \"$WS/up\"\nwhile [ ! -e \"$WS/go\" ]; do sleep 0.05; done\n"
+    } else {
+        ""
+    };
     let wrapped = format!(
         "WS=$1; STATE=$2; PREV=$3; ROOT=$4\n\
          while [ ! -s \"$WS/live\" ]; do sleep 0.05; done\n\
          LIVE=$(cat \"$WS/live\")\n\
          t() {{ if \"$@\" >>\"$WS/.o\" 2>&1; then echo \"OK $*\"; else echo \"DENIED $*\"; fi; }}\n\
-         {script}\n"
+         p() {{ n=$1; shift; if \"$@\" >>\"$WS/.o\" 2>&1; then echo \"OK $n\"; else echo \"DENIED $n\"; fi; }}\n\
+         {park}{script}\n"
     );
-    let mut child = Command::new(leash_exe())
+    let child = Command::new(leash_exe())
         .args(["run", "--unattended", "--state-dir"])
-        .arg(layout.state())
+        .arg(opts.state_arg.clone().unwrap_or_else(|| layout.state()))
         .arg("--policy")
         .arg(policy)
         .args(["--", "/bin/sh", "-c", &wrapped, "sh"])
@@ -139,8 +190,19 @@ fn run_enforce(layout: &Layout, policy: &Path, prev: &Path, script: &str) -> Fin
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    drive(layout, opts, known, child)
+}
+
+/// wait for the live run directory, hand it to the agent, run the hook, wait for the exit.
+fn drive(
+    layout: &Layout,
+    opts: &Opts<'_>,
+    known: BTreeSet<String>,
+    mut child: std::process::Child,
+) -> Finished {
     let start = Instant::now();
     let mut live = None;
+    let mut hooked = opts.hook.is_none();
     loop {
         if live.is_none() {
             let now = run_names(&layout.state());
@@ -153,6 +215,15 @@ fn run_enforce(layout: &Layout, policy: &Path, prev: &Path, script: &str) -> Fin
                     live = Some(dir);
                 }
             }
+        }
+        if !hooked && layout.ws().join("up").exists() {
+            let ctx = HookCtx {
+                leash_pid: child.id(),
+                ws: layout.ws(),
+            };
+            (opts.hook.unwrap())(&ctx);
+            std::fs::write(layout.ws().join("go"), b"go").unwrap();
+            hooked = true;
         }
         if child.try_wait().unwrap().is_some() {
             break;
@@ -208,6 +279,65 @@ fn mentions(events: &[serde_json::Value], path: &Path) -> bool {
     events
         .iter()
         .any(|e| e["fact"]["path"] == p.as_ref() || e["fact"]["dest"] == p.as_ref())
+}
+
+/// one probe and what the trace must say about it: a deny event whose syscall starts with
+/// one of `syscalls`, whose fact `field` is `value`, decided by `rule`.
+struct Probe {
+    name: &'static str,
+    syscalls: &'static [&'static str],
+    field: &'static str,
+    value: PathBuf,
+    rule: &'static str,
+}
+
+fn probe(
+    name: &'static str,
+    syscalls: &'static [&'static str],
+    field: &'static str,
+    value: impl Into<PathBuf>,
+) -> Probe {
+    Probe {
+        name,
+        syscalls,
+        field,
+        value: value.into(),
+        rule: IMPLICIT,
+    }
+}
+
+/// assert every probe on its own: the agent saw the denial and the trace recorded it with
+/// the expected syscall, path and rule.
+fn assert_probes(text: &str, run_dir: &Path, probes: &[Probe]) {
+    let all = events(run_dir);
+    for p in probes {
+        assert!(
+            text.lines().any(|l| l == format!("DENIED {}", p.name)),
+            "probe {} was not denied for the agent in:\n{text}",
+            p.name
+        );
+        let value = p.value.to_string_lossy();
+        let found = all.iter().any(|e| {
+            e["decision"] == "deny"
+                && e["matched_rule"] == p.rule
+                && e["syscall"]
+                    .as_str()
+                    .is_some_and(|s| p.syscalls.iter().any(|prefix| s.starts_with(prefix)))
+                && e["fact"][p.field] == value.as_ref()
+        });
+        assert!(
+            found,
+            "probe {}: no deny event {:?} with {}={} decided by {}; denies seen: {:#?}",
+            p.name,
+            p.syscalls,
+            p.field,
+            value,
+            p.rule,
+            all.iter()
+                .filter(|e| e["decision"] == "deny")
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 #[test]
@@ -270,26 +400,28 @@ fn enforce_agent_cannot_tamper_with_the_state_root_even_with_write_grants() {
         &prev,
         r#"
 echo ok > "$WS/ctl"
-t sh -c 'echo x >> "$1"' sh "$LIVE/trace.jsonl"
-t sh -c ': > "$1"' sh "$LIVE/trace.jsonl"
-t truncate -s 0 "$LIVE/trace.jsonl"
-t touch "$LIVE/planted"
-t touch "$STATE/planted"
-t mkdir "$STATE/d"
-t rm "$LIVE/trace.jsonl"
-t mv "$LIVE/trace.jsonl" "$ROOT/stolen"
-t mv "$PREV" "$ROOT/moved"
-t rm -rf "$PREV"
-t mv "$ROOT/p" "$ROOT/p2"
-t rmdir "$ROOT/p"
-t mv -T "$ROOT/other" "$ROOT/p"
-t mv "$STATE" "$ROOT/state2"
-t rm -rf "$STATE"
-t mv "$WS/file" "$STATE/x"
-t ln "$WS/file" "$STATE/hl"
-t ln "$LIVE/trace.jsonl" "$WS/leak"
-t ln -s /etc/passwd "$STATE/sl"
-t ln -s /etc/passwd "$LIVE/sl"
+p append sh -c 'echo x >> "$1"' sh "$LIVE/trace.jsonl"
+p redirect_truncate sh -c ': > "$1"' sh "$LIVE/trace.jsonl"
+p truncate_cmd truncate -s 0 "$LIVE/trace.jsonl"
+p touch_live touch "$LIVE/planted"
+p touch_state touch "$STATE/planted"
+p mkdir_state mkdir "$STATE/d"
+p rm_trace rm "$LIVE/trace.jsonl"
+p rmdir_prev rmdir "$PREV"
+p rmdir_state rmdir "$STATE"
+p mv_trace mv "$LIVE/trace.jsonl" "$ROOT/stolen"
+p mv_prev mv "$PREV" "$ROOT/moved"
+p mv_state mv "$STATE" "$ROOT/state2"
+p mv_parent mv "$ROOT/p" "$ROOT/p2"
+p mv_into_state mv "$WS/file" "$STATE/x"
+p ln_into_state ln "$WS/file" "$STATE/hl"
+p ln_from_state ln "$LIVE/trace.jsonl" "$WS/leak"
+p symlink_state ln -s /etc/passwd "$STATE/sl"
+p symlink_live ln -s /etc/passwd "$LIVE/sl"
+# these two fail with ENOTEMPTY in the kernel anyway, so the only thing they can prove is
+# the recorded decision: the rule runs before the kernel is asked
+p rmdir_parent rmdir "$ROOT/p"
+p mv_over_parent mv -T "$ROOT/other" "$ROOT/p"
 exit 0
 "#,
     );
@@ -307,51 +439,49 @@ exit 0
     assert!(!l.root().join("p2").exists());
     assert!(!l.ws().join("leak").exists());
     assert!(l.other().exists(), "the unrelated directory was not moved");
-    // the live trace is intact and parseable, and holds the denies under the implicit id
-    let all = events(&f.live);
-    assert_eq!(all[0]["type"], "run_start");
-    let denies = implicit_denies(&f.live);
-    for syscall in ["open", "unlink", "link", "symlink", "mkdir"] {
-        assert!(
-            denies.iter().any(|e| e["syscall"]
-                .as_str()
-                .is_some_and(|s| s.starts_with(syscall))),
-            "no implicit deny for {syscall}: {denies:#?}"
-        );
-    }
-    assert!(
-        denies.iter().any(|e| e["syscall"]
-            .as_str()
-            .is_some_and(|s| s.starts_with("rename"))),
-        "{denies:#?}"
-    );
-    // ancestor protection: moving or removing the state root's parent, and renaming over it
-    let p = l.parent();
-    assert!(
-        denies
-            .iter()
-            .any(|e| e["fact"]["path"] == p.to_string_lossy().as_ref()
-                && e["syscall"]
-                    .as_str()
-                    .is_some_and(|s| s.starts_with("rename"))),
-        "rename of the parent is not denied by the implicit rule: {denies:#?}"
-    );
-    assert!(
-        denies
-            .iter()
-            .any(|e| e["fact"]["dest"] == p.to_string_lossy().as_ref()),
-        "rename onto the parent is not denied by the implicit rule: {denies:#?}"
-    );
-    assert!(
-        denies
-            .iter()
-            .any(|e| e["fact"]["path"] == l.state().to_string_lossy().as_ref()),
-        "{denies:#?}"
-    );
+    // the live trace is intact and parseable
+    assert_eq!(events(&f.live)[0]["type"], "run_start");
     // the control write outside the state root worked
     assert_eq!(std::fs::read(l.ws().join("ctl")).unwrap(), b"ok\n");
-    assert_denied(&text, "truncate -s 0");
-    assert_denied(&text, "mv ");
+    let live = &f.live;
+    assert_probes(
+        &text,
+        live,
+        &[
+            probe("append", &["open"], "path", live.join("trace.jsonl")),
+            probe(
+                "redirect_truncate",
+                &["open"],
+                "path",
+                live.join("trace.jsonl"),
+            ),
+            probe(
+                "truncate_cmd",
+                &["open", "truncate"],
+                "path",
+                live.join("trace.jsonl"),
+            ),
+            probe("touch_live", &["open"], "path", live.join("planted")),
+            probe("touch_state", &["open"], "path", l.state().join("planted")),
+            probe("mkdir_state", &["mkdir"], "path", l.state().join("d")),
+            probe("rm_trace", &["unlink"], "path", live.join("trace.jsonl")),
+            probe("rmdir_prev", &["rmdir", "unlink"], "path", prev.clone()),
+            probe("rmdir_state", &["rmdir", "unlink"], "path", l.state()),
+            probe("mv_trace", &["rename"], "path", live.join("trace.jsonl")),
+            probe("mv_prev", &["rename"], "path", prev.clone()),
+            probe("mv_state", &["rename"], "path", l.state()),
+            probe("mv_parent", &["rename"], "path", l.parent()),
+            probe("mv_into_state", &["rename"], "dest", l.state().join("x")),
+            probe("ln_into_state", &["link"], "dest", l.state().join("hl")),
+            probe("ln_from_state", &["link"], "path", live.join("trace.jsonl")),
+            probe("symlink_state", &["symlink"], "path", l.state().join("sl")),
+            probe("symlink_live", &["symlink"], "path", live.join("sl")),
+            probe("rmdir_parent", &["rmdir", "unlink"], "path", l.parent()),
+            probe("mv_over_parent", &["rename"], "dest", l.parent()),
+        ],
+    );
+    let report = std::fs::read_to_string(f.live.join("report.txt")).unwrap();
+    assert!(report.contains("denied"), "{report}");
 }
 
 #[test]
@@ -365,19 +495,27 @@ fn enforce_denies_a_symlink_that_resolves_into_the_state_root() {
     symlink(l.state(), links_path.join("dir")).unwrap();
     symlink(prev.join("trace.jsonl"), l.ws().join("inws")).unwrap();
     let script = format!(
-        "t cat {l}/trace\nt ls {l}/dir\nt cat \"$WS/inws\"\nexit 0\n",
+        "p via_file_link cat {l}/trace\n\
+         p via_dir_link ls {l}/dir\n\
+         p via_ws_link cat \"$WS/inws\"\n\
+         exit 0\n",
         l = links_path.display()
     );
     let f = run_enforce(&l, &l.policy(false), &prev, &script);
     let text = stdout(&f);
-    assert_denied(&text, &format!("{}/trace", links_path.display()));
-    assert_denied(&text, &format!("{}/dir", links_path.display()));
-    assert_denied(&text, "inws");
-    assert!(!probe_output(&l).contains("\"type\""));
-    let denies = implicit_denies(&f.live);
     assert!(
-        mentions(&denies, &prev.join("trace.jsonl")),
-        "the decision is on the resolved identity: {denies:#?}"
+        !probe_output(&l).contains("\"type\""),
+        "trace content must not reach the agent: {text}"
+    );
+    // each of the three probes is decided on the resolved identity, not the spelling
+    assert_probes(
+        &text,
+        &f.live,
+        &[
+            probe("via_file_link", &["open"], "path", prev.join("trace.jsonl")),
+            probe("via_dir_link", &["open"], "path", l.state()),
+            probe("via_ws_link", &["open"], "path", prev.join("trace.jsonl")),
+        ],
     );
 }
 
@@ -423,4 +561,389 @@ fn record_only_mode_does_not_apply_the_implicit_rule() {
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert!(prev.join("planted").exists());
+}
+
+/// the state root reached through a symlinked `--state-dir`: the agent has a write grant on
+/// the link's parent, and must still not be able to rename, replace or remove the link, which
+/// would redirect the operator's own spelling of the state root.
+#[test]
+fn enforce_protects_the_symlink_the_state_dir_was_spelled_through() {
+    use std::os::unix::fs::symlink;
+    let l = Layout::new();
+    let prev = l.previous_run();
+    let link = l.links().join("sd");
+    symlink(l.state(), &link).unwrap();
+    std::fs::write(l.links().join("decoy"), b"decoy").unwrap();
+    let opts = Opts {
+        state_arg: Some(link.clone()),
+        hook: None,
+    };
+    let script = format!(
+        "p mv_hop mv {link} \"$ROOT/links/moved\"\n\
+         p replace_hop mv -T \"$ROOT/links/decoy\" {link}\n\
+         p rm_hop rm {link}\n\
+         p ln_force_hop ln -sfn /nonexistent {link}\n\
+         p mv_links_dir mv \"$ROOT/links\" \"$ROOT/links2\"\n\
+         exit 0\n",
+        link = link.display()
+    );
+    let f = run_enforce_with(&l, &opts, &l.policy(true), &prev, &script);
+    let text = stdout(&f);
+    assert!(f.out.status.success(), "{:?}", f.out);
+    assert_eq!(std::fs::read_link(&link).unwrap(), l.state());
+    assert_eq!(std::fs::read(l.links().join("decoy")).unwrap(), b"decoy");
+    assert!(!l.links().join("moved").exists());
+    assert!(!l.root().join("links2").exists());
+    assert_probes(
+        &text,
+        &f.live,
+        &[
+            probe("mv_hop", &["rename"], "path", link.clone()),
+            probe("replace_hop", &["rename"], "dest", link.clone()),
+            probe("rm_hop", &["unlink"], "path", link.clone()),
+            probe("ln_force_hop", &["unlink"], "path", link.clone()),
+            probe("mv_links_dir", &["rename"], "path", l.links()),
+        ],
+    );
+}
+
+fn ppid_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // the command name is parenthesised and may contain spaces; ppid is the second field after it
+    let after = stat.rsplit_once(')')?.1;
+    after.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn children_of(parent: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| ppid_of(*pid) == Some(parent))
+        .collect()
+}
+
+fn comm_of(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// what every descriptor of `pid` points at. panics when the table cannot be read, so a
+/// check never passes by seeing nothing.
+fn fd_targets(pid: u32) -> Vec<String> {
+    let dir = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap_or_else(|e| panic!("cannot read /proc/{pid}/fd: {e}"));
+    dir.filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .map(|t| t.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// the broker is a forked copy of the supervisor, so it inherited the live trace descriptor
+/// unless it closed it. and neither process's `/proc/<pid>` tree may be reached by the agent,
+/// whatever it is granted: `mem` there is the supervisor's memory.
+#[test]
+fn broker_holds_no_trace_descriptor_and_the_supervisor_proc_tree_is_denied() {
+    let l = Layout::new();
+    let prev = l.previous_run();
+    let pids = std::sync::Mutex::new(None::<(u32, u32)>);
+    let hook = |ctx: &HookCtx| {
+        let kids = children_of(ctx.leash_pid);
+        let broker = kids
+            .iter()
+            .copied()
+            .find(|pid| comm_of(*pid) == "leash")
+            .unwrap_or_else(|| panic!("no broker among {kids:?}"));
+        // the supervisor holds the trace, which proves the check below can see one
+        let sup = fd_targets(ctx.leash_pid);
+        assert!(
+            sup.iter().any(|t| t.ends_with("/trace.jsonl")),
+            "the supervisor's own descriptors show no trace: {sup:?}"
+        );
+        let held = fd_targets(broker);
+        assert!(
+            held.len() >= 4,
+            "the broker keeps stdio and its socket at least: {held:?}"
+        );
+        assert!(
+            held.iter().all(|t| !t.contains("trace.jsonl")),
+            "the broker inherited the live trace: {held:?}"
+        );
+        assert!(
+            held.iter().all(|t| !t.contains("/runs/")),
+            "the broker inherited a run directory descriptor: {held:?}"
+        );
+        std::fs::write(
+            ctx.ws.join("pids"),
+            format!("{} {}\n", ctx.leash_pid, broker),
+        )
+        .unwrap();
+        *pids.lock().unwrap() = Some((ctx.leash_pid, broker));
+    };
+    let opts = Opts {
+        state_arg: None,
+        hook: Some(&hook),
+    };
+    let policy = l.policy_with(
+        true,
+        "\n[[fs]]\npath = \"/proc/**\"\nmode = [\"read\", \"write\"]\naction = \"allow\"\n",
+    );
+    let f = run_enforce_with(
+        &l,
+        &opts,
+        &policy,
+        &prev,
+        r#"
+read SUP BROKER < "$WS/pids"
+p sup_mem_read sh -c ': < /proc/$1/mem' sh "$SUP"
+p sup_mem_write sh -c ': >> /proc/$1/mem' sh "$SUP"
+p sup_fd_dir ls "/proc/$SUP/fd"
+p broker_mem_read sh -c ': < /proc/$1/mem' sh "$BROKER"
+p broker_mem_write sh -c ': >> /proc/$1/mem' sh "$BROKER"
+p broker_task_dir ls "/proc/$BROKER/task"
+exit 0
+"#,
+    );
+    let text = stdout(&f);
+    let (sup, broker) = pids.lock().unwrap().expect("the hook ran");
+    let denial = |name, syscalls, pid: u32, tail: &str| Probe {
+        name,
+        syscalls,
+        field: "path",
+        value: PathBuf::from(format!("/proc/{pid}/{tail}")),
+        rule: PROC_RULE,
+    };
+    assert_probes(
+        &text,
+        &f.live,
+        &[
+            denial("sup_mem_read", &["open"], sup, "mem"),
+            denial("sup_mem_write", &["open"], sup, "mem"),
+            denial("sup_fd_dir", &["open"], sup, "fd"),
+            denial("broker_mem_read", &["open"], broker, "mem"),
+            denial("broker_mem_write", &["open"], broker, "mem"),
+            denial("broker_task_dir", &["open"], broker, "task"),
+        ],
+    );
+}
+
+/// raw-syscall probes a shell cannot make, run as the agent of the next test.
+#[test]
+fn agent_probes() {
+    use std::ffi::CString;
+    if std::env::var_os("LEASH_SR_AGENT").is_none() {
+        return;
+    }
+    let env = |k: &str| std::env::var(k).unwrap();
+    let c = |s: &str| CString::new(s).unwrap();
+    let report = |name: &str, rc: i64| {
+        println!("{} {name}", if rc < 0 { "DENIED" } else { "OK" });
+    };
+    let (parent, state, prev) = (env("SR_PARENT"), env("SR_STATE"), env("SR_PREV"));
+    // the live run directory is handed over through the workspace once the run starts
+    let ws = env("SR_WS");
+    let live = loop {
+        match std::fs::read_to_string(format!("{ws}/live")) {
+            Ok(text) if !text.is_empty() => break text,
+            _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+    let (root, link) = (env("SR_ROOT"), env("SR_LINK"));
+    // SAFETY: every call below passes nul-terminated paths this function owns and checks
+    // the return value; none of them takes a pointer the kernel writes through.
+    unsafe {
+        let (uid, gid) = (libc::getuid(), libc::getgid());
+        report("chmod_parent", libc::chmod(c(&parent).as_ptr(), 0).into());
+        report("chmod_state", libc::chmod(c(&state).as_ptr(), 0).into());
+        report(
+            "chown_parent",
+            libc::chown(c(&parent).as_ptr(), uid, gid).into(),
+        );
+        report(
+            "chown_state",
+            libc::chown(c(&state).as_ptr(), uid, gid).into(),
+        );
+
+        // an O_PATH handle on a file in the root
+        let fd = libc::open(
+            c(&format!("{prev}/trace.jsonl")).as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC,
+        );
+        report("opath_open", fd.into());
+
+        // a directory handle on an ancestor is allowed (control); a relative open through it
+        // that lands in the root is not, and a sibling through it still is
+        let dirfd = libc::open(
+            c(&parent).as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
+        report("ctl_ancestor_dirfd", dirfd.into());
+        let rel = prev
+            .strip_prefix(&format!("{parent}/"))
+            .unwrap()
+            .to_string();
+        let fd = libc::openat(
+            dirfd,
+            c(&format!("{rel}/meta.json")).as_ptr(),
+            libc::O_RDONLY,
+        );
+        report("dirfd_openat", fd.into());
+        let fd = libc::openat(dirfd, c("state-other/f").as_ptr(), libc::O_RDONLY);
+        report("ctl_dirfd_sibling", fd.into());
+
+        // `..` out of an unrelated directory and back into the root
+        let live_name = live.rsplit('/').next().unwrap().to_string();
+        let fd = libc::open(
+            c(&format!(
+                "{root}/other/../p/state/runs/{live_name}/meta.json"
+            ))
+            .as_ptr(),
+            libc::O_RDONLY,
+        );
+        report("dotdot_open", fd.into());
+
+        // RENAME_EXCHANGE swaps the two names, so on the ancestor it would replace it
+        const EXCHANGE: libc::c_uint = 2;
+        let other = format!("{root}/other");
+        let rc = libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            c(&parent).as_ptr(),
+            libc::AT_FDCWD,
+            c(&other).as_ptr(),
+            EXCHANGE,
+        );
+        report("exchange_source", rc);
+        let rc = libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            c(&other).as_ptr(),
+            libc::AT_FDCWD,
+            c(&parent).as_ptr(),
+            EXCHANGE,
+        );
+        report("exchange_dest", rc);
+
+        // exec last: a success would replace this process
+        let arg0 = c("x");
+        let argv = [arg0.as_ptr(), std::ptr::null()];
+        let envp = [std::ptr::null::<libc::c_char>()];
+        for (name, path) in [
+            ("exec_spelled", format!("{state}/exe.sh")),
+            ("exec_symlink", format!("{link}/exe.sh")),
+            ("exec_dotdot", format!("{root}/other/../p/state/exe.sh")),
+        ] {
+            report(
+                name,
+                libc::execve(c(&path).as_ptr(), argv.as_ptr(), envp.as_ptr()).into(),
+            );
+        }
+    }
+}
+
+/// metadata changes on the root and an ancestor, O_PATH and dirfd-relative opens, `..`
+/// traversal, RENAME_EXCHANGE on an ancestor, and exec by three spellings, all under a policy
+/// that grants everything under the root: each must be denied by the implicit rule alone.
+#[test]
+fn enforce_denies_metadata_handle_traversal_exchange_and_exec_probes() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let l = Layout::new();
+    let prev = l.previous_run();
+    let exe = l.state().join("exe.sh");
+    std::fs::write(
+        &exe,
+        format!("#!/bin/sh\ntouch '{}/exec-ran'\n", l.ws().display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(l.state(), l.links().join("stlink")).unwrap();
+    let parent_mode = std::fs::metadata(l.parent()).unwrap().permissions().mode();
+    let state_mode = std::fs::metadata(l.state()).unwrap().permissions().mode();
+
+    let known = run_names(&l.state());
+    let agent = std::env::current_exe().unwrap();
+    let child = Command::new(leash_exe())
+        .args(["run", "--unattended", "--state-dir"])
+        .arg(l.state())
+        .arg("--policy")
+        .arg(l.policy(true))
+        .arg("--")
+        .arg(&agent)
+        .args(["--exact", "agent_probes", "--nocapture"])
+        .env("LEASH_SR_AGENT", "1")
+        .env("SR_PARENT", l.parent())
+        .env("SR_STATE", l.state())
+        .env("SR_PREV", &prev)
+        .env("SR_ROOT", l.root())
+        .env("SR_LINK", l.links().join("stlink"))
+        .env("SR_WS", l.ws())
+        .current_dir(l.ws())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let f = drive(&l, &Opts::default(), known, child);
+    let text = stdout(&f);
+    assert!(
+        text.lines().any(|n| n == "OK ctl_ancestor_dirfd")
+            && text.lines().any(|n| n == "OK ctl_dirfd_sibling"),
+        "the control probes must succeed: {text}"
+    );
+
+    // nothing the probes attempted took effect
+    assert_eq!(
+        std::fs::metadata(l.parent()).unwrap().permissions().mode(),
+        parent_mode
+    );
+    assert_eq!(
+        std::fs::metadata(l.state()).unwrap().permissions().mode(),
+        state_mode
+    );
+    assert!(l.state().exists() && l.sibling().exists() && !l.other().join("state").exists());
+    assert!(!l.ws().join("exec-ran").exists(), "the exec ran: {text}");
+
+    assert_probes(
+        &text,
+        &f.live,
+        &[
+            probe("chmod_parent", &["chmod", "fchmodat"], "path", l.parent()),
+            probe("chmod_state", &["chmod", "fchmodat"], "path", l.state()),
+            probe(
+                "chown_parent",
+                &["chown", "fchownat", "lchown"],
+                "path",
+                l.parent(),
+            ),
+            probe(
+                "chown_state",
+                &["chown", "fchownat", "lchown"],
+                "path",
+                l.state(),
+            ),
+            probe("opath_open", &["open"], "path", prev.join("trace.jsonl")),
+            probe("dirfd_openat", &["open"], "path", prev.join("meta.json")),
+            probe("dotdot_open", &["open"], "path", f.live.join("meta.json")),
+            probe("exchange_source", &["rename"], "path", l.parent()),
+            probe("exchange_dest", &["rename"], "dest", l.parent()),
+            probe("exec_spelled", &["exec"], "binary", exe.clone()),
+            probe(
+                "exec_symlink",
+                &["exec"],
+                "binary",
+                l.links().join("stlink/exe.sh"),
+            ),
+            probe(
+                "exec_dotdot",
+                &["exec"],
+                "binary",
+                l.root().join("other/../p/state/exe.sh"),
+            ),
+        ],
+    );
+    let report = std::fs::read_to_string(f.live.join("report.txt")).unwrap();
+    assert!(
+        report.contains("denied"),
+        "the report still renders: {report}"
+    );
 }
