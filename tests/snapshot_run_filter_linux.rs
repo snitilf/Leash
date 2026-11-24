@@ -121,6 +121,34 @@ fn glibc_process_creation_still_works_in_a_snapshot_run() {
 }
 
 #[test]
+fn threads_fall_back_to_clone_in_a_snapshot_run() {
+    // glibc's pthread_create tries clone3 first and falls back to clone on ENOSYS.
+    let script = "import threading\n\
+        t = threading.Thread(target=lambda: None)\n\
+        t.start()\n\
+        t.join()\n";
+    let run = enforce(script, true);
+    assert_exit_zero(&run);
+    let denied = events_for(&run, "clone3");
+    assert!(
+        !denied.is_empty(),
+        "glibc tried clone3 first, so the denial is on the trace"
+    );
+    assert!(
+        denied
+            .iter()
+            .all(|e| e["matched_rule"] == "snapshot:clone3")
+    );
+    assert!(
+        events_for(&run, "clone")
+            .iter()
+            .any(|e| e["decision"] == "allow"),
+        "the libc fallback to clone was allowed: {:?}",
+        events_for(&run, "clone")
+    );
+}
+
+#[test]
 fn clone3_is_unchanged_without_snapshot_integrity() {
     let script = format!(
         "{RAW_CLONE3}\
@@ -195,25 +223,42 @@ fn record_only_with_snapshot_integrity_is_refused_before_spawn() {
 }
 
 #[test]
-fn supervisor_is_non_dumpable_during_a_run() {
+fn supervisor_and_broker_are_non_dumpable_during_a_run() {
     // /proc/<pid>/status has no Dumpable field. the kernel's visible effect is that a
-    // non-dumpable process's /proc/<pid>/status inode is owned by root, while a dumpable one
-    // belongs to its own uid. the agent's parent is the supervisor; the agent itself
-    // keeps the default, so its own /proc entry stays owned by it.
+    // non-dumpable process's /proc/<pid> files are owned by root, while a dumpable one's
+    // belong to its own uid. the agent's parent is the supervisor (this process) and the
+    // broker is the supervisor's other child. the agent's own dumpable state is not
+    // asserted: execve resets it, so an agent-side check could never fail. the child
+    // reset is proven instead by the supervisor reading the agent's execve path through
+    // /proc/<pid>/mem, which a non-dumpable target refuses (the run would fail closed).
     // SAFETY: geteuid takes no arguments and cannot fail.
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("skipped: root cannot tell the two ownerships apart");
-        return;
-    }
-    let script = "import os\n\
-        me = os.geteuid()\n\
-        sup = os.stat('/proc/%d/status' % os.getppid()).st_uid\n\
-        assert sup == 0, ('supervisor proc owner', sup)\n\
-        assert os.stat('/proc/self/status').st_uid == me, 'the agent keeps the default'\n";
+    let root = unsafe { libc::geteuid() } == 0;
+    let script = if root {
+        // root cannot tell the two ownerships apart; only the in-process check below runs.
+        "pass\n"
+    } else {
+        "import os\n\
+        sup = os.getppid()\n\
+        me = os.getpid()\n\
+        assert os.stat('/proc/%d/status' % sup).st_uid == 0, 'supervisor is non-dumpable'\n\
+        others = []\n\
+        for d in os.listdir('/proc'):\n\
+        \x20   if not d.isdigit() or int(d) == me:\n\
+        \x20       continue\n\
+        \x20   try:\n\
+        \x20       ppid = [l for l in open('/proc/%s/status' % d) if l.startswith('PPid:')][0].split()[1]\n\
+        \x20       if int(ppid) == sup:\n\
+        \x20           others.append((d, os.stat('/proc/%s/status' % d).st_uid))\n\
+        \x20   except (OSError, IndexError):\n\
+        \x20       pass\n\
+        assert others, 'the broker is the supervisor other child'\n\
+        assert all(uid == 0 for _, uid in others), ('broker is non-dumpable', others)\n"
+    };
     for snapshot_integrity in [false, true] {
         let run = enforce(script, snapshot_integrity);
         assert_exit_zero(&run);
     }
+    // the in-process observable, checked for root too: this process is the supervisor.
     // SAFETY: PR_GET_DUMPABLE takes no pointer arguments.
     assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
 }
