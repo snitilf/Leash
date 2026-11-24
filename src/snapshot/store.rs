@@ -182,6 +182,13 @@ pub enum StoreError {
         /// why the manifest was rejected.
         reason: String,
     },
+    /// the manifest digests given to a chain head, or the manifests in a store, do not form a
+    /// valid chain.
+    #[error("invalid snapshot chain: {reason}")]
+    InvalidChain {
+        /// why the chain was rejected.
+        reason: String,
+    },
     /// a caller-provided object digest is not 64 lowercase hex characters.
     #[error("invalid sha256 digest: {0}")]
     InvalidDigest(String),

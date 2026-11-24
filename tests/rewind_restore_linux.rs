@@ -98,14 +98,33 @@ fn digest(c: char) -> String {
 }
 
 #[test]
-fn chain_head_is_deterministic_and_order_sensitive() {
+fn chain_head_is_deterministic_and_digest_sensitive() {
     let a = vec![(0u64, digest('a')), (1, digest('b'))];
-    assert_eq!(chain_head(&a), chain_head(&a.clone()));
+    assert_eq!(chain_head(&a).unwrap(), chain_head(&a.clone()).unwrap());
     let swapped = vec![(0u64, digest('b')), (1, digest('a'))];
-    assert_ne!(chain_head(&a), chain_head(&swapped));
-    let reversed = vec![(1u64, digest('b')), (0, digest('a'))];
-    assert_ne!(chain_head(&a), chain_head(&reversed));
-    assert_ne!(chain_head(&a), chain_head(&a[..1]));
+    assert_ne!(chain_head(&a).unwrap(), chain_head(&swapped).unwrap());
+    assert_ne!(chain_head(&a).unwrap(), chain_head(&a[..1]).unwrap());
+}
+
+#[test]
+fn chain_head_rejects_non_ascending_steps_and_malformed_digests() {
+    for steps in [[1u64, 0], [0, 0], [3, 3]] {
+        let d = vec![(steps[0], digest('a')), (steps[1], digest('b'))];
+        let err = chain_head(&d).unwrap_err();
+        assert!(matches!(err, StoreError::InvalidChain { .. }), "{err}");
+    }
+    for bad in [
+        "".to_owned(),
+        "abc".to_owned(),
+        digest('A'),
+        digest('g'),
+        format!("{}0", digest('a')),
+        format!("{}\n", digest('a')),
+    ] {
+        let err = chain_head(&[(0, bad.clone())]).unwrap_err();
+        assert!(matches!(err, StoreError::InvalidChain { .. }), "{bad:?}");
+    }
+    assert!(chain_head(&[]).is_ok());
 }
 
 #[test]
@@ -117,37 +136,86 @@ fn chain_head_hashes_the_documented_line_format() {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    assert_eq!(chain_head(&d), expected);
+    assert_eq!(chain_head(&d).unwrap(), expected);
+}
+
+fn capture_chain(fx: &Fixture, steps: u64) -> Vec<(u64, String)> {
+    fs::write(fx.ws.join("a"), b"one").unwrap();
+    let mut digests = Vec::new();
+    for step in 0..steps {
+        let p = capture(&fx.ws_fd(), &fx.store_fd(), step, &Limits::default()).unwrap();
+        digests.push((step, p.manifest_digest));
+        fs::write(fx.ws.join("a"), format!("v{step}")).unwrap();
+    }
+    digests
 }
 
 #[test]
 fn recompute_chain_matches_digests_returned_by_capture() {
     let fx = Fixture::new();
-    fs::write(fx.ws.join("a"), b"one").unwrap();
-    let mut digests = Vec::new();
-    for step in 0..3u64 {
-        let p = capture(&fx.ws_fd(), &fx.store_fd(), step, &Limits::default()).unwrap();
-        digests.push((step, p.manifest_digest));
-        fs::write(fx.ws.join("a"), format!("v{step}")).unwrap();
-    }
-    assert_eq!(
-        recompute_chain(&fx.store_fd()).unwrap(),
-        chain_head(&digests)
-    );
+    let digests = capture_chain(&fx, 3);
+    let chain = recompute_chain(&fx.store_fd()).unwrap();
+    assert_eq!(chain.head, chain_head(&digests).unwrap());
+    assert_eq!(chain.digests, digests);
+    assert_eq!(chain.digest(1), Some(digests[1].1.as_str()));
+    assert_eq!(chain.digest(3), None);
 }
 
 #[test]
 fn recompute_chain_uses_bytes_on_disk_not_a_trace() {
     let fx = Fixture::new();
-    fs::write(fx.ws.join("a"), b"one").unwrap();
-    let p = capture(&fx.ws_fd(), &fx.store_fd(), 0, &Limits::default()).unwrap();
-    let honest = chain_head(&[(0, p.manifest_digest)]);
+    let digests = capture_chain(&fx, 1);
+    let honest = chain_head(&digests).unwrap();
     let path = fx.store_path.join("manifests/step-000000.json");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     let mut bytes = fs::read(&path).unwrap();
     bytes.push(b'\n');
     fs::write(&path, bytes).unwrap();
-    assert_ne!(recompute_chain(&fx.store_fd()).unwrap(), honest);
+    assert_ne!(recompute_chain(&fx.store_fd()).unwrap().head, honest);
+}
+
+#[test]
+fn a_deleted_last_manifest_changes_the_head() {
+    let fx = Fixture::new();
+    let digests = capture_chain(&fx, 3);
+    let honest = chain_head(&digests).unwrap();
+    fs::remove_file(fx.store_path.join("manifests/step-000002.json")).unwrap();
+    let after = recompute_chain(&fx.store_fd()).unwrap();
+    assert_ne!(after.head, honest);
+    assert_eq!(after.digest(2), None);
+}
+
+#[test]
+fn a_deleted_middle_manifest_is_a_gap_naming_the_missing_step() {
+    let fx = Fixture::new();
+    capture_chain(&fx, 3);
+    fs::remove_file(fx.store_path.join("manifests/step-000001.json")).unwrap();
+    let err = recompute_chain(&fx.store_fd()).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidChain { reason } if reason.contains("step 1 is missing")),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_chain_that_starts_after_step_zero_names_step_zero() {
+    let fx = Fixture::new();
+    capture_chain(&fx, 2);
+    fs::remove_file(fx.store_path.join("manifests/step-000000.json")).unwrap();
+    let err = recompute_chain(&fx.store_fd()).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidChain { reason } if reason.contains("step 0 is missing")),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_extra_manifest_changes_the_head() {
+    let fx = Fixture::new();
+    let digests = capture_chain(&fx, 2);
+    let honest = chain_head(&digests).unwrap();
+    capture(&fx.ws_fd(), &fx.store_fd(), 2, &Limits::default()).unwrap();
+    assert_ne!(recompute_chain(&fx.store_fd()).unwrap().head, honest);
 }
 
 #[test]

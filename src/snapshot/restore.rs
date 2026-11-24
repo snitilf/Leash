@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use super::store::{
     EntryKind, Limits, Manifest, ManifestEntry, StoreError, capture, committed_steps, hex_encode,
-    load_manifest, validate_manifest, validate_relative_path, verify_object,
+    is_valid_sha256_hex, load_manifest, validate_manifest, validate_relative_path, verify_object,
 };
 
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
@@ -36,28 +36,71 @@ const MAX_XATTR_RETRIES: usize = 4;
 /// the head is the lowercase hex sha256 of the concatenation, in the order given, of one
 /// ASCII line per step: `"<step>:<manifest digest hex>\n"`. `<step>` is the decimal step
 /// number with no padding and `<manifest digest hex>` is the 64-character lowercase hex
-/// sha256 of the exact manifest bytes (`load_manifest`'s second return value). callers
-/// pass ascending step order; the function does not sort, so a reordered input yields a
-/// different head. an empty list hashes the empty string.
-pub fn chain_head(digests: &[(u64, String)]) -> String {
+/// sha256 of the exact manifest bytes (`load_manifest`'s second return value). steps must
+/// be strictly ascending and every digest must be 64 lowercase hex characters, so one
+/// chain has one encoding; anything else is `StoreError::InvalidChain`. an empty list
+/// hashes the empty string.
+pub fn chain_head(digests: &[(u64, String)]) -> Result<String, StoreError> {
     let mut hasher = Sha256::new();
+    let mut previous: Option<u64> = None;
     for (step, digest) in digests {
+        if previous.is_some_and(|prev| *step <= prev) {
+            return Err(StoreError::InvalidChain {
+                reason: format!("step {step} does not ascend from the previous step"),
+            });
+        }
+        if !is_valid_sha256_hex(digest) {
+            return Err(StoreError::InvalidChain {
+                reason: format!("step {step} has a malformed manifest digest"),
+            });
+        }
+        previous = Some(*step);
         hasher.update(format!("{step}:{digest}\n").as_bytes());
     }
-    hex_encode(&hasher.finalize())
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+/// the chain recomputed from the manifests present in a store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecomputedChain {
+    /// the chain head over `digests`.
+    pub head: String,
+    /// `(step, manifest digest)` for every committed step, ascending from 0.
+    pub digests: Vec<(u64, String)>,
+}
+
+impl RecomputedChain {
+    /// the digest of the manifest at `step`, when that step is in the chain.
+    pub fn digest(&self, step: u64) -> Option<&str> {
+        self.digests
+            .binary_search_by_key(&step, |(s, _)| *s)
+            .ok()
+            .map(|i| self.digests[i].1.as_str())
+    }
 }
 
 /// recompute the chain head from the manifests actually present in `store`.
 ///
 /// loads every committed manifest in ascending step order and uses the digest of the bytes
-/// it read from disk. the chain is never read from a trace.
-pub fn recompute_chain(store: &File) -> Result<String, StoreError> {
+/// it read from disk. the chain is never read from a trace. steps must be contiguous from
+/// 0: a gap is an error naming the missing step. callers take the target manifest's digest
+/// from the result instead of loading it a second time.
+pub fn recompute_chain(store: &File) -> Result<RecomputedChain, StoreError> {
     let mut digests = Vec::new();
-    for step in committed_steps(store)? {
+    for (expected, step) in committed_steps(store)?.into_iter().enumerate() {
+        let expected = expected as u64;
+        if step != expected {
+            return Err(StoreError::InvalidChain {
+                reason: format!("step {expected} is missing (next committed step is {step})"),
+            });
+        }
         let (_, digest) = load_manifest(store, step)?;
         digests.push((step, digest));
     }
-    Ok(chain_head(&digests))
+    Ok(RecomputedChain {
+        head: chain_head(&digests)?,
+        digests,
+    })
 }
 
 /// capture the current workspace into `scratch_store` at `step` and return its manifest.
