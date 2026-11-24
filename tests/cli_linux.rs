@@ -1210,3 +1210,25 @@ fn state_dir_inside_workspace_is_refused() {
         "the refusal names the workspace rule: {stderr}"
     );
 }
+
+/// a rename whose destination cannot be prepared (its parent does not exist) must be a
+/// clean refusal of that one syscall, not a panic that takes the supervisor down.
+#[test]
+fn enforce_survives_a_rename_whose_destination_cannot_be_prepared() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join("source.txt"), b"source").unwrap();
+    let (out, _state) = run_enforce(
+        "schema_version = 1\n\
+         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+         [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+        ws.path(),
+        &[
+            "/bin/sh",
+            "-c",
+            "mv source.txt no-such-dir/destination.txt 2>/dev/null; exit 0",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "supervisor panicked: {stderr}");
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+}
