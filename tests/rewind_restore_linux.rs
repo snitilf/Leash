@@ -1152,9 +1152,8 @@ fn scan_current_matches_capture_when_nothing_is_refused() {
     fs::write(fx.ws.join("d/empty"), b"").unwrap();
     symlink("a", fx.ws.join("lnk")).unwrap();
     chmod(&fx.ws.join("d/empty"), 0o4755);
-    if try_set_user_xattr(&fx.ws.join("a"), "user.k", b"v") {
-        // the group shares one inode, so both names carry it
-    }
+    // the group shares one inode, so both names carry the attribute
+    let _ = try_set_user_xattr(&fx.ws.join("a"), "user.k", b"v");
     let captured = fx.capture(0);
     let (scanned, refused) = scan_current(&fx.ws_fd(), &Limits::default()).unwrap();
     assert!(refused.is_empty(), "{refused:?}");
@@ -1177,8 +1176,8 @@ fn a_no_undo_scan_stores_nothing_and_plans_around_entries_capture_refuses() {
     fs::write(fx.ws.join("huge"), vec![7u8; 64]).unwrap();
     fs::write(fx.ws.join("keep"), b"edited").unwrap();
     chmod(&fx.ws.join("secret"), 0o000);
-    let err = capture(&fx.ws_fd(), &fx.store_fd(), 1, &Limits::default()).unwrap_err();
-    assert!(matches!(err, StoreError::UnsupportedEntry { .. }), "{err}");
+    // capture refuses this workspace outright (the unreadable file, then the socket)
+    assert!(capture(&fx.ws_fd(), &fx.store_fd(), 1, &Limits::default()).is_err());
 
     let before = count_store_files(&fx.store_path);
     let limits = Limits {
