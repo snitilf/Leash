@@ -19,8 +19,9 @@ lets the kernel proceed. **Landlock** adds a second, kernel-enforced boundary in
 applied by the child before it execs the agent: a filesystem boundary always, and a network-port
 boundary where the running ABI supports it (ADR-0003, ADR-0013). It holds even where the decision
 logic has a gap. **Record-only** applies no general policy enforcement (ADR-0010).
-Snapshot-enabled runs in either mode additionally require the integrity protections of
-ADR-0022; their implementation and validation remain pending.
+Snapshots exist only in enforce mode and only when the operator passes `--snapshots` (ADR-0024).
+The ADR-0022 capture barrier applies to them.
+The snapshot controls are specified by ADR-0024, not yet implemented.
 
 ```
   leash (supervisor, trusted)              child (agent + whole process tree, untrusted)
@@ -63,12 +64,18 @@ by ID. ADR-0002 already refers to I2 by this number; the full list is fixed here
   a grandchild is mediated exactly as the agent is. Any change to process handling re-verifies this.
   (FR-1, FR-4, SR-2.)
 - **I2** - The supervisor is the sole author of the **trace** and the sole owner of the decision
-  path. In **enforce** mode the child is denied the state directory by both layers (FR-3, FR-21), so
-  the policy boundary protects the trace. Ordinary **record-only** trace integrity still
-  rests on filesystem permissions and does not resist hostile same-uid tampering. Exact
-  snapshot-enabled runs in both modes additionally require verified protection of retained
-  baselines, captures and authoritative metadata (ADR-0022, FR-21); these controls remain
-  pending. The distinction and residual are named in [`escapes.md`](escapes.md).
+  path.
+  In **enforce** mode the child is denied the state directory (FR-3, FR-21), so the policy boundary protects the trace.
+  The two layers do different jobs (specified by ADR-0024, not yet implemented).
+  The seccomp layer applies an implicit, first-ranked deny of every open of the state root, reads included, and of every mutation of it or its ancestors, before any policy rule.
+  Landlock backs up writes only, and a snapshot run refuses before spawn when a write-class grant overlaps the state root.
+  Ordinary **record-only** trace integrity still rests on filesystem permissions and does not resist hostile same-uid tampering.
+  Snapshots exist only in enforce mode (ADR-0024).
+  Their retained state is protected during the run.
+  At rest it is checkable only against a chain head the operator kept outside the store (`--expect`).
+  It is not protected against other same-uid processes outside the run's tree, during or between runs.
+  The ADR-0022 custodian is the deferred path to that.
+  The distinction and residual are named in [`escapes.md`](escapes.md).
 
 - **I3** - Every decision **fails closed**. Any supervisor error, crash, or decision timeout
   resolves the pending action to deny; the child never gets a default-allow. One arc is scoped by
@@ -127,23 +134,22 @@ claim, and refuses to run rather than silently degrade (FR-14). Preflight bundle
   6.2), TCP connect/bind (`NET_*`) from ABI 4 (Linux 6.7). The floor guarantees ABI 2; anything above
   it is probed, and the degrade table fixes what happens when a backstop the policy could use is
   above the running ABI.
-- **Snapshot prerequisites.** ADR-0022 requires usable delegated cgroup v2, verified
-  freezer completion, whole-tree termination, and protection against child migration and
-  control-plane writes before a snapshot-enabled run starts. Retained baselines, snapshot
-  data and authoritative metadata must also be protected from same-uid child mutation. Both modes require these
-  integrity controls. Missing support refuses before spawn; unfrozen copy is not a fallback.
-  ADR-0022 selects a separately provisioned, distinct-host-UID snapshot custodian as the
-  storage-protection direction, with private capability-based control and refusal when
-  unavailable. It must protect canonical state across runs; operator-owned indexes and
-  exports are not authoritative. Implementation and adversarial validation remain pending.
+- **Snapshot prerequisites.**
+  A `--snapshots` run (enforce mode only, ADR-0024) requires a usable delegated cgroup v2, verified freezer completion, whole-tree termination, Landlock ABI 3 or higher, and protection against child migration and control-plane writes.
+  The run-time protection is the implicit state-root and cgroup denies plus refusal of overlapping write-class Landlock grants.
+  Missing support refuses before spawn; unfrozen copy is not a fallback.
+  All of this is specified by ADR-0024, not yet implemented.
+  The ADR-0022 custodian (a separately provisioned, distinct-host-UID snapshot custodian) is deferred hardening, not a prerequisite.
+  It would protect canonical state across runs, and implementation and adversarial validation remain pending.
 - **Snapshot backend.** Copy is the initial backend under ADR-0022. Overlay support alone
   does not enable overlay: its complete mount, capture, retained-baseline and offline restore
   lifecycle must pass equivalence tests first. The selected backend and reason are stamped
   into run metadata. Both backends require the same capture barrier.
 
 
-Landlock backstop degrade table. Record-only applies no general policy Landlock ruleset (ADR-0010;
-snapshot integrity prerequisites are separately specified by ADR-0022); the table is about which backstop the enforce-mode ruleset can carry at a given ABI. Per
+Landlock backstop degrade table.
+Record-only applies no general policy Landlock ruleset (ADR-0010).
+The table is about which backstop the enforce-mode ruleset can carry at a given ABI. Per
 ADR-0013 the seccomp layer is the primary decision layer, so a missing backstop degrades to
 seccomp-only with a named residual, it does not refuse the run:
 
@@ -166,8 +172,8 @@ seccomp layer mediates the relevant syscalls for the trace in both modes regardl
 The ordering is forced by the kernel API and by the invariants; each step precedes the next for a
 stated reason.
 
-1. Supervisor prepares the per-run directory and selected snapshot backend. Snapshot-enabled
-   runs must establish the ADR-0022 prerequisites and initial capture before spawn (FR-21).
+1. Supervisor prepares the per-run directory and selected snapshot backend.
+   Snapshot runs (enforce mode with `--snapshots`) must establish the ADR-0024 prerequisites and initial capture before spawn (FR-21).
    The run cgroup must contain the child before untrusted execution; descendants inherit
    membership, while the supervisor remains outside. This lifecycle is required design,
    not a claim that the current spawn path implements it.
@@ -184,8 +190,8 @@ stated reason.
    waits for the supervisor to acknowledge that it holds the fd and is ready to serve.
 5. In **enforce** mode the child applies the Landlock ruleset granting exactly the workspace, the
    explicitly allowed paths, and the TCP port backstop for allowed hosts (ADR-0003, ADR-0013). In
-   **record-only** mode the general policy ruleset is skipped (ADR-0010); ADR-0022 snapshot integrity
-   restrictions remain prerequisites. Landlock is applied by
+   **record-only** mode the general policy ruleset is skipped (ADR-0010).
+   Landlock is applied by
    the child, pre-exec, because a process can only restrict itself and its descendants. The child
    then sends a second handshake byte, and the parent does not return from spawn until that byte
    confirms every pre-exec boundary was installed.

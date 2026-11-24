@@ -108,7 +108,7 @@ allowed.
 | Syscall | Also on ARM64 | Decision basis | Allow realized by | Landlock backstop |
 |---|---|---|---|---|
 | `fork`, `vfork` | no (x86-64) | none (creation itself) | `CONTINUE` (scalar decision) | none (I1 is automatic) |
-| `clone`, `clone3` | yes | flags (scalar / struct) | `CONTINUE` | none (I1 is automatic) |
+| `clone`, `clone3` | yes | flags (scalar / struct) | `CONTINUE`; in a snapshot run `clone3` is answered `ENOSYS` (specified by ADR-0024, not yet implemented) | none (I1 is automatic) |
 | `execve`, `execveat` | yes | binary path (pointer) | `CONTINUE`, backstopped by Landlock | `FS_EXECUTE` |
 
 `execve` cannot be injected: there is no fd to `ADDFD` and the exec replaces the address space. The
@@ -122,6 +122,7 @@ trace and any **ask**; the kernel drives enforcement. This split is stated as a 
 decision is on that read value. Because the enforcing property (filter inheritance) is automatic, a
 swapped flag after the read cannot escape mediation; it can at most misrecord the flags in the trace,
 which the notify loop bounds by reading once and recording what it read (I4).
+In a snapshot run, `clone3` is instead answered `ENOSYS` before the struct is read and the denial is recorded as an event, so `CLONE_INTO_CGROUP` cannot be requested and C libraries fall back to `clone` (ADR-0024 rule 7, specified, not yet implemented).
 
 ### 3.4 Cross-process control
 
@@ -278,6 +279,10 @@ operator, especially in record-only, wants to see that the agent reached for the
   and not scoped by mode: refusing it is not policy enforcement, it is refusing to let the agent
   make the trace lie. The recorded id is `sr4:pidfd_getfd`, in both modes, replacing the
   earlier enforce-only `failsafe:pidfd_getfd` id.
+- Legacy AIO (`io_setup`, `io_submit`), in a snapshot run only (ADR-0024 rule 8, specified by ADR-0024, not yet implemented).
+  The freezer stops tasks, not in-flight I/O, so an AIO write could land across a capture boundary.
+  Today AIO is allowed, unmediated and unrecorded (measurement 0003 question 4).
+  The denial is recorded as an event and is scoped to snapshot runs.
 - Foreign-ABI entry. The filter pins the architecture (`AUDIT_ARCH_X86_64` or `AUDIT_ARCH_AARCH64`)
   and routes any mismatch to deny-and-record. Pinning the arch alone does **not** close the x32 ABI:
   x32 syscalls arrive with `arch == AUDIT_ARCH_X86_64` but with `__X32_SYSCALL_BIT` (bit 30) set in

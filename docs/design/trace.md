@@ -27,8 +27,11 @@ $XDG_STATE_HOME/leash/runs/<run-id>/
 ```
 
 The state directory lies outside the **workspace**, and in **enforce** mode the child is denied
-access to it by both layers: no policy rule grants it, and the derived Landlock ruleset does not
-include it (FR-21, FR-3). An escape test confirms the child cannot open `trace.jsonl` under any path,
+access to it (FR-21, FR-3).
+Today no code denies it: measurement 0003 question 1 found the traces readable under the example policy, and writable under a broad write grant.
+ADR-0024 specifies an implicit, first-ranked seccomp deny of every open of the state root, reads included, which is not yet implemented.
+Landlock backs up writes only, and a snapshot run refuses before spawn when a write-class grant overlaps the state root.
+An escape test confirms the child cannot open `trace.jsonl` under any path,
 including `/proc` self-reference ([`escapes.md`](escapes.md), I2).
 
 The `<run-id>` is a UTC timestamp plus a short random suffix, `20260708T153012Z-7k3m9q`: a compact
@@ -116,6 +119,13 @@ are required design, with schema implementation and validation pending. Existing
 captures must not be relabeled exact. A failed or unpublished capture must not produce a
 successful step; a published snapshot without its committed step is an orphan during recovery.
 A failed final capture must be represented as failure, not as a successful final boundary.
+
+ADR-0024 adds these fields, specified by ADR-0024, not yet implemented:
+
+- a `step` event carries the manifest digest of its snapshot and the capture pause;
+- a cgroup-kill record is written when Leash writes `cgroup.kill`, at run end and on every abort path;
+- `run_end` carries the chain head over all step manifest digests, recomputed from the manifests and never read from the trace;
+- a snapshot run records the `clone3` `ENOSYS` denial and the legacy AIO denial as events.
 
 
 The `fact` is what the supervisor resolved, not what the child's memory said after the fact: the

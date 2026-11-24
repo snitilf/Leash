@@ -182,9 +182,10 @@ confusing.
 ## 6. Landlock derivation
 
 The policy-derived Landlock ruleset is the kernel backstop in **enforce** mode (ADR-0003).
-**Record-only** applies no general policy ruleset (ADR-0010). Snapshot-enabled runs in both
-modes additionally require the pending integrity protections in ADR-0022; this section
-describes only the enforce-mode policy derivation. It is derived from the
+**Record-only** applies no general policy ruleset (ADR-0010).
+Snapshots exist only in enforce mode (ADR-0024), and their implicit state-root and cgroup denies are specified by ADR-0024, not yet implemented.
+This section describes only the policy derivation.
+It is derived from the
 same policy so the two enforcing layers cannot silently disagree. The derivation is a coarsening, and
 its direction matters for correctness:
 
