@@ -1,6 +1,6 @@
 # ADR-0020: Confined broker realization and child-socket duplication
 
-- Status: accepted
+- Status: accepted (namespace-root flag choice refined by ADR-0023)
 - Date: 2026-07-23
 
 ## Context
