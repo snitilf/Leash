@@ -670,6 +670,1202 @@ pub(crate) fn step_manifest_filename(step: u64) -> String {
     format!("step-{step:06}.json")
 }
 
+#[cfg(target_os = "linux")]
+pub use linux::{capture, committed_steps, load_manifest, verify_object};
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::collections::{BTreeMap, HashMap};
+    use std::ffi::{CStr, CString};
+    use std::fs::File;
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+
+    use sha2::{Digest, Sha256};
+
+    use super::{
+        CaptureStats, EntryKind, FileFingerprint, Limits, MANIFEST_READ_CAP,
+        MANIFEST_SCHEMA_VERSION, Manifest, ManifestEntry, ManifestTotals, Published, StoreError,
+        XattrAction, check_file_unchanged, classify_xattr, hex_encode, is_valid_sha256_hex,
+        manifest_digest, parse_manifest, parse_step_filename, step_manifest_filename,
+    };
+
+    const COPY_BUF_LEN: usize = 64 * 1024;
+    const MAX_XATTR_RETRIES: usize = 4;
+    const MAX_SYMLINK_TARGET_BYTES: usize = 1024 * 1024;
+
+    struct DirStream(*mut libc::DIR);
+
+    impl DirStream {
+        fn open_from_dir_fd(dir_fd: RawFd, path: &str) -> Result<Self, StoreError> {
+            // openat "." creates an independent open file description at offset 0 so
+            // reading entries never disturbs the caller's directory descriptor offset.
+            // SAFETY: dir_fd is a live directory descriptor; "." is a static NUL-terminated
+            // string; openat returns a fresh owned fd on success.
+            let fd = unsafe {
+                libc::openat(
+                    dir_fd,
+                    c".".as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io_err("openat", path, io::Error::last_os_error()));
+            }
+            Self::from_owned_fd(fd, path)
+        }
+
+        fn from_owned_fd(fd: RawFd, path: &str) -> Result<Self, StoreError> {
+            // SAFETY: fd is a uniquely owned directory descriptor; fdopendir takes
+            // ownership on success.
+            let ptr = unsafe { libc::fdopendir(fd) };
+            if ptr.is_null() {
+                let err = io::Error::last_os_error();
+                // SAFETY: fdopendir failed, so we still own fd and must close it.
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(io_err("fdopendir", path, err));
+            }
+            Ok(Self(ptr))
+        }
+
+        fn read_names(&mut self, path: &str) -> Result<Vec<CString>, StoreError> {
+            let mut names = Vec::new();
+            loop {
+                // SAFETY: __errno_location returns the current thread's errno slot.
+                unsafe {
+                    *libc::__errno_location() = 0;
+                }
+                // SAFETY: self.0 is a live DIR* stream owned by self.
+                let ent = unsafe { libc::readdir(self.0) };
+                if ent.is_null() {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(0) {
+                        break;
+                    }
+                    return Err(io_err("readdir", path, err));
+                }
+                // SAFETY: ent is non-null and d_name is a NUL-terminated C string
+                // valid until the next readdir or closedir call.
+                let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
+                if name == c"." || name == c".." {
+                    continue;
+                }
+                names.push(name.to_owned());
+            }
+            names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            Ok(names)
+        }
+    }
+
+    impl Drop for DirStream {
+        fn drop(&mut self) {
+            // SAFETY: self.0 was returned by fdopendir and is closed exactly once here.
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+
+    fn io_err(op: &'static str, path: impl Into<String>, source: io::Error) -> StoreError {
+        StoreError::Io {
+            op,
+            path: path.into(),
+            source,
+        }
+    }
+
+    fn fstat_fd(fd: RawFd, op: &'static str, path: &str) -> Result<libc::stat, StoreError> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fd is a live open descriptor and fstat initializes `st` on success.
+        if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+            return Err(io_err(op, path, io::Error::last_os_error()));
+        }
+        // SAFETY: fstat returned 0, so `st` is fully initialized.
+        Ok(unsafe { st.assume_init() })
+    }
+
+    fn is_dir_mode(mode: libc::mode_t) -> bool {
+        (mode & libc::S_IFMT) == libc::S_IFDIR
+    }
+
+    fn is_reg_mode(mode: libc::mode_t) -> bool {
+        (mode & libc::S_IFMT) == libc::S_IFREG
+    }
+
+    fn fsync_fd(fd: RawFd, op: &'static str, path: &str) -> Result<(), StoreError> {
+        // SAFETY: fd is a live open descriptor.
+        if unsafe { libc::fsync(fd) } != 0 {
+            return Err(io_err(op, path, io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    fn openat_dir(parent_fd: RawFd, name: &CStr, path: &str) -> Result<File, StoreError> {
+        // SAFETY: parent_fd and name are live; openat returns a fresh owned fd.
+        let fd = unsafe {
+            libc::openat(
+                parent_fd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io_err("openat", path, io::Error::last_os_error()));
+        }
+        // SAFETY: fd was returned by openat and is uniquely owned here.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn ensure_dir(parent_fd: RawFd, name: &CStr, path: &str) -> Result<File, StoreError> {
+        // SAFETY: parent_fd is a live directory descriptor and name is NUL-terminated.
+        let rc = unsafe { libc::mkdirat(parent_fd, name.as_ptr(), 0o700) };
+        let created = if rc == 0 {
+            true
+        } else {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EEXIST) {
+                false
+            } else {
+                return Err(io_err("mkdirat", path, err));
+            }
+        };
+        let dir = openat_dir(parent_fd, name, path)?;
+        if created {
+            fsync_fd(parent_fd, "fsync", path)?;
+        }
+        Ok(dir)
+    }
+
+    fn fstatat_exists(
+        dir_fd: RawFd,
+        name: &CStr,
+        op: &'static str,
+        path: &str,
+    ) -> Result<bool, StoreError> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: dir_fd is a live directory descriptor, name is NUL-terminated, and
+        // AT_SYMLINK_NOFOLLOW avoids traversing symlinks.
+        let rc = unsafe {
+            libc::fstatat(
+                dir_fd,
+                name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            Ok(true)
+        } else {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                Ok(false)
+            } else {
+                Err(io_err(op, path, err))
+            }
+        }
+    }
+
+    fn unlink_best_effort(dir_fd: RawFd, name: &CStr) {
+        // SAFETY: dir_fd is a live directory descriptor and name is NUL-terminated.
+        let _ = unsafe { libc::unlinkat(dir_fd, name.as_ptr(), 0) };
+    }
+
+    fn create_staging_file(staging_dir: &File) -> Result<(File, CString), StoreError> {
+        let mut rnd = [0u8; 16];
+        getrandom::fill(&mut rnd).map_err(|e| StoreError::Random(e.to_string()))?;
+        let name = format!("tmp-{}", hex_encode(&rnd));
+        let c_name = CString::new(name.as_str()).map_err(|_| StoreError::UnsupportedName {
+            path: format!("staging/{name}"),
+        })?;
+        // SAFETY: staging_dir and c_name are live; O_CREAT | O_EXCL creates a new file
+        // with mode 0400 and returns a fresh owned descriptor.
+        let fd = unsafe {
+            libc::openat(
+                staging_dir.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o400 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io_err(
+                "openat",
+                format!("staging/{name}"),
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: fd was returned by openat and is uniquely owned here.
+        let file = unsafe { File::from_raw_fd(fd) };
+        // ensure exact 0400 permissions regardless of process umask.
+        // SAFETY: file.as_raw_fd() is a live descriptor we own.
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o400) } != 0 {
+            let err = io::Error::last_os_error();
+            drop(file);
+            unlink_best_effort(staging_dir.as_raw_fd(), &c_name);
+            return Err(io_err("fchmod", format!("staging/{name}"), err));
+        }
+        Ok((file, c_name))
+    }
+
+    fn rename_noreplace(
+        old_dir_fd: RawFd,
+        old_name: &CStr,
+        new_dir_fd: RawFd,
+        new_name: &CStr,
+    ) -> io::Result<bool> {
+        // SAFETY: both directory descriptors and NUL-terminated names are live;
+        // RENAME_NOREPLACE atomically fails with EEXIST rather than clobbering.
+        let rc = unsafe {
+            libc::renameat2(
+                old_dir_fd,
+                old_name.as_ptr(),
+                new_dir_fd,
+                new_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if rc == 0 {
+            Ok(true)
+        } else {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EEXIST) {
+                Ok(false)
+            } else {
+                Err(err)
+            }
+        }
+    }
+
+    fn join_rel(prefix: &str, name: &str) -> String {
+        if prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{prefix}/{name}")
+        }
+    }
+
+    fn stat_size(st: &libc::stat, path: &str) -> Result<u64, StoreError> {
+        u64::try_from(st.st_size).map_err(|_| {
+            io_err(
+                "fstat",
+                path,
+                io::Error::new(io::ErrorKind::InvalidData, "negative file size"),
+            )
+        })
+    }
+
+    fn read_xattrs(fd: RawFd, path: &str) -> Result<BTreeMap<String, String>, StoreError> {
+        let list_buf = {
+            let mut result = Vec::new();
+            for _ in 0..MAX_XATTR_RETRIES {
+                // SAFETY: fd is a live descriptor; null pointer with 0 size queries length.
+                let needed = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
+                if needed < 0 {
+                    let err = io::Error::last_os_error();
+                    if matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP | libc::ENOSYS)) {
+                        return Ok(BTreeMap::new());
+                    }
+                    return Err(io_err("flistxattr", path, err));
+                }
+                if needed == 0 {
+                    return Ok(BTreeMap::new());
+                }
+                let mut buf = vec![0u8; needed as usize];
+                // SAFETY: fd is live and buf has `buf.len()` writable bytes.
+                let got = unsafe { libc::flistxattr(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if got < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::ERANGE) {
+                        continue;
+                    }
+                    if matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP | libc::ENOSYS)) {
+                        return Ok(BTreeMap::new());
+                    }
+                    return Err(io_err("flistxattr", path, err));
+                }
+                buf.truncate(got as usize);
+                result = buf;
+                break;
+            }
+            result
+        };
+
+        let mut xattrs = BTreeMap::new();
+        for raw_name in list_buf.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            let name = match std::str::from_utf8(raw_name) {
+                Ok(s) => s,
+                Err(_) => {
+                    return Err(StoreError::UnsupportedMetadata {
+                        path: path.to_owned(),
+                        attr: String::from_utf8_lossy(raw_name).into_owned(),
+                    });
+                }
+            };
+            match classify_xattr(name) {
+                XattrAction::Ignore => continue,
+                XattrAction::Reject => {
+                    return Err(StoreError::UnsupportedMetadata {
+                        path: path.to_owned(),
+                        attr: name.to_owned(),
+                    });
+                }
+                XattrAction::Record => {
+                    let c_name =
+                        CString::new(raw_name).map_err(|_| StoreError::UnsupportedMetadata {
+                            path: path.to_owned(),
+                            attr: name.to_owned(),
+                        })?;
+                    let value = read_one_xattr(fd, &c_name, path)?;
+                    xattrs.insert(name.to_owned(), hex_encode(&value));
+                }
+            }
+        }
+        Ok(xattrs)
+    }
+
+    fn read_one_xattr(fd: RawFd, name: &CStr, path: &str) -> Result<Vec<u8>, StoreError> {
+        for _ in 0..MAX_XATTR_RETRIES {
+            // SAFETY: fd is live, name is NUL-terminated; null value queries length.
+            let needed = unsafe { libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0) };
+            if needed < 0 {
+                return Err(io_err("fgetxattr", path, io::Error::last_os_error()));
+            }
+            if needed == 0 {
+                return Ok(Vec::new());
+            }
+            let mut buf = vec![0u8; needed as usize];
+            // SAFETY: fd is live, name is NUL-terminated, buf has `buf.len()` writable bytes.
+            let got =
+                unsafe { libc::fgetxattr(fd, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+            if got < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ERANGE) {
+                    continue;
+                }
+                return Err(io_err("fgetxattr", path, err));
+            }
+            buf.truncate(got as usize);
+            return Ok(buf);
+        }
+        Err(io_err(
+            "fgetxattr",
+            path,
+            io::Error::other("xattr size changed repeatedly during read"),
+        ))
+    }
+
+    fn read_symlink_target(fd: RawFd, size_hint: i64, path: &str) -> Result<String, StoreError> {
+        let mut cap = usize::try_from(size_hint)
+            .unwrap_or(256)
+            .clamp(256, 65_536)
+            .saturating_add(1);
+        loop {
+            let mut buf = vec![0u8; cap];
+            // SAFETY: fd is an O_PATH | O_NOFOLLOW symlink descriptor; empty pathname
+            // reads its target into `buf` without following the link (Linux 2.6.39+).
+            let got =
+                unsafe { libc::readlinkat(fd, c"".as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+            if got < 0 {
+                return Err(io_err("readlinkat", path, io::Error::last_os_error()));
+            }
+            let got = got as usize;
+            if got < buf.len() {
+                buf.truncate(got);
+                let target = String::from_utf8(buf).map_err(|_| StoreError::UnsupportedName {
+                    path: path.to_owned(),
+                })?;
+                if target.is_empty() || target.contains('\0') {
+                    return Err(StoreError::UnsupportedName {
+                        path: path.to_owned(),
+                    });
+                }
+                return Ok(target);
+            }
+            if cap >= MAX_SYMLINK_TARGET_BYTES {
+                return Err(io_err(
+                    "readlinkat",
+                    path,
+                    io::Error::new(io::ErrorKind::InvalidData, "symlink target exceeds limit"),
+                ));
+            }
+            cap = cap.saturating_mul(2).min(MAX_SYMLINK_TARGET_BYTES);
+        }
+    }
+
+    fn unsupported_kind_label(mode: libc::mode_t) -> &'static str {
+        match mode & libc::S_IFMT {
+            libc::S_IFIFO => "fifo",
+            libc::S_IFSOCK => "socket",
+            libc::S_IFCHR => "char device",
+            libc::S_IFBLK => "block device",
+            _ => "unknown",
+        }
+    }
+
+    fn open_entry_no_follow(
+        dir_fd: RawFd,
+        c_name: &CStr,
+        rel_path: &str,
+    ) -> Result<(File, libc::stat), StoreError> {
+        // SAFETY: dir_fd and c_name are live; O_NOFOLLOW | O_NONBLOCK prevents symlink
+        // traversal and blocking on FIFOs.
+        let fd = unsafe {
+            libc::openat(
+                dir_fd,
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: fd was returned by openat and is uniquely owned here.
+            let file = unsafe { File::from_raw_fd(fd) };
+            let st = fstat_fd(file.as_raw_fd(), "fstat", rel_path)?;
+            return Ok((file, st));
+        }
+
+        let open_err = io::Error::last_os_error();
+        if !matches!(
+            open_err.raw_os_error(),
+            Some(libc::ELOOP | libc::ENXIO | libc::EACCES | libc::EPERM)
+        ) {
+            return Err(io_err("openat", rel_path, open_err));
+        }
+
+        // symlinks fail O_NOFOLLOW with ELOOP; unix sockets fail with ENXIO; unreadable
+        // device nodes may fail with EACCES/EPERM. open with O_PATH to inspect via fstat.
+        // SAFETY: dir_fd and c_name are live; O_PATH | O_NOFOLLOW opens a path handle
+        // without opening the underlying device or following a symlink.
+        let path_fd = unsafe {
+            libc::openat(
+                dir_fd,
+                c_name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if path_fd < 0 {
+            return Err(io_err("openat", rel_path, open_err));
+        }
+        // SAFETY: path_fd was returned by openat and is uniquely owned here.
+        let file = unsafe { File::from_raw_fd(path_fd) };
+        let st = fstat_fd(file.as_raw_fd(), "fstat", rel_path)?;
+        let fmt = st.st_mode & libc::S_IFMT;
+        if fmt == libc::S_IFREG || fmt == libc::S_IFDIR {
+            // regular file or directory that failed O_RDONLY open (e.g. EACCES): report
+            // the original open error rather than treating the O_PATH fd as readable.
+            return Err(io_err("openat", rel_path, open_err));
+        }
+        Ok((file, st))
+    }
+
+    struct CapturedRecord {
+        entry: ManifestEntry,
+        /// `(st_dev, st_ino)` for regular files with `st_nlink > 1`, used to assign
+        /// deterministic `link_group` ids after sorting entries by path.
+        hardlink_inode: Option<(u64, u64)>,
+    }
+
+    struct DirFrame {
+        dir: File,
+        rel_prefix: String,
+        names: Vec<CString>,
+        next_idx: usize,
+    }
+
+    /// capture an exact, content-addressed snapshot of `workspace` into `store` at `step`.
+    ///
+    /// traverses only via `openat` relative to directory descriptors, never path strings
+    /// from the root. refuses symlinks traversal, cross-device entries, non-UTF-8 names or
+    /// symlink targets, FIFOs, sockets, devices, unsupported extended attributes, concurrent
+    /// file modifications, and any resource limit violation.
+    ///
+    /// objects are staged, hashed, fsynced, and atomically placed with `RENAME_NOREPLACE`
+    /// before the manifest is published. on any error, no manifest is published.
+    pub fn capture(
+        workspace: &File,
+        store: &File,
+        step: u64,
+        limits: &Limits,
+    ) -> Result<Published, StoreError> {
+        let ws_stat = fstat_fd(workspace.as_raw_fd(), "fstat", "<workspace>")?;
+        if !is_dir_mode(ws_stat.st_mode) {
+            return Err(StoreError::InvalidRoot);
+        }
+        let store_stat = fstat_fd(store.as_raw_fd(), "fstat", "<store>")?;
+        if !is_dir_mode(store_stat.st_mode) {
+            return Err(StoreError::InvalidStore);
+        }
+        let root_dev = ws_stat.st_dev;
+
+        let objects_dir = ensure_dir(store.as_raw_fd(), c"objects", "objects")?;
+        let manifests_dir = ensure_dir(store.as_raw_fd(), c"manifests", "manifests")?;
+        let staging_dir = ensure_dir(store.as_raw_fd(), c"staging", "staging")?;
+
+        let manifest_name = step_manifest_filename(step);
+        let c_manifest_name =
+            CString::new(manifest_name.as_str()).map_err(|_| StoreError::UnsupportedName {
+                path: format!("manifests/{manifest_name}"),
+            })?;
+        if fstatat_exists(
+            manifests_dir.as_raw_fd(),
+            &c_manifest_name,
+            "fstatat",
+            &format!("manifests/{manifest_name}"),
+        )? {
+            return Err(StoreError::ManifestExists { step });
+        }
+
+        let mut records: Vec<CapturedRecord> = Vec::new();
+        let mut stats = CaptureStats {
+            entries: 0,
+            files: 0,
+            dirs: 0,
+            symlinks: 0,
+            total_bytes: 0,
+            new_objects: 0,
+            reused_objects: 0,
+            store_growth: 0,
+        };
+        let mut hardlink_cache: HashMap<(u64, u64), (u64, String)> = HashMap::new();
+        let mut copy_buf = vec![0u8; COPY_BUF_LEN];
+
+        let root_names = DirStream::open_from_dir_fd(workspace.as_raw_fd(), "<workspace>")?
+            .read_names("<workspace>")?;
+        let mut stack: Vec<DirFrame> = Vec::new();
+        // handle root children using workspace's fd directly without taking ownership.
+        let mut root_idx = 0usize;
+
+        loop {
+            let (parent_fd, rel_prefix, c_name) = if let Some(frame) = stack.last_mut() {
+                if frame.next_idx >= frame.names.len() {
+                    stack.pop();
+                    continue;
+                }
+                let name = frame.names[frame.next_idx].clone();
+                frame.next_idx += 1;
+                (frame.dir.as_raw_fd(), frame.rel_prefix.clone(), name)
+            } else if root_idx < root_names.len() {
+                let name = root_names[root_idx].clone();
+                root_idx += 1;
+                (workspace.as_raw_fd(), String::new(), name)
+            } else {
+                break;
+            };
+
+            let name = match std::str::from_utf8(c_name.as_bytes()) {
+                Ok(s) => s,
+                Err(_) => {
+                    let lossy = String::from_utf8_lossy(c_name.as_bytes());
+                    return Err(StoreError::UnsupportedName {
+                        path: join_rel(&rel_prefix, &lossy),
+                    });
+                }
+            };
+            let rel_path = join_rel(&rel_prefix, name);
+
+            if records.len() as u64 >= limits.max_entries {
+                return Err(StoreError::EntryLimitExceeded {
+                    limit: limits.max_entries,
+                });
+            }
+
+            let (entry_file, st) = open_entry_no_follow(parent_fd, &c_name, &rel_path)?;
+            if st.st_dev != root_dev {
+                return Err(StoreError::CrossDevice { path: rel_path });
+            }
+
+            let mode = st.st_mode & 0o7777;
+            let uid = st.st_uid;
+            let gid = st.st_gid;
+            let mtime_sec = st.st_mtime;
+            let mtime_nsec = st.st_mtime_nsec;
+
+            match st.st_mode & libc::S_IFMT {
+                libc::S_IFREG => {
+                    let size = stat_size(&st, &rel_path)?;
+                    if size > limits.max_file_size {
+                        return Err(StoreError::FileSizeLimitExceeded {
+                            path: rel_path,
+                            size,
+                            limit: limits.max_file_size,
+                        });
+                    }
+                    let next_total = stats.total_bytes.checked_add(size).ok_or(
+                        StoreError::TotalBytesLimitExceeded {
+                            total: u64::MAX,
+                            limit: limits.max_total_bytes,
+                        },
+                    )?;
+                    if next_total > limits.max_total_bytes {
+                        return Err(StoreError::TotalBytesLimitExceeded {
+                            total: next_total,
+                            limit: limits.max_total_bytes,
+                        });
+                    }
+
+                    let xattrs = read_xattrs(entry_file.as_raw_fd(), &rel_path)?;
+                    let inode_key = (st.st_nlink > 1).then_some((st.st_dev, st.st_ino));
+
+                    let sha256 = if let Some(key) = inode_key
+                        && let Some((cached_size, cached_sha)) = hardlink_cache.get(&key)
+                    {
+                        if *cached_size != size {
+                            return Err(StoreError::ConcurrentModification { path: rel_path });
+                        }
+                        stats.reused_objects += 1;
+                        cached_sha.clone()
+                    } else {
+                        let sha = store_regular_file(
+                            entry_file,
+                            &st,
+                            size,
+                            &rel_path,
+                            &objects_dir,
+                            &staging_dir,
+                            limits,
+                            &mut stats,
+                            &mut copy_buf,
+                        )?;
+                        if let Some(key) = inode_key {
+                            hardlink_cache.insert(key, (size, sha.clone()));
+                        }
+                        sha
+                    };
+
+                    stats.files += 1;
+                    stats.total_bytes = next_total;
+                    records.push(CapturedRecord {
+                        entry: ManifestEntry {
+                            path: rel_path,
+                            kind: EntryKind::File,
+                            mode,
+                            uid,
+                            gid,
+                            mtime_sec,
+                            mtime_nsec,
+                            size: Some(size),
+                            sha256: Some(sha256),
+                            target: None,
+                            link_group: None,
+                            xattrs,
+                        },
+                        hardlink_inode: inode_key,
+                    });
+                }
+                libc::S_IFDIR => {
+                    let xattrs = read_xattrs(entry_file.as_raw_fd(), &rel_path)?;
+                    let child_names =
+                        DirStream::open_from_dir_fd(entry_file.as_raw_fd(), &rel_path)?
+                            .read_names(&rel_path)?;
+                    stats.dirs += 1;
+                    records.push(CapturedRecord {
+                        entry: ManifestEntry {
+                            path: rel_path.clone(),
+                            kind: EntryKind::Dir,
+                            mode,
+                            uid,
+                            gid,
+                            mtime_sec,
+                            mtime_nsec,
+                            size: None,
+                            sha256: None,
+                            target: None,
+                            link_group: None,
+                            xattrs,
+                        },
+                        hardlink_inode: None,
+                    });
+                    stack.push(DirFrame {
+                        dir: entry_file,
+                        rel_prefix: rel_path,
+                        names: child_names,
+                        next_idx: 0,
+                    });
+                }
+                libc::S_IFLNK => {
+                    let target =
+                        read_symlink_target(entry_file.as_raw_fd(), st.st_size, &rel_path)?;
+                    stats.symlinks += 1;
+                    records.push(CapturedRecord {
+                        entry: ManifestEntry {
+                            path: rel_path,
+                            kind: EntryKind::Symlink,
+                            mode,
+                            uid,
+                            gid,
+                            mtime_sec,
+                            mtime_nsec,
+                            size: None,
+                            sha256: None,
+                            target: Some(target),
+                            link_group: None,
+                            xattrs: BTreeMap::new(),
+                        },
+                        hardlink_inode: None,
+                    });
+                }
+                other => {
+                    return Err(StoreError::UnsupportedEntry {
+                        path: rel_path,
+                        kind: unsupported_kind_label(other),
+                    });
+                }
+            }
+        }
+
+        // sort deterministically by path, then assign link_group ids in path order for
+        // inodes shared by at least two captured regular-file entries.
+        records.sort_by(|a, b| a.entry.path.cmp(&b.entry.path));
+        let mut inode_counts: HashMap<(u64, u64), usize> = HashMap::new();
+        for rec in &records {
+            if let Some(key) = rec.hardlink_inode {
+                *inode_counts.entry(key).or_insert(0) += 1;
+            }
+        }
+        let mut group_ids: HashMap<(u64, u64), u64> = HashMap::new();
+        let mut next_group_id = 1u64;
+        let mut entries = Vec::with_capacity(records.len());
+        for mut rec in records {
+            if let Some(key) = rec.hardlink_inode
+                && inode_counts.get(&key).copied().unwrap_or(0) > 1
+            {
+                let id = *group_ids.entry(key).or_insert_with(|| {
+                    let id = next_group_id;
+                    next_group_id += 1;
+                    id
+                });
+                rec.entry.link_group = Some(id);
+            }
+            entries.push(rec.entry);
+        }
+
+        stats.entries = entries.len() as u64;
+        let manifest = Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            step,
+            totals: ManifestTotals {
+                entries: stats.entries,
+                files: stats.files,
+                dirs: stats.dirs,
+                symlinks: stats.symlinks,
+                total_bytes: stats.total_bytes,
+            },
+            entries,
+        };
+
+        let bytes = serde_json::to_vec(&manifest).map_err(|e| {
+            io_err(
+                "serialize manifest",
+                format!("manifests/{manifest_name}"),
+                io::Error::other(e),
+            )
+        })?;
+        let digest = manifest_digest(&bytes);
+
+        let (mut staged_manifest, staged_name) = create_staging_file(&staging_dir)?;
+        if let Err(err) = staged_manifest
+            .write_all(&bytes)
+            .and_then(|()| staged_manifest.sync_all())
+        {
+            drop(staged_manifest);
+            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+            return Err(io_err(
+                "write manifest",
+                format!("manifests/{manifest_name}"),
+                err,
+            ));
+        }
+        drop(staged_manifest);
+
+        let placed = match rename_noreplace(
+            staging_dir.as_raw_fd(),
+            &staged_name,
+            manifests_dir.as_raw_fd(),
+            &c_manifest_name,
+        ) {
+            Ok(placed) => placed,
+            Err(err) => {
+                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+                return Err(io_err(
+                    "renameat2",
+                    format!("manifests/{manifest_name}"),
+                    err,
+                ));
+            }
+        };
+        if !placed {
+            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+            return Err(StoreError::ManifestExists { step });
+        }
+
+        fsync_fd(
+            manifests_dir.as_raw_fd(),
+            "fsync",
+            &format!("manifests/{manifest_name}"),
+        )?;
+
+        Ok(Published {
+            manifest_digest: digest,
+            stats,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_regular_file(
+        mut src: File,
+        before_stat: &libc::stat,
+        size: u64,
+        rel_path: &str,
+        objects_dir: &File,
+        staging_dir: &File,
+        limits: &Limits,
+        stats: &mut CaptureStats,
+        copy_buf: &mut [u8],
+    ) -> Result<String, StoreError> {
+        let before_fp = FileFingerprint {
+            size,
+            mtime_sec: before_stat.st_mtime,
+            mtime_nsec: before_stat.st_mtime_nsec,
+        };
+        let (mut staged, staged_name) = create_staging_file(staging_dir)?;
+        let mut hasher = Sha256::new();
+        let mut bytes_read = 0u64;
+
+        loop {
+            let n = match src.read(copy_buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    drop(staged);
+                    unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+                    return Err(io_err("read", rel_path, e));
+                }
+            };
+            bytes_read = bytes_read.saturating_add(n as u64);
+            if bytes_read > size {
+                drop(staged);
+                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+                return Err(StoreError::ConcurrentModification {
+                    path: rel_path.to_owned(),
+                });
+            }
+            hasher.update(&copy_buf[..n]);
+            if let Err(e) = staged.write_all(&copy_buf[..n]) {
+                drop(staged);
+                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+                return Err(io_err("write staging", rel_path, e));
+            }
+        }
+
+        let after_stat = match fstat_fd(src.as_raw_fd(), "fstat", rel_path) {
+            Ok(st) => st,
+            Err(err) => {
+                drop(staged);
+                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+                return Err(err);
+            }
+        };
+        let after_size = match stat_size(&after_stat, rel_path) {
+            Ok(sz) => sz,
+            Err(err) => {
+                drop(staged);
+                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+                return Err(err);
+            }
+        };
+        let after_fp = FileFingerprint {
+            size: after_size,
+            mtime_sec: after_stat.st_mtime,
+            mtime_nsec: after_stat.st_mtime_nsec,
+        };
+        if let Err(err) = check_file_unchanged(rel_path, before_fp, after_fp, bytes_read) {
+            drop(staged);
+            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+            return Err(err);
+        }
+
+        if let Err(e) = staged.sync_all() {
+            drop(staged);
+            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+            return Err(io_err("fsync staging", rel_path, e));
+        }
+        drop(staged);
+
+        let sha256_hex = hex_encode(&hasher.finalize());
+        let bucket = &sha256_hex[..2];
+        let c_bucket =
+            CString::new(bucket).map_err(|_| StoreError::InvalidDigest(sha256_hex.clone()))?;
+        let c_hash = CString::new(sha256_hex.as_str())
+            .map_err(|_| StoreError::InvalidDigest(sha256_hex.clone()))?;
+
+        let bucket_path = format!("objects/{bucket}");
+        let object_path = format!("objects/{bucket}/{sha256_hex}");
+        let bucket_dir = match ensure_dir(objects_dir.as_raw_fd(), &c_bucket, &bucket_path) {
+            Ok(dir) => dir,
+            Err(err) => {
+                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+                return Err(err);
+            }
+        };
+
+        let already_exists =
+            match fstatat_exists(bucket_dir.as_raw_fd(), &c_hash, "fstatat", &object_path) {
+                Ok(exists) => exists,
+                Err(err) => {
+                    unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+                    return Err(err);
+                }
+            };
+        if already_exists {
+            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+            stats.reused_objects += 1;
+            return Ok(sha256_hex);
+        }
+
+        let next_growth = stats.store_growth.checked_add(bytes_read).ok_or(
+            StoreError::StoreGrowthLimitExceeded {
+                growth: u64::MAX,
+                limit: limits.max_store_growth,
+            },
+        );
+        let next_growth = match next_growth {
+            Ok(g) if g <= limits.max_store_growth => g,
+            Ok(g) => {
+                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+                return Err(StoreError::StoreGrowthLimitExceeded {
+                    growth: g,
+                    limit: limits.max_store_growth,
+                });
+            }
+            Err(err) => {
+                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+                return Err(err);
+            }
+        };
+
+        let placed = match rename_noreplace(
+            staging_dir.as_raw_fd(),
+            &staged_name,
+            bucket_dir.as_raw_fd(),
+            &c_hash,
+        ) {
+            Ok(placed) => placed,
+            Err(err) => {
+                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+                return Err(io_err("renameat2", &object_path, err));
+            }
+        };
+        if placed {
+            fsync_fd(bucket_dir.as_raw_fd(), "fsync", &bucket_path)?;
+            stats.new_objects += 1;
+            stats.store_growth = next_growth;
+        } else {
+            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+            stats.reused_objects += 1;
+        }
+
+        Ok(sha256_hex)
+    }
+
+    /// load and validate the committed manifest for `step` from `store`.
+    ///
+    /// returns the parsed `Manifest` along with the lowercase hex SHA-256 digest of the
+    /// exact bytes read from disk. refuses symlinks, non-regular files, manifests larger
+    /// than `MANIFEST_READ_CAP`, malformed JSON/invariants, and step-number mismatches.
+    pub fn load_manifest(store: &File, step: u64) -> Result<(Manifest, String), StoreError> {
+        let store_stat = fstat_fd(store.as_raw_fd(), "fstat", "<store>")?;
+        if !is_dir_mode(store_stat.st_mode) {
+            return Err(StoreError::InvalidStore);
+        }
+
+        let manifests_dir = openat_dir(store.as_raw_fd(), c"manifests", "manifests")?;
+        let name = step_manifest_filename(step);
+        let rel = format!("manifests/{name}");
+        let c_name = CString::new(name.as_str())
+            .map_err(|_| StoreError::UnsupportedName { path: rel.clone() })?;
+
+        // SAFETY: manifests_dir and c_name are live; O_NOFOLLOW | O_NONBLOCK prevents
+        // symlink traversal and FIFO blocking.
+        let fd = unsafe {
+            libc::openat(
+                manifests_dir.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                return Err(StoreError::InvalidManifest {
+                    reason: format!("{rel} is a symlink"),
+                });
+            }
+            return Err(io_err("openat", &rel, err));
+        }
+        // SAFETY: fd was returned by openat and is uniquely owned here.
+        let file = unsafe { File::from_raw_fd(fd) };
+
+        let st = fstat_fd(file.as_raw_fd(), "fstat", &rel)?;
+        if !is_reg_mode(st.st_mode) {
+            return Err(StoreError::InvalidManifest {
+                reason: format!("{rel} is not a regular file"),
+            });
+        }
+        let size = stat_size(&st, &rel)?;
+        if size > MANIFEST_READ_CAP {
+            return Err(StoreError::ManifestTooLarge {
+                step,
+                limit: MANIFEST_READ_CAP,
+            });
+        }
+
+        let mut bytes = Vec::new();
+        file.take(MANIFEST_READ_CAP + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| io_err("read", &rel, e))?;
+        if bytes.len() as u64 > MANIFEST_READ_CAP {
+            return Err(StoreError::ManifestTooLarge {
+                step,
+                limit: MANIFEST_READ_CAP,
+            });
+        }
+
+        let manifest = parse_manifest(&bytes)?;
+        if manifest.step != step {
+            return Err(StoreError::InvalidManifest {
+                reason: format!(
+                    "manifest step {} does not match requested step {step}",
+                    manifest.step
+                ),
+            });
+        }
+
+        let digest = manifest_digest(&bytes);
+        Ok((manifest, digest))
+    }
+
+    /// open a content-addressed object by `sha256_hex`, verify its integrity, and return
+    /// a handle rewound to offset 0.
+    ///
+    /// rejects malformed digests (`InvalidDigest`), symlinks and non-regular files
+    /// (`InvalidObject`), and content whose SHA-256 differs from `sha256_hex`
+    /// (`ObjectCorrupt`).
+    pub fn verify_object(store: &File, sha256_hex: &str) -> Result<File, StoreError> {
+        if !is_valid_sha256_hex(sha256_hex) {
+            return Err(StoreError::InvalidDigest(sha256_hex.to_owned()));
+        }
+        let store_stat = fstat_fd(store.as_raw_fd(), "fstat", "<store>")?;
+        if !is_dir_mode(store_stat.st_mode) {
+            return Err(StoreError::InvalidStore);
+        }
+
+        let objects_dir = openat_dir(store.as_raw_fd(), c"objects", "objects")?;
+        let bucket = &sha256_hex[..2];
+        let bucket_path = format!("objects/{bucket}");
+        let object_path = format!("objects/{bucket}/{sha256_hex}");
+        let c_bucket =
+            CString::new(bucket).map_err(|_| StoreError::InvalidDigest(sha256_hex.to_owned()))?;
+        let c_hash = CString::new(sha256_hex)
+            .map_err(|_| StoreError::InvalidDigest(sha256_hex.to_owned()))?;
+
+        let bucket_dir = openat_dir(objects_dir.as_raw_fd(), &c_bucket, &bucket_path)?;
+        // SAFETY: bucket_dir and c_hash are live; O_NOFOLLOW | O_NONBLOCK refuses symlinks
+        // and avoids blocking on FIFOs.
+        let fd = unsafe {
+            libc::openat(
+                bucket_dir.as_raw_fd(),
+                c_hash.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                return Err(StoreError::InvalidObject {
+                    digest: sha256_hex.to_owned(),
+                    reason: "object is a symlink",
+                });
+            }
+            return Err(io_err("openat", &object_path, err));
+        }
+        // SAFETY: fd was returned by openat and is uniquely owned here.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+
+        let st = fstat_fd(file.as_raw_fd(), "fstat", &object_path)?;
+        if !is_reg_mode(st.st_mode) {
+            return Err(StoreError::InvalidObject {
+                digest: sha256_hex.to_owned(),
+                reason: "object is not a regular file",
+            });
+        }
+
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; COPY_BUF_LEN];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(io_err("read", &object_path, e)),
+            }
+        }
+
+        let actual = hex_encode(&hasher.finalize());
+        if actual != sha256_hex {
+            return Err(StoreError::ObjectCorrupt {
+                expected: sha256_hex.to_owned(),
+                actual,
+            });
+        }
+
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| io_err("seek", &object_path, e))?;
+        Ok(file)
+    }
+
+    /// list all committed step numbers present in `manifests/`, sorted ascending.
+    ///
+    /// returns an empty list if `manifests/` does not exist yet. ignores any entry whose
+    /// filename does not match `parse_step_filename`.
+    pub fn committed_steps(store: &File) -> Result<Vec<u64>, StoreError> {
+        let store_stat = fstat_fd(store.as_raw_fd(), "fstat", "<store>")?;
+        if !is_dir_mode(store_stat.st_mode) {
+            return Err(StoreError::InvalidStore);
+        }
+
+        // SAFETY: store is a live directory descriptor; openat returns a fresh owned fd.
+        let fd = unsafe {
+            libc::openat(
+                store.as_raw_fd(),
+                c"manifests".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(Vec::new());
+            }
+            return Err(io_err("openat", "manifests", err));
+        }
+
+        let mut stream = DirStream::from_owned_fd(fd, "manifests")?;
+        let names = stream.read_names("manifests")?;
+        let mut steps = Vec::new();
+        for c_name in names {
+            if let Ok(name) = c_name.to_str()
+                && let Some(step) = parse_step_filename(name)
+            {
+                steps.push(step);
+            }
+        }
+        steps.sort_unstable();
+        Ok(steps)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
