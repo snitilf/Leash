@@ -139,10 +139,10 @@ fn the_agent_tree_is_in_the_run_cgroup_and_the_supervisor_and_broker_are_not() {
         sup = {supervisor:?}\n\
         def cg(pid):\n\
         \x20   return open('/proc/%s/cgroup' % pid).read().split('0::')[1].strip()\n\
-        me = cg('self')\n\
+        me = cg(os.getpid())\n\
         assert me != sup and me.rsplit('/', 1)[1].startswith('leash-'), (me, sup)\n\
         assert me.rsplit('/', 1)[0] in (sup, ''), (me, sup)\n\
-        kid = subprocess.check_output(['/bin/cat', '/proc/self/cgroup']).decode()\n\
+        kid = subprocess.check_output(['/bin/sh', '-c', 'cat /proc/$$/cgroup']).decode()\n\
         assert kid.split('0::')[1].strip() == me, 'a descendant inherits the cgroup'\n\
         sup_pid = os.getppid()\n\
         assert cg(sup_pid) == sup, 'the supervisor stays outside'\n\
@@ -383,15 +383,17 @@ fn the_attach_descriptor_and_run_lock_do_not_survive_into_the_agent() {
     let session = Session::new();
     let run = session
         .python(
+            // fstat answers for the agent's own descriptors; /proc/self would be resolved in
+            // the broker, not here
             "import os\n\
-            for fd in os.listdir('/proc/self/fd'):\n\
+            open_fds = []\n\
+            for fd in range(3, 1024):\n\
             \x20   try:\n\
-            \x20       target = os.readlink('/proc/self/fd/' + fd)\n\
+            \x20       os.fstat(fd)\n\
             \x20   except OSError:\n\
             \x20       continue\n\
-            \x20   assert 'cgroup' not in target and 'leash-' not in target, (fd, target)\n\
-            \x20   assert not target.endswith('run.lock'), (fd, target)\n\
-            \x20   assert int(fd) <= 2 or target.startswith('/proc'), (fd, target)\n",
+            \x20   open_fds.append(fd)\n\
+            assert not open_fds, open_fds\n",
         )
         .unwrap();
     run.assert_exit_zero();
@@ -411,7 +413,7 @@ fn the_agent_cannot_write_cgroup_procs_or_freeze_under_the_default_policy() {
     let script = format!(
         "import os\n\
         sup = '/sys/fs/cgroup' + {supervisor:?}\n\
-        me = '/sys/fs/cgroup' + open('/proc/self/cgroup').read().split('0::')[1].strip()\n\
+        me = '/sys/fs/cgroup' + open('/proc/%d/cgroup' % os.getpid()).read().split('0::')[1].strip()\n\
         for directory in (me, sup):\n\
         \x20   for name in ('cgroup.procs', 'cgroup.freeze', 'cgroup.kill'):\n\
         \x20       try:\n\
