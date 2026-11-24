@@ -75,6 +75,21 @@ bare value. The response column states how an allow is realized; the rule behind
 | `openat`, `openat2` | yes | path + access mode (pointer) | `ADDFD`: confined broker opens the resolved path, supervisor injects the returned fd | `FS_READ_FILE` / `FS_WRITE_FILE`, or `FS_READ_DIR` for a directory |
 | `open`, `creat` | no (x86-64 legacy only) | path + access mode (pointer) | `ADDFD` | same |
 
+`O_PATH` opens are realized as a read-only descriptor, not an `O_PATH` one.
+`SECCOMP_IOCTL_NOTIF_ADDFD` cannot inject an `O_PATH` descriptor: the kernel looks the source up with `fget`, which rejects `FMODE_PATH` files with `EBADF` (issue #53, observed on kernel 6.8 with coreutils `mv dir existing-dir`).
+`CONTINUE` is not an option, because it would make the kernel re-resolve a path the agent can swap (ADR-0020).
+So the broker reopens the same pinned object `O_RDONLY` through `/proc/self/fd` and the supervisor injects that.
+The policy already evaluated the open as a read of that object, so the substitute grants no access the decision did not.
+Only directories and regular files are substituted.
+A fifo, device, socket, or symlink opened with `O_PATH` is refused with `EACCES`, because a read-only open of those can block the broker or have side effects, and a symlink cannot be reopened without following it.
+The agent sees a descriptor that is readable where `O_PATH` would not be, and it works as a `dirfd` for the `*at` calls.
+An object whose mode denies the broker a read-only open fails with that open's errno.
+
+An `ADDFD` the kernel refuses (for example `EMFILE` when the agent's descriptor table is full) fails only that syscall.
+The agent receives the same errno for `EMFILE`, `ENFILE`, and `ENOMEM`, and `EIO` for anything else.
+The trace gets a second event for the syscall with `failsafe:realization`, decision `deny`, and the errno the agent received.
+Only a failure of the notify fd itself ends the loop.
+
 ### 3.2 Filesystem mutation (no fd returned)
 
 | Syscall | Also on ARM64 | Decision basis | Allow realized by | Landlock backstop |
