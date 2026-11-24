@@ -67,15 +67,15 @@ The human-readable summary produced at the end of a **run** (FR-5): the files to
 _Avoid_: run report, summary (the canonical compound is "session report")
 
 **Snapshot**:
-The captured state of the workspace at a **step** boundary, enabling rewind and diff. Implemented over the workspace's write layer.
+The supported filesystem state of the workspace captured at a **step** boundary, enabling rewind and diff. Exactness requires exclusive workspace ownership and a completed capture barrier (ADR-0022); it does not include process state or application transactions.
 _Avoid_: checkpoint, backup
 
 **Step**:
-One coalesced burst of the child's mediated filesystem writes; steps partition a run, and a snapshot is captured at each step boundary (FR-17). Rewind targets are step boundaries.
+One coalesced burst of the child's mediated filesystem writes; event quiescence proposes a boundary whose snapshot requires a completed capture barrier (FR-17, ADR-0022). Writes through existing descriptors or mappings need not produce their own steps; rewind targets committed step boundaries.
 _Avoid_: tick, frame
 
 **Rewind**:
-Restoring the workspace to an earlier snapshot. Reverses *effects on the filesystem*; it does **not** re-run the agent.
+Restoring the supported workspace filesystem state to an earlier snapshot, offline under exclusive ownership (ADR-0022). Reverses *effects on the filesystem*; it does **not** re-run the agent.
 _Avoid_: replay (forbidden — implies deterministic re-execution of the model, which Leash never does), rollback, undo (informal only)
 
 **Diff** (of runs):

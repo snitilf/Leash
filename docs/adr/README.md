@@ -55,4 +55,6 @@ Numbering: scan this directory for the highest number, increment by one.
 | [0020](0020-confined-realizer-and-socket-duplication.md) | Confined broker realization and child-socket duplication | accepted |
 | [0021](0021-accept-wait-killable-recv-post-send-race.md) | Accept the residual WAIT_KILLABLE_RECV post-SEND race | accepted |
 
+| [0022](0022-exact-snapshot-capture-barrier.md) | Exact snapshots require exclusive ownership and a capture barrier | accepted; implementation pending |
+
 These encode the project's load-bearing decisions. They are the committed, authoritative source.

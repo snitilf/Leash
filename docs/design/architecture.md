@@ -18,8 +18,9 @@ holding the notification fd, decides allow / deny / **ask**, records an **event*
 lets the kernel proceed. **Landlock** adds a second, kernel-enforced boundary in **enforce** mode,
 applied by the child before it execs the agent: a filesystem boundary always, and a network-port
 boundary where the running ABI supports it (ADR-0003, ADR-0013). It holds even where the decision
-logic has a gap. In **record-only** mode nothing is enforced, so no Landlock ruleset is applied
-(ADR-0010).
+logic has a gap. **Record-only** applies no general policy enforcement (ADR-0010).
+Snapshot-enabled runs in either mode additionally require the integrity protections of
+ADR-0022; their implementation and validation remain pending.
 
 ```
   leash (supervisor, trusted)              child (agent + whole process tree, untrusted)
@@ -63,17 +64,17 @@ by ID. ADR-0002 already refers to I2 by this number; the full list is fixed here
   (FR-1, FR-4, SR-2.)
 - **I2** - The supervisor is the sole author of the **trace** and the sole owner of the decision
   path. In **enforce** mode the child is denied the state directory by both layers (FR-3, FR-21), so
-  it can never read, mutate, delay, or block the trace. In **record-only** mode no Landlock ruleset
-  is applied (nothing is enforced, ADR-0010), so trace integrity rests on filesystem permissions: the
-  state directory lies outside the **workspace** with restrictive permissions, but a hostile same-uid
-  child is not defended against. This matches the spec, which scopes state-directory denial to enforce
-  mode (FR-21), and matches record-only being a camera, not a bouncer; the residual is named in
-  [`escapes.md`](escapes.md). (FR-3, FR-21, ADR-0002.)
+  the policy boundary protects the trace. Ordinary **record-only** trace integrity still
+  rests on filesystem permissions and does not resist hostile same-uid tampering. Exact
+  snapshot-enabled runs in both modes additionally require verified protection of retained
+  baselines, captures and authoritative metadata (ADR-0022, FR-21); these controls remain
+  pending. The distinction and residual are named in [`escapes.md`](escapes.md).
+
 - **I3** - Every decision **fails closed**. Any supervisor error, crash, or decision timeout
   resolves the pending action to deny; the child never gets a default-allow. One arc is scoped by
   mode, the same way I2 is: where the supervisor cannot decode a network address from the trapped
   `sockaddr`, **enforce** denies, while **record-only** records the attempt with no destination and
-  continues, because record-only enforces nothing outside the denied-and-recorded set (ADR-0010,
+  continues, because record-only applies no general network policy enforcement (ADR-0010,
   ADR-0019, and FR-9 as it scopes this arc). That arc is the only one scoped by mode. Every other
   arc denies in both modes: an undecodable filesystem or process-creation fact, a recorder-write
   failure, a crash, a decision timeout, and the denied-and-recorded set (SR-4, whose members are
@@ -126,23 +127,29 @@ claim, and refuses to run rather than silently degrade (FR-14). Preflight bundle
   6.2), TCP connect/bind (`NET_*`) from ABI 4 (Linux 6.7). The floor guarantees ABI 2; anything above
   it is probed, and the degrade table fixes what happens when a backstop the policy could use is
   above the running ABI.
-- **Overlay support.** Whether an overlay mount is available (privileged mount, or an unprivileged
-  user namespace) selects the snapshot mechanism: overlay if available, plain-copy fallback
-  otherwise (ADR-0009). The probe distinguishes a kernel that lacks overlay from a host that merely
-  restricts unprivileged user namespaces (for example stock Ubuntu 24.04 with
-  `apparmor_restrict_unprivileged_userns=1`, confirmed by the M0 spike): the latter still supports a
-  privileged overlay mount, so a privileged run gets overlay and only an unprivileged run on such a
-  host falls to the copy fallback. The selected mechanism, and the reason for it, is stamped into the
-  trace.
+- **Snapshot prerequisites.** ADR-0022 requires usable delegated cgroup v2, verified
+  freezer completion, whole-tree termination, and protection against child migration and
+  control-plane writes before a snapshot-enabled run starts. Retained baselines, snapshot
+  data and authoritative metadata must also be protected from same-uid child mutation. Both modes require these
+  integrity controls. Missing support refuses before spawn; unfrozen copy is not a fallback.
+  ADR-0022 selects a separately provisioned, distinct-host-UID snapshot custodian as the
+  storage-protection direction, with private capability-based control and refusal when
+  unavailable. It must protect canonical state across runs; operator-owned indexes and
+  exports are not authoritative. Implementation and adversarial validation remain pending.
+- **Snapshot backend.** Copy is the initial backend under ADR-0022. Overlay support alone
+  does not enable overlay: its complete mount, capture, retained-baseline and offline restore
+  lifecycle must pass equivalence tests first. The selected backend and reason are stamped
+  into run metadata. Both backends require the same capture barrier.
 
-Landlock backstop degrade table. Record-only applies no Landlock at all (nothing is enforced,
-ADR-0010); the table is about which backstop the enforce-mode ruleset can carry at a given ABI. Per
+
+Landlock backstop degrade table. Record-only applies no general policy Landlock ruleset (ADR-0010;
+snapshot integrity prerequisites are separately specified by ADR-0022); the table is about which backstop the enforce-mode ruleset can carry at a given ABI. Per
 ADR-0013 the seccomp layer is the primary decision layer, so a missing backstop degrades to
 seccomp-only with a named residual, it does not refuse the run:
 
 | Backstop | Needs | Record-only | Enforce |
 |---|---|---|---|
-| Landlock ruleset at all | - | not applied | applied |
+| General policy Landlock ruleset | - | not applied | applied |
 | Filesystem access + cross-dir rename/link | ABI 2 (floor guarantees) | not applied | applied |
 | Truncation | ABI 3 (Linux 6.2) | not applied | applied where present; below, seccomp mediates `truncate` and the missing backstop is stamped as a residual |
 | Network port | ABI 4 (Linux 6.7) | not applied | applied where present; below, seccomp enforces the port and the missing backstop is stamped |
@@ -159,8 +166,11 @@ seccomp layer mediates the relevant syscalls for the trace in both modes regardl
 The ordering is forced by the kernel API and by the invariants; each step precedes the next for a
 stated reason.
 
-1. Supervisor prepares the per-run directory in the state directory and mounts the overlay write
-   layer over the workspace (or selects the copy fallback). (FR-21, ADR-0009.)
+1. Supervisor prepares the per-run directory and selected snapshot backend. Snapshot-enabled
+   runs must establish the ADR-0022 prerequisites and initial capture before spawn (FR-21).
+   The run cgroup must contain the child before untrusted execution; descendants inherit
+   membership, while the supervisor remains outside. This lifecycle is required design,
+   not a claim that the current spawn path implements it.
 2. Supervisor creates a socketpair for the notify-fd handoff, then forks the child.
 3. Child installs the seccomp filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER` and
    `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`, which prevents a non-fatal signal from cancelling a
@@ -174,7 +184,8 @@ stated reason.
    waits for the supervisor to acknowledge that it holds the fd and is ready to serve.
 5. In **enforce** mode the child applies the Landlock ruleset granting exactly the workspace, the
    explicitly allowed paths, and the TCP port backstop for allowed hosts (ADR-0003, ADR-0013). In
-   **record-only** mode this step is skipped: nothing is enforced (ADR-0010). Landlock is applied by
+   **record-only** mode the general policy ruleset is skipped (ADR-0010); ADR-0022 snapshot integrity
+   restrictions remain prerequisites. Landlock is applied by
    the child, pre-exec, because a process can only restrict itself and its descendants. The child
    then sends a second handshake byte, and the parent does not return from spawn until that byte
    confirms every pre-exec boundary was installed.
@@ -192,13 +203,18 @@ The supervisor serves the notify fd on a single decision thread (ADR-0011): rece
 notification, validate it, gather facts, evaluate the policy, record the event, respond, repeat.
 The protocol, the fact-gathering rules, and the complete fail-closed enumeration are in
 [`notify-loop.md`](notify-loop.md). Filesystem-write events feed **step** detection and snapshot
-capture ([`snapshot.md`](snapshot.md)).
+capture ([`snapshot.md`](snapshot.md)). Event silence is only a scheduling heuristic.
+The ADR-0022 boundary stops broker mutation dispatch, completes outstanding broker work,
+waits for verified whole-cgroup freeze and asynchronous-I/O quiescence, then captures and
+publishes before thawing. These pending requirements apply to both backends.
 
 ### 5.4 Shutdown
 
-When the agent process tree exits (or the run is aborted), the supervisor reaps the tree, captures
-the final snapshot at the run-end **step** boundary (FR-17), writes the run-end event, finalizes the
-trace, and emits the human-readable **session report** (FR-5). The active mode is named in the report
+A successful final capture requires the entire run cgroup to be empty, including descendants
+that outlive the initial child (ADR-0022, implementation pending). On abort, terminate the
+whole cgroup and deny pending decisions; never report an incomplete capture as a successful
+final boundary. After a successful final capture, write the run-end event, finalize the
+trace, and emit the human-readable **session report** (FR-5). The active mode is named in the report
 (FR-19). Teardown of the overlay mount is part of shutdown; the captured snapshots persist under the
 run directory (FR-21).
 
