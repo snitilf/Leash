@@ -228,7 +228,7 @@ t ls "$STATE"
 t ls "$STATE/runs"
 t ls "$PREV"
 t ls "$LIVE"
-cd "$STATE/runs" 2>/dev/null && t ls .
+cd "$STATE/runs" && t ls .
 exit 0
 "#,
     );
@@ -282,7 +282,7 @@ t mv "$PREV" "$ROOT/moved"
 t rm -rf "$PREV"
 t mv "$ROOT/p" "$ROOT/p2"
 t rmdir "$ROOT/p"
-t mv "$ROOT/other" "$ROOT/p"
+t mv -T "$ROOT/other" "$ROOT/p"
 t mv "$STATE" "$ROOT/state2"
 t rm -rf "$STATE"
 t mv "$WS/file" "$STATE/x"
