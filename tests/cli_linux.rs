@@ -1294,6 +1294,7 @@ fn enforce_session_without_a_resolvable_state_root_refuses_before_spawn() {
             argv: argv.clone(),
             workspace: ws.path().to_path_buf(),
             start_ts: 1,
+            run_cgroup: None,
         };
         let run_dir =
             leash::recorder::RunDir::create(state.path(), &meta, std::time::SystemTime::now())
