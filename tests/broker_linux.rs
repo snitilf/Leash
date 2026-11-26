@@ -349,21 +349,32 @@ fn production_broker_preserves_o_path_directory_validation() {
 
 /// issue #53: SECCOMP_IOCTL_NOTIF_ADDFD refuses an O_PATH source descriptor (the kernel's
 /// fget rejects FMODE_PATH files with EBADF), so the broker answers an O_PATH open with a
-/// read-only descriptor on the same pinned object instead.
+/// read-only descriptor on the same pinned object instead. a kind it cannot reopen safely
+/// is refused with EOPNOTSUPP. whether the agent's descriptor is close-on-exec is set by
+/// the ADDFD, not this descriptor, and is covered end to end in cli_linux.
 #[test]
 fn production_broker_realizes_o_path_as_a_read_only_descriptor() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+
     let _guard = fork_guard();
     let workspace = tempfile::tempdir().unwrap();
     let dir = workspace.path().join("dir");
     std::fs::create_dir(&dir).unwrap();
     let file = workspace.path().join("regular-file");
     std::fs::write(&file, b"data").unwrap();
+    let link = workspace.path().join("link-to-file");
+    // relative, so the workspace anchor (RESOLVE_BENEATH) can follow it
+    symlink("regular-file", &link).unwrap();
     let fifo = workspace.path().join("fifo");
     let fifo_c = CString::new(fifo.to_str().unwrap()).unwrap();
     // SAFETY: fifo_c is a valid nul-terminated path.
     assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    let socket = workspace.path().join("socket");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    // the hull must reach /dev/null for the device case to get past path preparation
     let policy = Policy::parse(
-        "schema_version = 1\n",
+        "schema_version = 1\n\
+         [[fs]]\npath=\"/dev/null\"\nmode=[\"read\"]\naction=\"allow\"\n",
         &ExpandContext {
             workspace: workspace.path().to_str().unwrap(),
             home: "/tmp",
@@ -373,22 +384,18 @@ fn production_broker_realizes_o_path_as_a_read_only_descriptor() {
     let prepared_ruleset = landlock::prepare_ruleset(&landlock::derive_hull(&policy, 4)).unwrap();
     let mut broker = Broker::spawn(&prepared_ruleset, workspace.path()).unwrap();
     let o_path = u64::try_from(libc::O_PATH | libc::O_CLOEXEC).unwrap();
+    let o_nofollow = u64::try_from(libc::O_NOFOLLOW).unwrap();
     let mut open = |path: &Path, flags: u64| {
-        let prepared = match broker.prepare_path(path, true, false).unwrap() {
-            BrokerResultOrPath::Path(path) => path,
-            other => panic!("expected prepared path, got {other:?}"),
-        };
+        let prepared = prepare_path(&mut broker, path, flags & o_nofollow == 0, false);
         broker.commit_open(prepared, flags, 0).unwrap()
     };
 
-    for (path, flags, is_dir) in [
-        (
-            &dir,
-            o_path | u64::try_from(libc::O_DIRECTORY).unwrap(),
-            true,
-        ),
-        (&dir, o_path, true),
-        (&file, o_path, false),
+    for (path, flags) in [
+        (&dir, o_path | u64::try_from(libc::O_DIRECTORY).unwrap()),
+        (&dir, o_path),
+        (&file, o_path),
+        // without O_NOFOLLOW the link is followed to the regular file
+        (&link, o_path),
     ] {
         let BrokerResult::Fd(fd) = open(path, flags) else {
             panic!("O_PATH open of {path:?} must yield a descriptor");
@@ -398,18 +405,54 @@ fn production_broker_realizes_o_path_as_a_read_only_descriptor() {
         assert!(status >= 0);
         assert_eq!(status & libc::O_PATH, 0, "must not be an O_PATH file");
         assert_eq!(status & libc::O_ACCMODE, libc::O_RDONLY);
-        // SAFETY: fd is live and the flag read is a plain query.
-        let fd_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
-        assert_ne!(fd_flags & libc::FD_CLOEXEC, 0, "O_CLOEXEC is preserved");
-        let metadata = std::fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
-        assert_eq!(metadata.is_dir(), is_dir);
+        // the substitute is the very object the policy judged, not a re-resolved path
+        let mut stat: libc::stat = unsafe { zeroed() };
+        // SAFETY: fd is live and stat points to writable local storage.
+        assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), &raw mut stat) }, 0);
+        let expected = std::fs::metadata(path).unwrap();
+        assert_eq!(
+            (stat.st_dev, stat.st_ino),
+            (expected.dev(), expected.ino()),
+            "{path:?}"
+        );
     }
 
-    // a node whose read-only open can block or has side effects is refused, not opened
-    match open(&fifo, o_path) {
-        BrokerResult::Errno(errno) => assert_eq!(errno, libc::EACCES),
-        other => panic!("expected EACCES for a fifo, got {other:?}"),
+    // a kind whose read-only open can block, has side effects, or cannot be reopened
+    // without following a symlink is refused, not opened
+    let dev_null = Path::new("/dev/null");
+    for (path, flags, kind) in [
+        (&link, o_path | o_nofollow, "symlink under O_NOFOLLOW"),
+        (&fifo, o_path, "fifo"),
+        (&socket, o_path, "unix socket"),
+        (&dev_null.to_path_buf(), o_path, "character device"),
+    ] {
+        match open(path, flags) {
+            BrokerResult::Errno(errno) => assert_eq!(errno, libc::EOPNOTSUPP, "{kind}"),
+            other => panic!("expected EOPNOTSUPP for a {kind}, got {other:?}"),
+        }
     }
+
+    // O_PATH honors only O_DIRECTORY, O_NOFOLLOW, and O_CLOEXEC: a stray O_CREAT creates
+    // nothing and O_TRUNC truncates nothing
+    let missing = workspace.path().join("missing");
+    match broker.prepare_path(&missing, true, true).unwrap() {
+        BrokerResultOrPath::Path(prepared) => {
+            let flags = o_path | u64::try_from(libc::O_CREAT | libc::O_WRONLY).unwrap();
+            match broker.commit_open(prepared, flags, 0o600).unwrap() {
+                BrokerResult::Errno(errno) => assert_eq!(errno, libc::ENOENT),
+                other => panic!("expected ENOENT, got {other:?}"),
+            }
+        }
+        other => panic!("expected prepared path, got {other:?}"),
+    }
+    assert!(!missing.exists(), "O_PATH | O_CREAT must not create");
+    let prepared = prepare_path(&mut broker, &file, true, false);
+    let flags = o_path | u64::try_from(libc::O_TRUNC | libc::O_WRONLY).unwrap();
+    assert!(matches!(
+        broker.commit_open(prepared, flags, 0).unwrap(),
+        BrokerResult::Fd(_)
+    ));
+    assert_eq!(std::fs::read(&file).unwrap(), b"data", "O_TRUNC is ignored");
 }
 
 #[test]

@@ -872,7 +872,8 @@ fn open_existing(target: BorrowedFd<'_>, flags: u64, _mode: u32) -> io::Result<O
 /// returns a read-only descriptor on the same pinned object. the policy already evaluated
 /// the open as a read of that object, so no authority is added. only directories and regular
 /// files are substituted: a read-only open of a fifo can block the broker and one of a device
-/// can have side effects, and a symlink cannot be reopened without following it.
+/// can have side effects, and a symlink cannot be reopened without following it. those kinds
+/// are refused with EOPNOTSUPP, which the supervisor records as a realization failure.
 fn open_path_substitute(target: BorrowedFd<'_>, flags: u64) -> io::Result<OwnedFd> {
     let mut stat: libc::stat = unsafe { zeroed() };
     // SAFETY: target is a live descriptor and stat points to writable local storage.
@@ -886,7 +887,7 @@ fn open_path_substitute(target: BorrowedFd<'_>, flags: u64) -> io::Result<OwnedF
     let reopen_flags = match kind {
         libc::S_IFDIR => libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         libc::S_IFREG => libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC,
-        _ => return Err(io::Error::from_raw_os_error(libc::EACCES)),
+        _ => return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
     };
     let path = CString::new(format!("/proc/self/fd/{}", target.as_raw_fd()))
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
