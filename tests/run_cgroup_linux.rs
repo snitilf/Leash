@@ -19,9 +19,11 @@
 
 mod common;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::io::{self, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -159,10 +161,11 @@ fn recorded_cgroup(run: &RunResult) -> PathBuf {
     )
 }
 
-/// watches direct children of `parent` from outside the sandbox and records each observed
-/// `(pid, cgroup_path)` pair. `/proc/<pid>/status` and `/proc/<pid>/cgroup` are world-readable
-/// even for non-dumpable processes, whereas inside the sandbox `implicit:supervisor_proc`
-/// denies the agent access to the supervisor's and broker's `/proc/<pid>` trees.
+/// watches `parent` (the supervisor) and its direct children from outside the sandbox and
+/// records each observed `(pid, cgroup_path)` pair. `/proc/<pid>/status` and
+/// `/proc/<pid>/cgroup` are world-readable even for non-dumpable processes, whereas inside
+/// the sandbox `implicit:supervisor_proc` denies the agent access to the supervisor's and
+/// broker's `/proc/<pid>` trees.
 const CHILD_CGROUP_WATCHER: &str = "import os, sys, time\n\
 parent, out = sys.argv[1], sys.argv[2]\n\
 seen = set()\n\
@@ -172,6 +175,10 @@ while time.time() < end:\n\
 \x20       if not d.isdigit():\n\
 \x20           continue\n\
 \x20       try:\n\
+\x20           if d == parent:\n\
+\x20               cg = open('/proc/%s/cgroup' % d).read().split('0::')[1].strip()\n\
+\x20               seen.add((int(d), cg))\n\
+\x20               continue\n\
 \x20           ppid = [l for l in open('/proc/%s/status' % d) if l.startswith('PPid:')][0].split()[1]\n\
 \x20           if ppid == parent:\n\
 \x20               cg = open('/proc/%s/cgroup' % d).read().split('0::')[1].strip()\n\
@@ -243,18 +250,54 @@ fn the_agent_tree_is_in_the_run_cgroup_and_the_supervisor_and_broker_are_not() {
             (pid.parse().unwrap(), cg.to_string())
         })
         .collect();
-    // exclude the watcher itself (also a child of this test process)
-    let non_watcher: Vec<&(u32, String)> = observed
-        .iter()
-        .filter(|(pid, _)| *pid != watcher.id())
-        .collect();
-    assert!(
-        non_watcher.iter().any(|(_, cg)| cg == &expected_rel),
-        "external watcher saw the agent inside {expected_rel}: {non_watcher:?}"
+    // exclude the watcher itself (also a child of this test process) and group by pid so we
+    // can assert each observed pid (supervisor, broker, agent, and any caught probe child)
+    // was seen in exactly one cgroup and it is the expected one.
+    let mut by_pid: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
+    for (pid, cg) in observed {
+        if pid != watcher.id() {
+            by_pid.entry(pid).or_default().insert(cg);
+        }
+    }
+    for (pid, cgs) in &by_pid {
+        assert_eq!(
+            cgs.len(),
+            1,
+            "pid {pid} must remain in a single cgroup for its lifetime: {cgs:?}"
+        );
+    }
+    let single_cg = |cgs: BTreeSet<String>| cgs.into_iter().next().unwrap();
+
+    let supervisor_pid = std::process::id();
+    let supervisor_observed = by_pid
+        .remove(&supervisor_pid)
+        .expect("external watcher must observe the supervisor pid");
+    assert_eq!(
+        single_cg(supervisor_observed),
+        supervisor,
+        "supervisor must stay in {supervisor}"
     );
-    assert!(
-        non_watcher.iter().any(|(_, cg)| cg == &supervisor),
-        "external watcher saw the broker stay in the supervisor cgroup {supervisor}: {non_watcher:?}"
+
+    let probe_prefix = format!("{}/leash-probe-", supervisor.trim_end_matches('/'));
+    let children: BTreeMap<u32, String> = by_pid
+        .into_iter()
+        .map(|(pid, cgs)| (pid, single_cg(cgs)))
+        .filter(|(_, cg)| !cg.starts_with(&probe_prefix))
+        .collect();
+    assert_eq!(
+        children.len(),
+        2,
+        "expected exactly the broker and agent direct children: {children:?}"
+    );
+    let broker_count = children.values().filter(|cg| *cg == &supervisor).count();
+    let agent_count = children.values().filter(|cg| *cg == &expected_rel).count();
+    assert_eq!(
+        broker_count, 1,
+        "expected exactly one child (broker) in {supervisor}: {children:?}"
+    );
+    assert_eq!(
+        agent_count, 1,
+        "expected exactly one child (agent) in {expected_rel}: {children:?}"
     );
 
     let meta: serde_json::Value =
@@ -592,18 +635,25 @@ fn dropping_run_cgroup_kills_live_process_tree_and_removes_cgroup() {
     let path = cgroup.path().to_path_buf();
 
     let mut shell = Command::new("/bin/sh")
-        .args(["-c", "sleep 60 & sleep 60 & wait"])
+        .args(["-c", "read x; sleep 60 & sleep 60 & wait"])
+        .stdin(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+    let stdin = shell.stdin.take().unwrap();
     cgroup.cgroup().attach(shell.id()).unwrap();
+    drop(stdin);
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if cgroup.cgroup().members().unwrap().len() >= 2 {
+        if cgroup.cgroup().members().unwrap().len() >= 3 {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(!cgroup.cgroup().members().unwrap().is_empty());
+    let members = cgroup.cgroup().members().unwrap();
+    assert!(
+        members.len() >= 3,
+        "shell and both sleeps must be in the run cgroup before drop: {members:?}"
+    );
 
     // dropping RunCgroup without calling kill_all or remove must kill the tree and rmdir
     drop(cgroup);
@@ -614,6 +664,22 @@ fn dropping_run_cgroup_kills_live_process_tree_and_removes_cgroup() {
         !path.exists(),
         "Drop backstop killed every descendant and removed the cgroup"
     );
+    let reap_deadline = Instant::now() + Duration::from_secs(2);
+    for pid in members {
+        let pid_t = libc::pid_t::try_from(pid).unwrap();
+        loop {
+            // SAFETY: signal 0 only checks whether pid still exists.
+            let rc = unsafe { libc::kill(pid_t, 0) };
+            if rc != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                Instant::now() < reap_deadline,
+                "pid {pid} survived RunCgroup Drop backstop"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 #[test]
@@ -764,26 +830,108 @@ fn probe_delegation_refuses_a_previously_killed_parent_cgroup() {
     // increment kill_seq on killed_dir while empty
     std::fs::write(killed_dir.join("cgroup.kill"), "1").unwrap();
 
-    // fork a helper so the test process itself never moves into the killed cgroup
+    // fork a helper so the test process itself never moves into the killed cgroup.
+    // first measure whether a raw clone3(CLONE_INTO_CGROUP) into a fresh child of the
+    // killed parent is SIGKILLed on this kernel, then assert probe_delegation refuses if
+    // and only if that raw child was SIGKILLed.
     // SAFETY: fork in a single-threaded section under SPAWN_LOCK; child exits with _exit.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");
     if pid == 0 {
-        let ok = std::fs::write(
-            killed_dir.join("cgroup.procs"),
-            std::process::id().to_string(),
-        )
-        .is_ok()
-            && cgroup::probe_delegation(&killed_dir, Duration::from_secs(2)).is_err();
+        #[repr(C)]
+        #[derive(Default)]
+        struct CloneArgs {
+            flags: u64,
+            pidfd: u64,
+            child_tid: u64,
+            parent_tid: u64,
+            exit_signal: u64,
+            stack: u64,
+            stack_size: u64,
+            tls: u64,
+            set_tid: u64,
+            set_tid_size: u64,
+            cgroup: u64,
+        }
+        const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+
+        let exit_code = (|| -> i32 {
+            if std::fs::write(
+                killed_dir.join("cgroup.procs"),
+                std::process::id().to_string(),
+            )
+            .is_err()
+            {
+                return 1;
+            }
+            let raw_dir = killed_dir.join("raw-probe");
+            let _ = std::fs::remove_dir(&raw_dir);
+            if std::fs::create_dir(&raw_dir).is_err() {
+                return 2;
+            }
+            let Ok(raw_file) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open(&raw_dir)
+            else {
+                let _ = std::fs::remove_dir(&raw_dir);
+                return 3;
+            };
+            let args = CloneArgs {
+                flags: CLONE_INTO_CGROUP,
+                exit_signal: libc::SIGCHLD as u64,
+                cgroup: raw_file.as_raw_fd() as u64,
+                ..CloneArgs::default()
+            };
+            // SAFETY: args is a live clone_args; child immediately calls _exit(0).
+            let raw_pid = unsafe {
+                libc::syscall(libc::SYS_clone3, &raw const args, size_of::<CloneArgs>())
+                    as libc::pid_t
+            };
+            if raw_pid < 0 {
+                drop(raw_file);
+                let _ = std::fs::remove_dir(&raw_dir);
+                return 4;
+            }
+            if raw_pid == 0 {
+                // SAFETY: immediate raw exit in the clone3 child.
+                unsafe { libc::_exit(0) };
+            }
+            let mut raw_status = 0;
+            // SAFETY: waitpid on the clone3 child we just created.
+            if unsafe { libc::waitpid(raw_pid, &raw mut raw_status, 0) } != raw_pid {
+                drop(raw_file);
+                let _ = std::fs::remove_dir(&raw_dir);
+                return 5;
+            }
+            drop(raw_file);
+            for _ in 0..200 {
+                if std::fs::remove_dir(&raw_dir).is_ok() || !raw_dir.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let raw_sigkilled =
+                libc::WIFSIGNALED(raw_status) && libc::WTERMSIG(raw_status) == libc::SIGKILL;
+            let raw_exited_ok = libc::WIFEXITED(raw_status) && libc::WEXITSTATUS(raw_status) == 0;
+            if !raw_sigkilled && !raw_exited_ok {
+                return 6;
+            }
+            let probe = cgroup::probe_delegation(&killed_dir, Duration::from_secs(2));
+            if probe.is_err() != raw_sigkilled {
+                return if raw_sigkilled { 7 } else { 8 };
+            }
+            0
+        })();
         // SAFETY: terminate forked helper without running destructors.
-        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        unsafe { libc::_exit(exit_code) };
     }
     let mut status = 0;
     // SAFETY: waitpid on our forked child.
     assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
     assert!(
         status == 0,
-        "probe_delegation must refuse a parent cgroup whose kill count is nonzero (wait status {status:#x})"
+        "probe_delegation must refuse iff raw clone3(CLONE_INTO_CGROUP) into a fresh child is SIGKILLed (wait status {status:#x})"
     );
 }
 
@@ -854,7 +1002,13 @@ fn a_parent_cgroup_that_is_not_writable_refuses_before_any_run_directory() {
         .run(&["/bin/true"])
         .err()
         .expect("an unwritable parent refuses");
-    assert!(matches!(error, SessionError::RunCgroup(_)), "{error:?}");
+    assert!(
+        matches!(
+            error,
+            SessionError::RunCgroup(RunCgroupError::NotWritable { .. })
+        ),
+        "{error:?}"
+    );
     let text = error.to_string();
     assert!(
         text.contains("systemd-run --user --scope -p Delegate=yes"),
@@ -1105,8 +1259,14 @@ fn a_nested_cgroup_inside_a_live_run_cgroup_is_removed_depth_first_and_run_end_i
         let live_cg = Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
         let nested = live_cg.join("nested").join("deep");
         std::fs::create_dir_all(&nested).unwrap();
+        let mut deep_sleeper = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        std::fs::write(nested.join("cgroup.procs"), deep_sleeper.id().to_string()).unwrap();
+        assert!(
+            deep_sleeper.try_wait().unwrap().is_none(),
+            "sleeper inside nested/deep must stay alive until run end"
+        );
         std::fs::write(&done_file_bg, "1").unwrap();
-        nested
+        (nested, deep_sleeper)
     });
 
     let script = format!(
@@ -1120,7 +1280,7 @@ fn a_nested_cgroup_inside_a_live_run_cgroup_is_removed_depth_first_and_run_end_i
         done_file = done_file.to_str().unwrap(),
     );
     let run = session.python(&script).unwrap();
-    let nested = helper.join().unwrap();
+    let (nested, mut deep_sleeper) = helper.join().unwrap();
 
     run.assert_exit_zero();
     assert_eq!(run.of_type("run_end").len(), 1);
@@ -1129,6 +1289,11 @@ fn a_nested_cgroup_inside_a_live_run_cgroup_is_removed_depth_first_and_run_end_i
     assert_eq!(kills.len(), 1);
     assert!(kills[0].get("error").is_none());
     assert!(kills[0].get("removal_error").is_none());
+    let deep_status = deep_sleeper.wait().unwrap();
+    assert!(
+        !deep_status.success(),
+        "sleeper inside nested/deep must be killed: {deep_status:?}"
+    );
     assert!(!nested.exists(), "nested descendant cgroup was removed");
     assert!(!recorded_cgroup(&run).exists(), "run cgroup was removed");
 }
@@ -1141,6 +1306,10 @@ fn a_failed_rmdir_after_successful_kill_records_removal_error_and_preserves_run_
     }
     // SAFETY: geteuid takes no arguments.
     if unsafe { libc::geteuid() } == 0 {
+        assert!(
+            std::env::var("LEASH_REQUIRE_FREEZER").as_deref() != Ok("1"),
+            "LEASH_REQUIRE_FREEZER=1: nonfatal_rmdir must run as an unprivileged user because root ignores parent directory 0o555"
+        );
         eprintln!("skipping nonfatal_rmdir: root ignores parent directory 0o555");
         return;
     }
@@ -1281,10 +1450,24 @@ fn a_stale_cgroup_from_a_dead_run_is_cleaned_at_the_next_run() {
     let id = generate_run_id(SystemTime::now()).unwrap();
     let dir = dead_run_dir(session.state.path(), &id);
     let mut stale = Leftover::new_bound(&parent, &format!("leash-{id}"), &dir.join("run.lock"));
-    // add a nested descendant cgroup to verify stale cleanup removes descendants depth-first
+    // add a populated nested descendant cgroup to verify stale cleanup kills processes in
+    // descendants and removes the hierarchy depth-first
     let nested = stale.cgroup.join("nested").join("deep");
     std::fs::create_dir_all(&nested).unwrap();
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut deep_sleeper = ChildGuard(Command::new("/bin/sleep").arg("60").spawn().unwrap());
+    std::fs::write(nested.join("cgroup.procs"), deep_sleeper.0.id().to_string()).unwrap();
     assert!(stale.sleeper_alive());
+    assert!(
+        deep_sleeper.0.try_wait().unwrap().is_none(),
+        "sleeper inside stale nested/deep must be alive before cleanup"
+    );
     assert_eq!(
         run_cgroup_gone(&stale.cgroup, &id).unwrap(),
         RunCgroupState::Present
@@ -1309,7 +1492,16 @@ fn a_stale_cgroup_from_a_dead_run_is_cleaned_at_the_next_run() {
     );
     assert!(!nested.exists(), "nested descendant cgroup is removed");
     assert!(!stale.cgroup.exists(), "the stale cgroup is removed");
-    stale.sleeper.wait().unwrap();
+    let stale_status = stale.sleeper.wait().unwrap();
+    assert!(
+        !stale_status.success(),
+        "stale sleeper must be killed: {stale_status:?}"
+    );
+    let deep_status = deep_sleeper.0.wait().unwrap();
+    assert!(
+        !deep_status.success(),
+        "stale nested/deep sleeper must be killed: {deep_status:?}"
+    );
     assert_eq!(
         run_cgroup_gone(&stale.cgroup, &id).unwrap(),
         RunCgroupState::Gone,
