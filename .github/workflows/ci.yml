@@ -61,4 +61,4 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" "$cgroup"
           echo $$ | sudo tee "$cgroup/cgroup.procs" > /dev/null
           echo "cgroup of this step: $(cat /proc/self/cgroup)"
-          cargo test --test run_cgroup_linux --test snapshot_run_filter_linux
+          cargo test --test run_cgroup_linux --test snapshot_run_filter_linux -- --nocapture
