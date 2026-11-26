@@ -122,11 +122,13 @@ Non-snapshot runs write neither.
 
 - `run_cgroup` is the absolute path of the run cgroup, `leash-<run-id>` under Leash's own cgroup.
   Rewind reads it to check that the cgroup is gone (ADR-0024 decision 17).
-- A `cgroup_kill` event is written whenever Leash writes `cgroup.kill`.
-  `reason` is `run_end` (the root exited and leftover processes were killed), `abort` (the run failed closed and the whole tree was killed), or `stale_cleanup` (the cgroup of a dead run was found at the start of this run and removed).
-  `cgroup` is the killed cgroup's name.
-  `processes` is the count listed in `cgroup.procs` just before the kill, and is absent when the list could not be read.
-  `error` is present only when opening or killing the cgroup failed or did not reach `populated 0` in time.
+- A `cgroup_kill` event is written when Leash kills a run cgroup or encounters a per-entry error during stale cleanup.
+  `reason` is `run_end` (the root exited and leftover processes were killed), `abort` (the run failed closed and the whole tree was killed), or `stale_cleanup` (the cgroup of a dead run was found at the start of this run and removed, or inspecting its lock or cgroup failed).
+  A stale-cleanup error on the run lock or cgroup emits a `stale_cleanup` event with `error` set and no kill performed.
+  Kills performed by the `RunCgroup` `Drop` backstop on unwind or early return are not recorded in the trace.
+  `cgroup` is the target cgroup's name.
+  `processes` is the count listed in `cgroup.procs` just before the kill, and is absent when the list could not be read or no kill was attempted.
+  `error` is present only when checking the lock, opening or killing the cgroup failed, or `populated` did not reach 0 in time.
   `removal_error` is present only when the kill succeeded and removing the cgroup directory or its descendants failed; at run end that failure is recorded here without discarding `run_end`.
   At run end the event precedes `run_end`.
   An abort event is written on a best-effort basis, because the trace itself may be what failed.

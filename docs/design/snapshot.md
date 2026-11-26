@@ -148,9 +148,9 @@ modified while mounted. Capturing a layer still requires the section 2 barrier.
 Rewind and diff follow ADR-0024 rules 17-22.
 
 Rewind requires the run's cgroup to be gone, not a `run_end` event, so a crashed run can be rewound.
-The cgroup-gone check returns a tri-state (`Gone`, `Present`, `Unknown`) by pinning the recorded parent directory on a cgroup2 mount first so an unresolvable path never fails open as `Gone`.
+The cgroup-gone check returns a tri-state (`Gone`, `Present`, `Unknown`) by pinning the recorded parent directory on a cgroup2 mount first, or walking up to the nearest existing ancestor when opening the parent returns `ENOENT`, so a vanished transient scope under a cgroup2 mount reports `Gone` while a non-cgroup2, inaccessible, or unresolvable path never fails open as `Gone`.
 Rewind must treat `Unknown` as not gone and must also acquire `<run_dir>/run.lock` before modifying the workspace.
-Every `leash run` and `leash rewind` kills and removes stale run cgroups under its current parent cgroup that run metadata names.
+Every snapshot `leash run` and `leash rewind` kills and removes stale run cgroups under its current parent cgroup that run metadata names; non-snapshot runs do not clean stale cgroups.
 A run cgroup is stale when its run lock can be taken and its `user.leash.lock` xattr matches that lock file's `<st_dev>:<st_ino>`.
 Only a Leash-named child of Leash's own cgroup is killed; a name from metadata is validated first.
 Under per-run `systemd-run --scope` launches, a crashed run's cgroup lives in its own earlier scope, so a later run's parent-cgroup scan does not reach it (unverified, as systemd is absent in the codespace).
