@@ -1398,19 +1398,97 @@ fn enforce_survives_an_addfd_the_kernel_refuses() {
         "one refused injection must not end the loop: {stderr}"
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "one", "{stderr}");
+    assert!(
+        stderr.contains("Too many open files"),
+        "the agent received EMFILE for the refused open: {stderr}"
+    );
     let events = trace_events(&only_run_dir(state.path()));
+    assert_allow_then_realization_failure(&events, "/four", "EMFILE");
+}
+
+/// the allowed open is recorded first, then its realization failure as a second event for
+/// the same syscall and path with the errno the agent received.
+fn assert_allow_then_realization_failure(
+    events: &[serde_json::Value],
+    path_suffix: &str,
+    errno: &str,
+) {
     let failed: Vec<_> = events
         .iter()
-        .filter(|event| event["errno"] == "EMFILE")
+        .enumerate()
+        .filter(|(_, event)| event["errno"] == errno)
         .collect();
     assert_eq!(failed.len(), 1, "one recorded failure: {events:?}");
-    assert_eq!(failed[0]["decision"], "deny");
-    assert_eq!(failed[0]["matched_rule"], "failsafe:realization");
+    let (at, failure) = failed[0];
+    assert_eq!(failure["decision"], "deny");
+    assert_eq!(failure["matched_rule"], "failsafe:realization");
     assert!(
-        failed[0]["fact"]["path"]
+        failure["fact"]["path"]
             .as_str()
-            .is_some_and(|path| path.ends_with("/four")),
-        "{failed:?}"
+            .is_some_and(|path| path.ends_with(path_suffix)),
+        "{failure:?}"
+    );
+    let allowed = events[..at]
+        .iter()
+        .rposition(|event| {
+            event["decision"] == "allow"
+                && event["syscall"] == failure["syscall"]
+                && event["pid"] == failure["pid"]
+                && event["fact"] == failure["fact"]
+        })
+        .unwrap_or_else(|| panic!("no allow before the failure: {events:?}"));
+    assert!(
+        events[allowed]["seq"].as_u64() < failure["seq"].as_u64(),
+        "the allow precedes the failure: {events:?}"
+    );
+}
+
+/// the broker creates the file before the ADDFD, so a refused ADDFD on an O_CREAT open
+/// leaves the file behind. the create was allowed and recorded, the failure is recorded
+/// after it, and the loop goes on.
+#[test]
+fn enforce_survives_a_refused_addfd_after_a_create() {
+    let ws = tempfile::tempdir().unwrap();
+    for name in ["one", "two", "three"] {
+        std::fs::write(ws.path().join(name), name).unwrap();
+    }
+    let (out, state) = run_enforce(
+        READ_EXEC_POLICY,
+        ws.path(),
+        &[
+            "/bin/sh",
+            "-c",
+            // descriptors 0-5 fill the table, so the created file's descriptor cannot be
+            // installed; the subshell keeps that failure from ending the shell
+            "ulimit -S -n 6; exec 3<one 4<two 5<three; (exec 6>created); \
+             ulimit -S -n 1024; cat one; exit 0",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("notify fd failed"),
+        "one refused injection must not end the loop: {stderr}"
+    );
+    assert!(
+        stderr.contains("Too many open files"),
+        "the agent received EMFILE for the refused open: {stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "one", "{stderr}");
+    assert!(
+        ws.path().join("created").exists(),
+        "a create committed before the refused ADDFD persists"
+    );
+    let events = trace_events(&only_run_dir(state.path()));
+    assert_allow_then_realization_failure(&events, "/created", "EMFILE");
+    let failure = events
+        .iter()
+        .find(|event| event["errno"] == "EMFILE")
+        .unwrap();
+    assert_eq!(
+        failure["fact"]["access"],
+        serde_json::json!(["write", "create"]),
+        "{failure:?}"
     );
 }
 

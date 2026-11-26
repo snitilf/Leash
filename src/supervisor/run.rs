@@ -960,8 +960,8 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
         primary_decision.effective
     };
 
-    let injected_path = fact_path.clone();
-    let injected_dest = fact_dest.clone();
+    let realized_path = fact_path.clone();
+    let realized_dest = fact_dest.clone();
     record_with_operands(
         writer,
         ts,
@@ -999,6 +999,9 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
         }
         _ => 0,
     };
+    // set only when the broker realized an O_PATH open, so an errno the supervisor chose
+    // for an unsupported openat2 request is never mistaken for the substitute's refusal
+    let mut o_path = false;
     let result = match invocation {
         FsInvocation::Open {
             flags,
@@ -1009,6 +1012,7 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
                 broker.borrow_mut().release(primary)?;
                 BrokerResult::Errno(errno)
             } else {
+                o_path = flags & crate::supervisor::fact::flags::O_PATH != 0;
                 broker.borrow_mut().commit_open(primary, flags, mode)?
             }
         }
@@ -1019,26 +1023,77 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
                 .commit_mutation(primary, secondary, operation)?
         }
     };
-    if let Some(errno) = respond_broker_result(kernel, notif.id, result, close_on_exec)? {
-        // the allow was recorded before the kernel refused to install the descriptor. the
-        // syscall failed, so the trace gets the failure the agent saw, and nothing mutated
+    deliver_realization(
+        kernel,
+        notif,
+        writer,
+        ts,
+        shape.name,
+        Fact::Fs {
+            path: realized_path,
+            access: access.clone(),
+            dest: realized_dest,
+        },
+        &access,
+        result,
+        Realization {
+            o_path,
+            newfd_flags: close_on_exec,
+        },
+    )
+}
+
+/// how an allowed filesystem syscall's broker result is to be delivered.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct Realization {
+    /// the open was `O_PATH`, so a broker EOPNOTSUPP is the substitute's refusal of the
+    /// object's kind, not an answer the kernel would have given
+    o_path: bool,
+    /// the `newfd_flags` an injected descriptor is installed with
+    newfd_flags: u32,
+}
+
+/// deliver the broker's realization of an allowed filesystem syscall whose allow event is
+/// already in the trace. when the allow cannot be realized after all (the kernel refuses
+/// the ADDFD, or the O_PATH substitute refuses the object's kind), the failure is recorded
+/// as a second event under `failsafe:realization` with the errno, and only then answered:
+/// record precedes respond for this event too (notify-loop.md section 3). a failed write of
+/// that event aborts the run with nothing sent. a create or truncate the broker committed
+/// before the ADDFD stays on disk, so the step clock is classified from the allow alone.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn deliver_realization<N: Notifier, S: TraceSink>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    writer: &mut TraceWriter<S>,
+    ts: u64,
+    syscall: &str,
+    fact: Fact,
+    access: &[crate::recorder::FsAccess],
+    result: BrokerResult,
+    realization: Realization,
+) -> Result<Handled, RunError> {
+    let delivery = match result {
+        BrokerResult::Errno(libc::EOPNOTSUPP) if realization.o_path => Delivery::Refused {
+            errno: libc::EOPNOTSUPP,
+        },
+        result => respond_broker_result(kernel, notif.id, result, realization.newfd_flags)?,
+    };
+    if let Delivery::Refused { errno } = delivery {
         record_event(
             writer,
             ts,
             notif,
-            shape.name,
-            Fact::Fs {
-                path: injected_path,
-                access,
-                dest: injected_dest,
-            },
+            syscall,
+            fact,
             &fixed_decision(Decision::Deny, rule::REALIZATION),
             None,
             Some(crate::recorder::errno_name(errno)),
         )?;
-        return Ok(Handled::Responded);
+        tolerate_dead(kernel.send_error(notif.id, errno))?;
     }
-    Ok(mutation_handled(decision.response_decision, &access))
+    Ok(mutation_handled(Decision::Allow, access))
 }
 
 /// classify one handled filesystem action for the step clock (snapshot.md section 1):
@@ -1224,37 +1279,50 @@ fn record_realization_deny<N: Notifier, S: TraceSink>(
     Ok(Handled::Responded)
 }
 
-/// answer a trapped syscall with the broker's result. returns the errno the agent received
-/// when the kernel refused to install an injected descriptor (the notification is then
-/// answered with that errno or EIO and the loop goes on), or `None` when the result was
-/// delivered. only a failure of the notify fd itself is an error: it surfaces from the
-/// error response, which the same fd would also fail to carry.
+/// whether a broker result reached the agent.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+enum Delivery {
+    /// the result was sent, or the agent is gone and nothing is owed
+    Delivered,
+    /// the kernel refused to install the descriptor. nothing has been sent: the
+    /// notification is still pending, and the caller records the failure and then answers
+    /// it with this errno
+    Refused { errno: i32 },
+}
+
+/// answer a trapped syscall with the broker's result. a descriptor the kernel refuses to
+/// install (`ADDFD|SEND` fails, which leaves the notification pending) is reported as
+/// `Refused` with the errno the agent is to receive: its own limits (`EMFILE`, `ENFILE`,
+/// `ENOMEM`) as they are, anything else as EIO. only a failure of the notify fd on a send
+/// is an error.
 #[cfg(target_os = "linux")]
 fn respond_broker_result<N: Notifier>(
     kernel: &N,
     id: u64,
     result: BrokerResult,
     newfd_flags: u32,
-) -> Result<Option<i32>, RunError> {
+) -> Result<Delivery, RunError> {
     match result {
-        BrokerResult::Value(value) => tolerate_dead(kernel.send_success(id, value)).map(|()| None),
+        BrokerResult::Value(value) => {
+            tolerate_dead(kernel.send_success(id, value)).map(|()| Delivery::Delivered)
+        }
         BrokerResult::Fd(fd) => {
             match kernel.send_addfd(id, fd.as_fd(), SECCOMP_ADDFD_FLAG_SEND, newfd_flags) {
-                Ok(_) => Ok(None),
-                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(None),
-                Err(error) => {
-                    // the agent's own limits are errnos it can act on; any other refusal is
-                    // an internal failure of this one injection
-                    let errno = match error.raw_os_error() {
+                Ok(_) => Ok(Delivery::Delivered),
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(Delivery::Delivered),
+                Err(error) => Ok(Delivery::Refused {
+                    errno: match error.raw_os_error() {
                         Some(errno @ (libc::EMFILE | libc::ENFILE | libc::ENOMEM)) => errno,
                         _ => libc::EIO,
-                    };
-                    tolerate_dead(kernel.send_error(id, errno))?;
-                    Ok(Some(errno))
-                }
+                    },
+                }),
             }
         }
-        BrokerResult::Errno(errno) => tolerate_dead(kernel.send_error(id, errno)).map(|()| None),
+        BrokerResult::Errno(errno) => {
+            tolerate_dead(kernel.send_error(id, errno)).map(|()| Delivery::Delivered)
+        }
     }
 }
 
@@ -1553,7 +1621,11 @@ fn handle_network<N: Notifier, S: TraceSink>(
             .ok_or(RunError::MissingBroker)?
             .borrow_mut()
             .network(operation, socket, sockaddr, payload, flags)?;
-        respond_broker_result(kernel, notif.id, result, 0)?;
+        // a network operation returns no descriptor, so nothing here can be refused; a
+        // refusal would still owe the agent an answer, and an errno never releases an action
+        if let Delivery::Refused { errno } = respond_broker_result(kernel, notif.id, result, 0)? {
+            tolerate_dead(kernel.send_error(notif.id, errno))?;
+        }
     }
     Ok(Handled::Responded)
 }
@@ -2525,11 +2597,11 @@ mod tests {
         BrokerResult::Fd(OwnedFd::from(std::fs::File::open("/dev/null").unwrap()))
     }
 
-    /// issue #53: the kernel refusing one ADDFD fails that syscall only. the agent gets an
-    /// error, the caller is told the errno to record, and the loop is not ended.
+    /// issue #53: the kernel refusing one ADDFD fails that syscall only. nothing is sent
+    /// yet: the caller is told the errno to record first and then answer with.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_refused_addfd_fails_only_that_notification() {
+    fn a_refused_addfd_is_reported_unanswered() {
         for (refused, expected) in [
             (libc::EBADF, libc::EIO),
             (libc::EINVAL, libc::EIO),
@@ -2541,9 +2613,13 @@ mod tests {
                 addfd_errno: Some(refused),
                 ..FakeNotifier::default()
             };
-            let delivered = respond_broker_result(&kernel, 7, a_descriptor(), 0).unwrap();
-            assert_eq!(delivered, Some(expected), "ADDFD errno {refused}");
-            assert_eq!(kernel.sent(), vec![format!("error:7:{expected}")]);
+            let delivery = respond_broker_result(&kernel, 7, a_descriptor(), 0).unwrap();
+            assert_eq!(
+                delivery,
+                Delivery::Refused { errno: expected },
+                "ADDFD errno {refused}"
+            );
+            assert!(kernel.sent().is_empty(), "record precedes respond");
         }
     }
 
@@ -2556,25 +2632,9 @@ mod tests {
         };
         assert_eq!(
             respond_broker_result(&kernel, 7, a_descriptor(), 0).unwrap(),
-            None
+            Delivery::Delivered
         );
         assert!(kernel.sent().is_empty());
-    }
-
-    /// only a dead notify fd ends the loop: when the error response cannot be sent either,
-    /// the failure is the listener's, not the one notification's.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_refused_addfd_on_a_broken_notify_fd_surfaces() {
-        let kernel = FakeNotifier {
-            addfd_errno: Some(libc::EBADF),
-            send_errno: Some(libc::EBADF),
-            ..FakeNotifier::default()
-        };
-        assert!(matches!(
-            respond_broker_result(&kernel, 7, a_descriptor(), 0),
-            Err(RunError::Notify(_))
-        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -2583,7 +2643,7 @@ mod tests {
         let kernel = FakeNotifier::default();
         assert_eq!(
             respond_broker_result(&kernel, 7, a_descriptor(), libc::O_CLOEXEC as u32).unwrap(),
-            None
+            Delivery::Delivered
         );
         assert_eq!(
             kernel.sent(),
@@ -2592,6 +2652,161 @@ mod tests {
                 libc::O_CLOEXEC
             )]
         );
+    }
+
+    /// deliver an allowed open's broker result the way handle_fs_enforce does, after its
+    /// allow event is already written.
+    #[cfg(target_os = "linux")]
+    fn deliver(
+        kernel: &FakeNotifier,
+        w: &mut TraceWriter<ScriptedSink>,
+        access: &[crate::recorder::FsAccess],
+        result: BrokerResult,
+        o_path: bool,
+    ) -> Result<Handled, RunError> {
+        deliver_realization(
+            kernel,
+            &notif(nr::OPENAT, [flags::AT_FDCWD, 0x1000, 0, 0, 0, 0]),
+            w,
+            1_000,
+            "openat",
+            Fact::Fs {
+                path: PathBuf::from("/ws/file"),
+                access: access.to_vec(),
+                dest: None,
+            },
+            access,
+            result,
+            Realization {
+                o_path,
+                newfd_flags: 0,
+            },
+        )
+    }
+
+    /// the refused ADDFD is recorded under failsafe:realization before the errno is sent,
+    /// and the loop goes on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_addfd_is_recorded_then_answered() {
+        use crate::recorder::FsAccess::Read;
+        let kernel = FakeNotifier {
+            addfd_errno: Some(libc::EMFILE),
+            ..FakeNotifier::default()
+        };
+        let mut w = writer();
+        let handled = deliver(&kernel, &mut w, &[Read], a_descriptor(), false).unwrap();
+        assert_eq!(handled, Handled::Responded, "a read never ticks the clock");
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EMFILE)]);
+        let events = events(w);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["decision"], "deny");
+        assert_eq!(events[0]["matched_rule"], "failsafe:realization");
+        assert_eq!(events[0]["errno"], "EMFILE");
+        assert_eq!(events[0]["fact"]["path"], "/ws/file");
+    }
+
+    /// record precedes respond on the second event too: when it cannot be written the run
+    /// aborts with no answer sent for the pending notification.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_write_of_the_realization_event_aborts_unanswered() {
+        use crate::recorder::FsAccess::Read;
+        let kernel = FakeNotifier {
+            addfd_errno: Some(libc::EMFILE),
+            ..FakeNotifier::default()
+        };
+        let mut w = TraceWriter::new(ScriptedSink {
+            fail_after: Some(0),
+            ..ScriptedSink::default()
+        });
+        let result = deliver(&kernel, &mut w, &[Read], a_descriptor(), false);
+        assert!(matches!(result, Err(RunError::Recorder(_))), "{result:?}");
+        assert!(
+            kernel.sent().is_empty(),
+            "no errno is sent before the failure is recorded"
+        );
+    }
+
+    /// the broker creates or truncates before the ADDFD, and a refused ADDFD does not undo
+    /// that, so the step clock must still see the mutation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_addfd_after_a_create_or_truncate_still_ticks_the_step_clock() {
+        use crate::recorder::FsAccess::{Create, Read, Write};
+        for access in [vec![Write, Create], vec![Read, Write]] {
+            let kernel = FakeNotifier {
+                addfd_errno: Some(libc::EMFILE),
+                ..FakeNotifier::default()
+            };
+            let mut w = writer();
+            let handled = deliver(&kernel, &mut w, &access, a_descriptor(), false).unwrap();
+            assert_eq!(handled, Handled::RespondedMutation, "{access:?}");
+            assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EMFILE)]);
+            assert_eq!(events(w)[0]["errno"], "EMFILE");
+        }
+    }
+
+    /// only a dead notify fd ends the loop: when the error response cannot be sent either,
+    /// the failure is the listener's, not the one notification's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_addfd_on_a_broken_notify_fd_surfaces() {
+        use crate::recorder::FsAccess::Read;
+        let kernel = FakeNotifier {
+            addfd_errno: Some(libc::EBADF),
+            send_errno: Some(libc::EBADF),
+            ..FakeNotifier::default()
+        };
+        let mut w = writer();
+        assert!(matches!(
+            deliver(&kernel, &mut w, &[Read], a_descriptor(), false),
+            Err(RunError::Notify(_))
+        ));
+        assert_eq!(events(w).len(), 1, "the failure was recorded first");
+    }
+
+    /// the O_PATH substitute refuses a fifo, device, socket, or symlink with EOPNOTSUPP. that
+    /// is a realization failure the trace must show, not an answer the kernel would give.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unrealizable_o_path_kind_is_recorded_then_answered() {
+        use crate::recorder::FsAccess::Read;
+        let kernel = FakeNotifier::default();
+        let mut w = writer();
+        let handled = deliver(
+            &kernel,
+            &mut w,
+            &[Read],
+            BrokerResult::Errno(libc::EOPNOTSUPP),
+            true,
+        )
+        .unwrap();
+        assert_eq!(handled, Handled::Responded);
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EOPNOTSUPP)]);
+        let events = events(w);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["matched_rule"], "failsafe:realization");
+        assert_eq!(events[0]["errno"], "EOPNOTSUPP");
+    }
+
+    /// any other broker errno is the answer the open would have had, already covered by
+    /// the allow event: it is sent as is with no second event.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_broker_errno_is_answered_without_a_second_event() {
+        use crate::recorder::FsAccess::Read;
+        for (errno, o_path) in [
+            (libc::EOPNOTSUPP, false),
+            (libc::ENOTDIR, true),
+            (libc::EEXIST, false),
+        ] {
+            let kernel = FakeNotifier::default();
+            let mut w = writer();
+            deliver(&kernel, &mut w, &[Read], BrokerResult::Errno(errno), o_path).unwrap();
+            assert_eq!(kernel.sent(), vec![format!("error:7:{errno}")]);
+            assert!(events(w).is_empty(), "errno {errno}, o_path {o_path}");
+        }
     }
 
     #[test]
