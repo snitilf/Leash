@@ -1047,8 +1047,9 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct Realization {
-    /// the open was `O_PATH`, so a broker EOPNOTSUPP is the substitute's refusal of the
-    /// object's kind, not an answer the kernel would have given
+    /// the open was `O_PATH`, so a broker EOPNOTSUPP (the substitute refuses the object's
+    /// kind) or EACCES (the file mode refuses its read-only reopen) is a realization
+    /// failure, not an answer the kernel would have given
     o_path: bool,
     /// the `newfd_flags` an injected descriptor is installed with
     newfd_flags: u32,
@@ -1056,11 +1057,12 @@ struct Realization {
 
 /// deliver the broker's realization of an allowed filesystem syscall whose allow event is
 /// already in the trace. when the allow cannot be realized after all (the kernel refuses
-/// the ADDFD, or the O_PATH substitute refuses the object's kind), the failure is recorded
-/// as a second event under `failsafe:realization` with the errno, and only then answered:
-/// record precedes respond for this event too (notify-loop.md section 3). a failed write of
-/// that event aborts the run with nothing sent. a create or truncate the broker committed
-/// before the ADDFD stays on disk, so the step clock is classified from the allow alone.
+/// the ADDFD, or the O_PATH substitute refuses the object's kind or cannot reopen it for
+/// reading), the failure is recorded as a second event under `failsafe:realization` with
+/// the errno, and only then answered: record precedes respond for this event too
+/// (notify-loop.md section 3). a failed write of that event aborts the run with nothing
+/// sent. a create or truncate the broker committed before the ADDFD stays on disk, so the
+/// step clock is classified from the allow alone.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn deliver_realization<N: Notifier, S: TraceSink>(
@@ -1075,9 +1077,11 @@ fn deliver_realization<N: Notifier, S: TraceSink>(
     realization: Realization,
 ) -> Result<Handled, RunError> {
     let delivery = match result {
-        BrokerResult::Errno(libc::EOPNOTSUPP) if realization.o_path => Delivery::Refused {
-            errno: libc::EOPNOTSUPP,
-        },
+        // the substitute refuses the object's kind, or its read-only reopen is refused by the
+        // file mode where the O_PATH open itself needs no read permission
+        BrokerResult::Errno(errno @ (libc::EOPNOTSUPP | libc::EACCES)) if realization.o_path => {
+            Delivery::Refused { errno }
+        }
         result => respond_broker_result(kernel, notif.id, result, realization.newfd_flags)?,
     };
     if let Delivery::Refused { errno } = delivery {
