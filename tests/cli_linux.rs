@@ -1492,6 +1492,55 @@ fn enforce_survives_a_refused_addfd_after_a_create() {
     );
 }
 
+/// coreutils mv only exercises O_PATH on some versions; this opener does it directly. an
+/// O_PATH directory descriptor must reach the agent, keep or drop FD_CLOEXEC as asked, and
+/// serve as a dirfd for fstatat and openat.
+#[test]
+fn enforce_o_path_descriptor_serves_as_a_dirfd_with_the_requested_close_on_exec() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir(ws.path().join("dir")).unwrap();
+    std::fs::write(ws.path().join("dir/file.txt"), b"payload").unwrap();
+    let script = "import ctypes, errno, fcntl, os\n\
+                  libc=ctypes.CDLL(None,use_errno=True)\n\
+                  def opath(flags):\n    \
+                      fd=libc.syscall(257,-100,b'dir',os.O_PATH|os.O_DIRECTORY|flags)\n    \
+                      assert fd >= 0, ctypes.get_errno()\n    \
+                      return fd\n\
+                  plain=opath(0)\n\
+                  assert fcntl.fcntl(plain,fcntl.F_GETFD) & fcntl.FD_CLOEXEC == 0\n\
+                  cloexec=opath(os.O_CLOEXEC)\n\
+                  assert fcntl.fcntl(cloexec,fcntl.F_GETFD) & fcntl.FD_CLOEXEC != 0\n\
+                  st=os.stat('dir')\n\
+                  assert (os.fstat(plain).st_dev,os.fstat(plain).st_ino) == (st.st_dev,st.st_ino)\n\
+                  assert os.stat('file.txt',dir_fd=plain).st_size == 7\n\
+                  f=os.open('file.txt',os.O_RDONLY,dir_fd=cloexec)\n\
+                  assert os.read(f,16) == b'payload'\n\
+                  print('ok')";
+    let (out, state) = run_enforce(
+        READ_EXEC_POLICY,
+        ws.path(),
+        &["/usr/bin/python3", "-c", script],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n", "{stderr}");
+    let events = trace_events(&only_run_dir(state.path()));
+    let o_path_opens: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["syscall"] == "openat"
+                && event["fact"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/dir"))
+        })
+        .collect();
+    assert_eq!(o_path_opens.len(), 2, "{events:?}");
+    for event in o_path_opens {
+        assert_eq!(event["decision"], "allow", "{event:?}");
+        assert_eq!(event["fact"]["access"], serde_json::json!(["read"]));
+    }
+}
+
 /// escape: with O_PATH the kernel ignores the access mode, and the broker realizes the
 /// open as a read-only descriptor. judging O_PATH | O_WRONLY as a write would let a
 /// write-allowed path hand out a readable descriptor on a file whose reads are denied.
