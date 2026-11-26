@@ -104,7 +104,7 @@ Fact details fixed by the notify loop:
   It stays a fail-closed `deny`, and the child receives the errno the event names.
   The event records that errno by symbolic name in `errno` (an unnamed value is written `errno_<n>`).
   This is an additive optional field, so `schema_version` does not move; a reader that ignores it still decodes the event.
-  The field exists because the same decision covers different situations: a path that does not exist (`ENOENT`, `ENOTDIR`), which the kernel would have answered the same way for an unconfined process, a refused resolution (`ELOOP` from a magic link, `EXDEV` from an escape beneath the authoritative root), which is a security refusal, and a realization the allow could not complete (`EMFILE`, `ENFILE`, `ENOMEM` or `EIO` from a refused injection, `EOPNOTSUPP` from an `O_PATH` kind the broker does not reopen).
+  The field exists because the same decision covers different situations: a path that does not exist (`ENOENT`, `ENOTDIR`), which the kernel would have answered the same way for an unconfined process, a refused resolution (`ELOOP` from a magic link, `EXDEV` from an escape beneath the authoritative root), which is a security refusal, and a realization the allow could not complete (`EMFILE`, `ENFILE`, `ENOMEM` or `EIO` from a refused injection, `EOPNOTSUPP` from an `O_PATH` kind the broker does not reopen, `EACCES` from an `O_PATH` substitute the file mode refuses to reopen for reading).
   The errno is what lets a reader tell them apart without changing what the decision means.
 
 In a run with no policy, `matched_rule` carries a fixed base id naming what decided the event:
@@ -195,6 +195,6 @@ Because it is derived from the trace, the report is regenerable after the fact f
 
 A realization failure ([`errno`](#2-event-schema) present) is rendered by its errno, not by its `deny` decision alone.
 `ENOENT` and `ENOTDIR` mean the path, or a component of it, does not exist; the report shows such a path as `not found`, because the policy refused nothing and a reader must not take a glibc locale probe for a blocked access.
-Any other errno is a refusal and renders as `denied (<ERRNO>)`, for example `denied (ELOOP)`, so the cause stays visible.
+Any other errno is a refusal or a failed realization and renders as `denied (<ERRNO>)`, for example `denied (ELOOP)`, so the cause stays visible.
 An event with no `errno` (every policy decision, and traces written before the field existed) renders as `denied` exactly as before.
 The decision recorded in the trace is unchanged in all cases; only the report's wording differs.

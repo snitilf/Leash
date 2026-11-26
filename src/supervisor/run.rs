@@ -1060,9 +1060,10 @@ struct Realization {
 /// the ADDFD, or the O_PATH substitute refuses the object's kind or cannot reopen it for
 /// reading), the failure is recorded as a second event under `failsafe:realization` with
 /// the errno, and only then answered: record precedes respond for this event too
-/// (notify-loop.md section 3). a failed write of that event aborts the run with nothing
-/// sent. a create or truncate the broker committed before the ADDFD stays on disk, so the
-/// step clock is classified from the allow alone.
+/// (notify-loop.md section 3). a failed write of that event returns with nothing sent
+/// here; the loop then treats it as case E, sends a best-effort EIO, and aborts the run. a
+/// create or truncate the broker committed before the ADDFD stays on disk, so the step
+/// clock is classified from the allow alone.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn deliver_realization<N: Notifier, S: TraceSink>(

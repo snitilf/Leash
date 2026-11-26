@@ -90,7 +90,8 @@ Only directories and regular files are substituted.
 A fifo, device, socket, or symlink opened with `O_PATH` is refused with `EOPNOTSUPP`, because a read-only open of those can block the broker or have side effects, and a symlink cannot be reopened without following it.
 That refusal is a realization failure and is recorded like a refused `ADDFD` below.
 The agent sees a descriptor that is readable where `O_PATH` would not be, and it works as a `dirfd` for the `*at` calls.
-An object whose mode denies the broker a read-only open fails with that open's errno.
+An object whose mode denies the broker a read-only open (for example a mode-000 file) fails `EACCES`, although the agent's own `O_PATH` open needs no read permission.
+That refusal is a realization failure too and is recorded the same way.
 
 An `ADDFD` the kernel refuses (for example `EMFILE` when the agent's descriptor table is full) fails only that syscall.
 The agent receives the same errno for `EMFILE`, `ENFILE`, and `ENOMEM`, and `EIO` for anything else.
