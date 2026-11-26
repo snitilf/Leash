@@ -598,6 +598,10 @@ pub fn run() -> ExitCode {
             .ask_timeout
             .map(std::time::Duration::from_secs)
             .unwrap_or(crate::supervisor::run::DEFAULT_ASK_TIMEOUT),
+        // keep snapshot_integrity off at the CLI until the --snapshots slice lands ADR-0024
+        // decisions 4 and 5 (implicit cgroup2 mount deny and Landlock overlap refusal) and
+        // un-ignores a_policy_grant_that_overlaps_the_cgroup_control_plane_is_refused in
+        // tests/run_cgroup_linux.rs.
         snapshot_integrity: false,
     })
 }
@@ -687,11 +691,15 @@ fn dispatch_runs(args: RunsArgs) -> ExitCode {
     }
 }
 
-/// run the session and map its outcome to the shell (cli.md section 6): the child's own
-/// result passes through; any failure of leash itself is the reserved supervisor code.
-#[cfg(target_os = "linux")]
-fn dispatch_run(spec: crate::supervisor::session::SessionSpec) -> ExitCode {
-    match crate::supervisor::session::run_session(spec) {
+/// map a completed or failed session to the shell exit code (cli.md section 6, FR-22):
+/// the child's own exit or signal passes through; any supervisor failure is 125.
+pub fn session_exit_code(
+    result: Result<
+        crate::supervisor::session::SessionOutcome,
+        crate::supervisor::session::SessionError,
+    >,
+) -> ExitCode {
+    match result {
         Ok(outcome) => {
             let code = outcome.exit.shell_code();
             // shell_code is 0..=255 by construction (exit status byte, or 128 + signal)
@@ -702,6 +710,13 @@ fn dispatch_run(spec: crate::supervisor::session::SessionSpec) -> ExitCode {
             ExitCode::from(EXIT_SUPERVISOR_FAILURE)
         }
     }
+}
+
+/// run the session and map its outcome to the shell (cli.md section 6): the child's own
+/// result passes through; any failure of leash itself is the reserved supervisor code.
+#[cfg(target_os = "linux")]
+fn dispatch_run(spec: crate::supervisor::session::SessionSpec) -> ExitCode {
+    session_exit_code(crate::supervisor::session::run_session(spec))
 }
 
 /// on a non-linux host the session cannot exist; preflight would refuse, so refuse the
