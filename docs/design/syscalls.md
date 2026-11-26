@@ -75,6 +75,32 @@ bare value. The response column states how an allow is realized; the rule behind
 | `openat`, `openat2` | yes | path + access mode (pointer) | `ADDFD`: confined broker opens the resolved path, supervisor injects the returned fd | `FS_READ_FILE` / `FS_WRITE_FILE`, or `FS_READ_DIR` for a directory |
 | `open`, `creat` | no (x86-64 legacy only) | path + access mode (pointer) | `ADDFD` | same |
 
+With `O_PATH` the kernel honors only `O_DIRECTORY`, `O_NOFOLLOW`, and `O_CLOEXEC` besides `O_PATH` itself.
+For `open` and `openat` every other bit (the access mode, `O_CREAT`, `O_TRUNC`, `O_EXCL`) is masked off before the access is derived and before the broker sees the flags, so an `O_PATH` open is always judged as a `read`.
+Judging the raw bits would let `O_PATH | O_WRONLY` on a write-allowed but read-denied file pass as a write and hand back the readable descriptor described below.
+`openat2` refuses the same combination with `EINVAL`, as the kernel does, and opens nothing.
+The broker masks the flags again on its side, so a stray `O_CREAT` or `O_TRUNC` can never create or truncate.
+
+`O_PATH` opens are realized as a read-only descriptor, not an `O_PATH` one.
+`SECCOMP_IOCTL_NOTIF_ADDFD` cannot inject an `O_PATH` descriptor: the kernel looks the source up with `fget`, which rejects `FMODE_PATH` files with `EBADF` (issue #53, observed on kernel 6.8 with coreutils `mv dir existing-dir`).
+`CONTINUE` is not an option, because it would make the kernel re-resolve a path the agent can swap (ADR-0020).
+So the broker reopens the same pinned object `O_RDONLY` through `/proc/self/fd` and the supervisor injects that.
+The policy already evaluated the open as a read of that object, so the substitute grants no access the decision did not.
+Only directories and regular files are substituted.
+A fifo, device, socket, or symlink opened with `O_PATH` is refused with `EOPNOTSUPP`, because a read-only open of those can block the broker or have side effects, and a symlink cannot be reopened without following it.
+That refusal is a realization failure and is recorded like a refused `ADDFD` below.
+The agent sees a descriptor that is readable where `O_PATH` would not be, and it works as a `dirfd` for the `*at` calls.
+An object whose mode denies the broker a read-only open (for example a mode-000 file) fails `EACCES`, although the agent's own `O_PATH` open needs no read permission.
+That refusal is a realization failure too and is recorded the same way.
+
+An `ADDFD` the kernel refuses (for example `EMFILE` when the agent's descriptor table is full) fails only that syscall.
+The agent receives the same errno for `EMFILE`, `ENFILE`, and `ENOMEM`, and `EIO` for anything else.
+The trace gets a second event for the syscall with `failsafe:realization`, decision `deny`, and the errno the agent received.
+That event is written before the errno is sent, so record precedes respond here too ([`notify-loop.md`](notify-loop.md) section 4, case J).
+The broker creates (`O_CREAT`) or truncates (`O_TRUNC`) before the descriptor is injected, and a refused `ADDFD` does not undo that.
+The created or truncated file persists, and the step clock counts the syscall as a mutation.
+Only a failure of the notify fd itself ends the loop.
+
 ### 3.2 Filesystem mutation (no fd returned)
 
 | Syscall | Also on ARM64 | Decision basis | Allow realized by | Landlock backstop |
@@ -265,6 +291,7 @@ identity the policy sees is still read back from the opened handle, so a symlink
 denied.
 For a child `openat2`, v1 accepts the base `open_how` layout plus zero-filled extension bytes.
 Nonzero extension bytes return `E2BIG`.
+`O_PATH` with any flag outside `O_DIRECTORY`, `O_NOFOLLOW`, and `O_CLOEXEC` (an access mode, `O_CREAT`, `O_TRUNC`) returns `EINVAL`, as the kernel's `openat2` does, and nothing is opened or created; when several apply, `E2BIG` takes precedence, then `EINVAL`, then `EOPNOTSUPP`.
 Nonzero caller `resolve` flags return `EOPNOTSUPP` until their exact interaction with the broker's mandatory resolution flags is specified and tested.
 
 ## 5. The denied-and-recorded set

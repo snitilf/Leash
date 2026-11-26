@@ -712,6 +712,9 @@ impl BrokerState<'_> {
         let Some(held) = self.held.remove(&token) else {
             return self.errno(libc::EBADF);
         };
+        // the supervisor already hands over the bits an O_PATH open honors; masking again
+        // here keeps a stray O_CREAT or O_TRUNC from ever creating or truncating
+        let flags = crate::supervisor::fact::effective_open_flags(flags);
         if flags & u64::try_from(libc::O_TMPFILE).unwrap_or_default()
             == u64::try_from(libc::O_TMPFILE).unwrap_or_default()
         {
@@ -852,17 +855,7 @@ fn open_existing(target: BorrowedFd<'_>, flags: u64, _mode: u32) -> io::Result<O
         return Err(io::Error::from_raw_os_error(libc::EEXIST));
     }
     if flags & u64::try_from(libc::O_PATH).unwrap_or_default() != 0 {
-        if flags & u64::try_from(libc::O_DIRECTORY).unwrap_or_default() != 0 {
-            let mut stat: libc::stat = unsafe { zeroed() };
-            // SAFETY: target is a live descriptor and stat points to writable local storage.
-            if unsafe { libc::fstat(target.as_raw_fd(), &raw mut stat) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
-                return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
-            }
-        }
-        return dup_fd(target);
+        return open_path_substitute(target, flags);
     }
     let path = CString::new(format!("/proc/self/fd/{}", target.as_raw_fd()))
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
@@ -871,6 +864,35 @@ fn open_existing(target: BorrowedFd<'_>, flags: u64, _mode: u32) -> io::Result<O
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
     // SAFETY: path names the retained descriptor and flags were range-checked.
     owned_fd(unsafe { libc::open(path.as_ptr(), clean_flags) })
+}
+
+/// realize an `O_PATH` open (issue #53). `SECCOMP_IOCTL_NOTIF_ADDFD` cannot inject an `O_PATH`
+/// descriptor (the kernel's `fget` rejects `FMODE_PATH` files with EBADF), and answering with
+/// CONTINUE would re-resolve the path the agent can swap (ADR-0020). the broker therefore
+/// returns a read-only descriptor on the same pinned object. the policy already evaluated
+/// the open as a read of that object, so no authority is added. only directories and regular
+/// files are substituted: a read-only open of a fifo can block the broker and one of a device
+/// can have side effects, and a symlink cannot be reopened without following it. those kinds
+/// are refused with EOPNOTSUPP, which the supervisor records as a realization failure.
+fn open_path_substitute(target: BorrowedFd<'_>, flags: u64) -> io::Result<OwnedFd> {
+    let mut stat: libc::stat = unsafe { zeroed() };
+    // SAFETY: target is a live descriptor and stat points to writable local storage.
+    if unsafe { libc::fstat(target.as_raw_fd(), &raw mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let kind = stat.st_mode & libc::S_IFMT;
+    if flags & u64::try_from(libc::O_DIRECTORY).unwrap_or_default() != 0 && kind != libc::S_IFDIR {
+        return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+    }
+    let reopen_flags = match kind {
+        libc::S_IFDIR => libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        libc::S_IFREG => libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC,
+        _ => return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+    };
+    let path = CString::new(format!("/proc/self/fd/{}", target.as_raw_fd()))
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: path names the retained descriptor and the flags are a fixed valid set.
+    owned_fd(unsafe { libc::open(path.as_ptr(), reopen_flags) })
 }
 
 fn truncate_held(path: &HeldPath, length: i64) -> io::Result<i64> {

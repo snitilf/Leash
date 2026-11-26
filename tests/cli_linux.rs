@@ -1332,3 +1332,362 @@ fn enforce_session_without_a_resolvable_state_root_refuses_before_spawn() {
     );
     assert!(marker.exists(), "the record-only agent ran");
 }
+
+const READ_EXEC_POLICY: &str = "schema_version = 1\n\
+     [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+     [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n";
+
+/// issue #53: coreutils `mv dir existing-dir` opens the destination with O_PATH. the
+/// kernel refuses an O_PATH descriptor as an ADDFD source, so the allowed open used to
+/// end the notify loop. the move must now complete and be recorded.
+#[test]
+fn enforce_mv_moves_a_directory_into_an_existing_directory() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir(ws.path().join("a")).unwrap();
+    std::fs::write(ws.path().join("a/file.txt"), b"payload").unwrap();
+    std::fs::create_dir(ws.path().join("b")).unwrap();
+    let (out, state) = run_enforce(READ_EXEC_POLICY, ws.path(), &["/bin/mv", "a", "b"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("notify fd failed"),
+        "the notify loop must survive: {stderr}"
+    );
+    assert!(!ws.path().join("a").exists());
+    assert_eq!(
+        std::fs::read(ws.path().join("b/a/file.txt")).unwrap(),
+        b"payload"
+    );
+    let events = trace_events(&only_run_dir(state.path()));
+    assert!(
+        events.iter().any(|event| {
+            event["syscall"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("rename"))
+                && event["decision"] == "allow"
+        }),
+        "the move must be recorded as an allowed rename: {events:?}"
+    );
+}
+
+/// an ADDFD the kernel refuses (here EMFILE: the agent's descriptor table is full) fails
+/// only that one open, is recorded as a realization failure with the errno the agent
+/// received, and the next syscall is served normally.
+#[test]
+fn enforce_survives_an_addfd_the_kernel_refuses() {
+    let ws = tempfile::tempdir().unwrap();
+    for name in ["one", "two", "three", "four"] {
+        std::fs::write(ws.path().join(name), name).unwrap();
+    }
+    let (out, state) = run_enforce(
+        READ_EXEC_POLICY,
+        ws.path(),
+        &[
+            "/bin/sh",
+            "-c",
+            // descriptors 0-5 fill the table, so the open for descriptor 6 cannot be
+            // installed; the subshell keeps that failure from ending the shell
+            "ulimit -S -n 6; exec 3<one 4<two 5<three; (exec 6<four); \
+             ulimit -S -n 1024; cat one; exit 0",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("notify fd failed"),
+        "one refused injection must not end the loop: {stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "one", "{stderr}");
+    assert!(
+        stderr.contains("Too many open files"),
+        "the agent received EMFILE for the refused open: {stderr}"
+    );
+    let events = trace_events(&only_run_dir(state.path()));
+    assert_allow_then_realization_failure(&events, "/four", "EMFILE");
+}
+
+/// the allowed open is recorded first, then its realization failure as a second event for
+/// the same syscall and path with the errno the agent received.
+fn assert_allow_then_realization_failure(
+    events: &[serde_json::Value],
+    path_suffix: &str,
+    errno: &str,
+) {
+    let failed: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event["errno"] == errno
+                && event["fact"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with(path_suffix))
+        })
+        .collect();
+    assert_eq!(failed.len(), 1, "one recorded failure: {events:?}");
+    let (at, failure) = failed[0];
+    assert_eq!(failure["decision"], "deny");
+    assert_eq!(failure["matched_rule"], "failsafe:realization");
+    let allowed = events[..at]
+        .iter()
+        .rposition(|event| {
+            event["decision"] == "allow"
+                && event["syscall"] == failure["syscall"]
+                && event["pid"] == failure["pid"]
+                && event["fact"] == failure["fact"]
+        })
+        .unwrap_or_else(|| panic!("no allow before the failure: {events:?}"));
+    assert!(
+        events[allowed]["seq"].as_u64() < failure["seq"].as_u64(),
+        "the allow precedes the failure: {events:?}"
+    );
+}
+
+/// the broker creates the file before the ADDFD, so a refused ADDFD on an O_CREAT open
+/// leaves the file behind. the create was allowed and recorded, the failure is recorded
+/// after it, and the loop goes on.
+#[test]
+fn enforce_survives_a_refused_addfd_after_a_create() {
+    let ws = tempfile::tempdir().unwrap();
+    for name in ["one", "two", "three"] {
+        std::fs::write(ws.path().join(name), name).unwrap();
+    }
+    let (out, state) = run_enforce(
+        READ_EXEC_POLICY,
+        ws.path(),
+        &[
+            "/bin/sh",
+            "-c",
+            // descriptors 0-5 fill the table, so the created file's descriptor cannot be
+            // installed; the subshell keeps that failure from ending the shell
+            "ulimit -S -n 6; exec 3<one 4<two 5<three; (exec 6>created); \
+             ulimit -S -n 1024; cat one; exit 0",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("notify fd failed"),
+        "one refused injection must not end the loop: {stderr}"
+    );
+    assert!(
+        stderr.contains("Too many open files"),
+        "the agent received EMFILE for the refused open: {stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "one", "{stderr}");
+    assert!(
+        ws.path().join("created").exists(),
+        "a create committed before the refused ADDFD persists"
+    );
+    let events = trace_events(&only_run_dir(state.path()));
+    assert_allow_then_realization_failure(&events, "/created", "EMFILE");
+    let failure = events
+        .iter()
+        .find(|event| event["errno"] == "EMFILE")
+        .unwrap();
+    assert_eq!(
+        failure["fact"]["access"],
+        serde_json::json!(["write", "create"]),
+        "{failure:?}"
+    );
+}
+
+/// coreutils mv only exercises O_PATH on some versions; this opener does it directly. an
+/// O_PATH directory descriptor must reach the agent, keep or drop FD_CLOEXEC as asked, and
+/// serve as a dirfd for fstatat and openat.
+#[test]
+fn enforce_o_path_descriptor_serves_as_a_dirfd_with_the_requested_close_on_exec() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir(ws.path().join("dir")).unwrap();
+    std::fs::write(ws.path().join("dir/file.txt"), b"payload").unwrap();
+    let script = "import ctypes, errno, fcntl, os\n\
+                  libc=ctypes.CDLL(None,use_errno=True)\n\
+                  def opath(flags):\n    \
+                      fd=libc.syscall(257,-100,b'dir',os.O_PATH|os.O_DIRECTORY|flags)\n    \
+                      assert fd >= 0, ctypes.get_errno()\n    \
+                      return fd\n\
+                  plain=opath(0)\n\
+                  assert fcntl.fcntl(plain,fcntl.F_GETFD) & fcntl.FD_CLOEXEC == 0\n\
+                  cloexec=opath(os.O_CLOEXEC)\n\
+                  assert fcntl.fcntl(cloexec,fcntl.F_GETFD) & fcntl.FD_CLOEXEC != 0\n\
+                  st=os.stat('dir')\n\
+                  assert (os.fstat(plain).st_dev,os.fstat(plain).st_ino) == (st.st_dev,st.st_ino)\n\
+                  assert os.stat('file.txt',dir_fd=plain).st_size == 7\n\
+                  f=os.open('file.txt',os.O_RDONLY,dir_fd=cloexec)\n\
+                  assert os.read(f,16) == b'payload'\n\
+                  print('ok')";
+    let (out, state) = run_enforce(
+        READ_EXEC_POLICY,
+        ws.path(),
+        &["/usr/bin/python3", "-c", script],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n", "{stderr}");
+    let events = trace_events(&only_run_dir(state.path()));
+    let o_path_opens: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["syscall"] == "openat"
+                && event["fact"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/dir"))
+        })
+        .collect();
+    assert_eq!(o_path_opens.len(), 2, "{events:?}");
+    for event in o_path_opens {
+        assert_eq!(event["decision"], "allow", "{event:?}");
+        assert_eq!(event["fact"]["access"], serde_json::json!(["read"]));
+    }
+}
+
+/// the O_PATH substitute reopens only directories and regular files. an allowed O_PATH open
+/// of a fifo, or of a symlink under O_NOFOLLOW, must fail EOPNOTSUPP, be recorded as the
+/// allow followed by its realization failure, and leave the loop serving the agent.
+#[test]
+fn enforce_o_path_of_a_fifo_or_symlink_is_recorded_as_a_realization_failure() {
+    let ws = tempfile::tempdir().unwrap();
+    let fifo = ws.path().join("fifo");
+    let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(made.success(), "mkfifo must succeed");
+    std::fs::write(ws.path().join("target.txt"), b"payload").unwrap();
+    std::os::unix::fs::symlink("target.txt", ws.path().join("link")).unwrap();
+    let script = "import ctypes, errno, os\n\
+                  libc=ctypes.CDLL(None,use_errno=True)\n\
+                  for name, extra in ((b'fifo',0),(b'link',os.O_NOFOLLOW)):\n    \
+                      fd=libc.syscall(257,-100,name,os.O_PATH|extra)\n    \
+                      assert fd == -1 and ctypes.get_errno() == errno.EOPNOTSUPP, (name,fd,ctypes.get_errno())\n\
+                  print(open('target.txt').read())";
+    let (out, state) = run_enforce(
+        READ_EXEC_POLICY,
+        ws.path(),
+        &["/usr/bin/python3", "-c", script],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("notify fd failed"),
+        "a refused kind must not end the loop: {stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "payload\n",
+        "{stderr}"
+    );
+    let events = trace_events(&only_run_dir(state.path()));
+    assert_allow_then_realization_failure(&events, "/fifo", "EOPNOTSUPP");
+    assert_allow_then_realization_failure(&events, "/link", "EOPNOTSUPP");
+}
+
+/// an O_PATH open needs no read permission, but its substitute is a read-only reopen. on a
+/// mode-000 file that reopen fails EACCES, which must be recorded as a realization failure
+/// after the allow rather than pass as an answer the kernel would have given.
+#[test]
+fn enforce_o_path_of_an_unreadable_file_is_recorded_as_a_realization_failure() {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root bypasses the file mode, so the reopen cannot fail EACCES");
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let locked = ws.path().join("locked");
+    std::fs::write(&locked, b"payload").unwrap();
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    let script = "import ctypes, errno, os\n\
+                  libc=ctypes.CDLL(None,use_errno=True)\n\
+                  fd=libc.syscall(257,-100,b'locked',os.O_PATH)\n\
+                  assert fd == -1 and ctypes.get_errno() == errno.EACCES, (fd,ctypes.get_errno())\n\
+                  print('refused')";
+    let (out, state) = run_enforce(
+        READ_EXEC_POLICY,
+        ws.path(),
+        &["/usr/bin/python3", "-c", script],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "refused\n",
+        "{stderr}"
+    );
+    let events = trace_events(&only_run_dir(state.path()));
+    assert_allow_then_realization_failure(&events, "/locked", "EACCES");
+}
+
+/// escape: with O_PATH the kernel ignores the access mode, and the broker realizes the
+/// open as a read-only descriptor. judging O_PATH | O_WRONLY as a write would let a
+/// write-allowed path hand out a readable descriptor on a file whose reads are denied.
+/// the open must be judged as the read it is and denied by the read-deny rule. openat2
+/// refuses the same combination with EINVAL, as the kernel does, and refuses O_PATH |
+/// O_CREAT on a missing name the same way without creating it.
+#[test]
+fn escape_o_path_with_write_access_bits_cannot_bypass_a_read_deny() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join(".env"), b"SECRET=1").unwrap();
+    let policy = format!(
+        "schema_version = 1\n\
+         [[fs]]\npath={:?}\nmode=[\"read\"]\naction=\"deny\"\n\
+         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+         [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+        ws.path().join(".env").to_string_lossy()
+    );
+    let script = "import ctypes, errno, os\n\
+                  libc=ctypes.CDLL(None,use_errno=True)\n\
+                  for extra in (os.O_WRONLY, os.O_RDWR, os.O_WRONLY|os.O_CREAT|os.O_TRUNC):\n    \
+                      fd=libc.syscall(257,-100,b'.env',os.O_PATH|extra)\n    \
+                      assert fd == -1 and ctypes.get_errno() == errno.EACCES, (extra,fd,ctypes.get_errno())\n\
+                  how=(ctypes.c_ulonglong*3)(os.O_PATH|os.O_WRONLY,0,0)\n\
+                  rc=libc.syscall(437,-100,b'.env',ctypes.byref(how),24)\n\
+                  assert rc == -1 and ctypes.get_errno() == errno.EINVAL, (rc,ctypes.get_errno())\n\
+                  how=(ctypes.c_ulonglong*3)(os.O_PATH|os.O_CREAT,0o600,0)\n\
+                  rc=libc.syscall(437,-100,b'missing',ctypes.byref(how),24)\n\
+                  assert rc == -1 and ctypes.get_errno() == errno.EINVAL, (rc,ctypes.get_errno())\n\
+                  print('denied')";
+    let (out, state) = run_enforce(&policy, ws.path(), &["/usr/bin/python3", "-c", script]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "denied\n", "{stderr}");
+    assert_eq!(std::fs::read(ws.path().join(".env")).unwrap(), b"SECRET=1");
+    let events = trace_events(&only_run_dir(state.path()));
+    let denied: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["syscall"] == "openat"
+                && event["fact"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/.env"))
+        })
+        .collect();
+    assert_eq!(denied.len(), 3, "{events:?}");
+    for event in denied {
+        assert_eq!(event["decision"], "deny", "{event:?}");
+        assert_eq!(event["matched_rule"], "fs.1", "{event:?}");
+        assert_eq!(event["fact"]["access"], serde_json::json!(["read"]));
+    }
+    // openat2 refuses the combination before anything is opened, so its fact keeps the raw
+    // access: the write the workspace allows, answered EINVAL with nothing realized
+    let openat2: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["syscall"] == "openat2"
+                && event["fact"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/.env"))
+        })
+        .collect();
+    assert_eq!(
+        openat2.len(),
+        1,
+        "the openat2 attempt is recorded: {events:?}"
+    );
+    assert_eq!(openat2[0]["decision"], "allow", "{:?}", openat2[0]);
+    assert_eq!(
+        openat2[0]["matched_rule"], "base:workspace",
+        "{:?}",
+        openat2[0]
+    );
+    assert_eq!(openat2[0]["fact"]["access"], serde_json::json!(["write"]));
+    assert!(
+        !ws.path().join("missing").exists(),
+        "openat2 with O_PATH | O_CREAT must create nothing"
+    );
+}

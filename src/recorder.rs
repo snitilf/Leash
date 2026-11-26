@@ -161,7 +161,9 @@ pub struct SyscallEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operand_decisions: Option<Vec<FsOperandDecision>>,
     /// symbolic errno the child received on an enforce-mode realization failure
-    /// (`failsafe:realization`); absent on every other event
+    /// (`failsafe:realization`): a path preparation that failed before policy evaluation,
+    /// or an allowed operation whose realization or descriptor injection failed after the
+    /// allow was recorded, written as a second event. absent on every other event
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errno: Option<String>,
 }

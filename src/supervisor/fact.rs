@@ -24,6 +24,16 @@ pub mod flags {
     pub const O_CREAT: u64 = 0o100;
     /// truncate on open; a write effect regardless of access mode
     pub const O_TRUNC: u64 = 0o1000;
+    /// fail unless the path is a directory
+    pub const O_DIRECTORY: u64 = 0o200000;
+    /// do not follow a final symlink
+    pub const O_NOFOLLOW: u64 = 0o400000;
+    /// close the descriptor on exec
+    pub const O_CLOEXEC: u64 = 0o2000000;
+    /// a location-only descriptor; the kernel ignores every bit outside `O_PATH_FLAGS`
+    pub const O_PATH: u64 = 0o10000000;
+    /// the only bits an `O_PATH` open honors (fs/open.c `O_PATH_FLAGS`)
+    pub const O_PATH_FLAGS: u64 = O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
     /// the dirfd value meaning "relative to the caller's cwd" (fcntl.h AT_FDCWD)
     pub const AT_FDCWD: u64 = (-100_i32 as u32) as u64;
 }
@@ -294,6 +304,26 @@ pub fn open_flags_access(open_flags: u64) -> Vec<FsAccess> {
     access
 }
 
+/// the flags a legacy `open`/`openat` acts on. with `O_PATH` the kernel drops every bit
+/// outside `O_PATH_FLAGS` before it looks at them, so `O_PATH | O_WRONLY | O_CREAT` opens no
+/// file for writing and creates nothing. the access a fact records and the open the broker
+/// realizes must be derived from these bits, not the raw register: judging the raw bits
+/// would let a write-allowed path stand in for a read the policy denies.
+pub fn effective_open_flags(open_flags: u64) -> u64 {
+    if open_flags & flags::O_PATH != 0 {
+        open_flags & flags::O_PATH_FLAGS
+    } else {
+        open_flags
+    }
+}
+
+/// whether an `openat2` `how.flags` value is one the kernel refuses with EINVAL because it
+/// pairs `O_PATH` with a bit `O_PATH` does not honor. unlike the legacy calls, `openat2`
+/// rejects the combination instead of ignoring the extra bits.
+pub fn openat2_o_path_invalid(open_flags: u64) -> bool {
+    open_flags & flags::O_PATH != 0 && open_flags & !flags::O_PATH_FLAGS != 0
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -441,6 +471,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_o_path_open_is_judged_as_a_read_whatever_else_it_carries() {
+        use FsAccess::Read;
+        for extra in [
+            flags::O_WRONLY,
+            flags::O_RDWR,
+            flags::O_WRONLY | flags::O_CREAT | flags::O_TRUNC,
+            flags::O_CREAT,
+            flags::O_TRUNC,
+        ] {
+            let effective = effective_open_flags(flags::O_PATH | extra);
+            assert_eq!(effective, flags::O_PATH, "extra bits {extra:#o}");
+            assert_eq!(open_flags_access(effective), vec![Read]);
+        }
+        let kept = flags::O_PATH | flags::O_DIRECTORY | flags::O_NOFOLLOW | flags::O_CLOEXEC;
+        assert_eq!(effective_open_flags(kept | flags::O_WRONLY), kept);
+        let plain = flags::O_WRONLY | flags::O_CREAT;
+        assert_eq!(effective_open_flags(plain), plain, "no O_PATH, no masking");
+    }
+
+    #[test]
+    fn openat2_refuses_o_path_with_bits_it_does_not_honor() {
+        assert!(openat2_o_path_invalid(flags::O_PATH | flags::O_WRONLY));
+        assert!(openat2_o_path_invalid(flags::O_PATH | flags::O_CREAT));
+        assert!(!openat2_o_path_invalid(
+            flags::O_PATH | flags::O_DIRECTORY | flags::O_NOFOLLOW | flags::O_CLOEXEC
+        ));
+        assert!(!openat2_o_path_invalid(flags::O_WRONLY | flags::O_CREAT));
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn pinned_flag_values_match_libc() {
@@ -449,6 +509,10 @@ mod tests {
         assert_eq!(flags::O_RDWR, libc::O_RDWR as u64);
         assert_eq!(flags::O_CREAT, libc::O_CREAT as u64);
         assert_eq!(flags::O_TRUNC, libc::O_TRUNC as u64);
+        assert_eq!(flags::O_DIRECTORY, libc::O_DIRECTORY as u64);
+        assert_eq!(flags::O_NOFOLLOW, libc::O_NOFOLLOW as u64);
+        assert_eq!(flags::O_CLOEXEC, libc::O_CLOEXEC as u64);
+        assert_eq!(flags::O_PATH, libc::O_PATH as u64);
         assert_eq!(flags::AT_FDCWD, u64::from(libc::AT_FDCWD as u32));
     }
 }
