@@ -2,9 +2,9 @@
 
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -14,10 +14,14 @@ const LOCK_XATTR: &CStr = c"user.leash.lock";
 /// the deepest cgroup tree `remove_descendants` walks; a deeper one is refused.
 const MAX_REMOVE_DEPTH: usize = 128;
 
-/// a cgroup pinned by an open directory descriptor.
+/// a cgroup pinned by an open directory descriptor and held control descriptors.
 /// callers must prevent the child from modifying the cgroup or its controls.
 pub struct Cgroup {
     dir: File,
+    procs: File,
+    freeze: File,
+    events: File,
+    kill: File,
 }
 
 impl Cgroup {
@@ -59,7 +63,7 @@ impl Cgroup {
 
     /// the pids currently listed in `cgroup.procs`.
     pub fn members(&self) -> io::Result<Vec<u32>> {
-        self.read_control(c"cgroup.procs")?
+        read_control(&self.procs)?
             .lines()
             .map(|line| {
                 line.trim()
@@ -76,55 +80,23 @@ impl Cgroup {
 
     fn from_dir(dir: File) -> io::Result<Self> {
         ensure_cgroup2(&dir)?;
-        let group = Self { dir };
-        for name in [
-            c"cgroup.procs",
-            c"cgroup.freeze",
-            c"cgroup.events",
-            c"cgroup.kill",
-        ] {
-            if !group
-                .control(name, libc::O_PATH)?
-                .metadata()?
-                .file_type()
-                .is_file()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid cgroup control",
-                ));
-            }
-        }
-        Ok(group)
+        Self::open_controls(dir)
     }
 
-    fn control(&self, name: &CStr, flags: libc::c_int) -> io::Result<File> {
-        // SAFETY: the directory descriptor and nul-terminated control name remain live;
-        // openat returns a new owned descriptor on success.
-        let fd = unsafe {
-            libc::openat(
-                self.dir.as_raw_fd(),
-                name.as_ptr(),
-                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: fd was returned by openat and has not been wrapped elsewhere.
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-
-    fn read_control(&self, name: &CStr) -> io::Result<String> {
-        let mut value = String::new();
-        self.control(name, libc::O_RDONLY)?
-            .read_to_string(&mut value)?;
-        Ok(value)
-    }
-
-    fn write_control(&self, name: &CStr, value: &str) -> io::Result<()> {
-        self.control(name, libc::O_WRONLY)?
-            .write_all(value.as_bytes())
+    fn open_controls(dir: File) -> io::Result<Self> {
+        // open each control file once at cgroup setup so a later chmod 0 on the directory
+        // or its controls cannot block freeze, kill, or event reads.
+        let procs = open_control(&dir, c"cgroup.procs", libc::O_RDWR)?;
+        let freeze = open_control(&dir, c"cgroup.freeze", libc::O_WRONLY)?;
+        let events = open_control(&dir, c"cgroup.events", libc::O_RDONLY)?;
+        let kill = open_control(&dir, c"cgroup.kill", libc::O_WRONLY)?;
+        Ok(Self {
+            dir,
+            procs,
+            freeze,
+            events,
+            kill,
+        })
     }
 
     /// attach a process before it can execute untrusted code.
@@ -135,12 +107,12 @@ impl Cgroup {
                 "pid must be nonzero and must not be the supervisor",
             ));
         }
-        self.write_control(c"cgroup.procs", &pid.to_string())
+        write_control(&self.procs, &pid.to_string())
     }
 
     /// request freeze or thaw and wait for the kernel to confirm it.
     pub fn set_frozen(&self, frozen: bool, timeout: Duration) -> io::Result<()> {
-        self.write_control(c"cgroup.freeze", if frozen { "1" } else { "0" })?;
+        write_control(&self.freeze, if frozen { "1" } else { "0" })?;
         self.wait_event("frozen", frozen, timeout)
     }
 
@@ -150,8 +122,8 @@ impl Cgroup {
     pub fn kill(&self, timeout: Duration) -> io::Result<()> {
         let start = Instant::now();
         loop {
-            self.write_control(c"cgroup.kill", "1")?;
-            let events = self.read_control(c"cgroup.events")?;
+            write_control(&self.kill, "1")?;
+            let events = read_control(&self.events)?;
             if !event_value(&events, "populated")? {
                 return Ok(());
             }
@@ -215,7 +187,7 @@ impl Cgroup {
     fn wait_event(&self, key: &str, expected: bool, timeout: Duration) -> io::Result<()> {
         let start = Instant::now();
         loop {
-            let events = self.read_control(c"cgroup.events")?;
+            let events = read_control(&self.events)?;
             if event_value(&events, key)? == expected {
                 return Ok(());
             }
@@ -230,6 +202,52 @@ impl Cgroup {
             );
         }
     }
+}
+
+fn open_control(dir: &File, name: &CStr, flags: libc::c_int) -> io::Result<File> {
+    // SAFETY: the directory descriptor and nul-terminated control name remain live;
+    // openat returns a new owned descriptor on success.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd was returned by openat and has not been wrapped elsewhere.
+    let file = unsafe { File::from_raw_fd(fd) };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid cgroup control",
+        ));
+    }
+    Ok(file)
+}
+
+fn read_control(file: &File) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut offset = 0u64;
+    loop {
+        let n = file.read_at(&mut buf, offset)?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..n]);
+        offset = offset
+            .checked_add(n as u64)
+            .ok_or_else(|| io::Error::other("cgroup control file too large"))?;
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid cgroup control"))
+}
+
+fn write_control(file: &File, value: &str) -> io::Result<()> {
+    file.write_all_at(value.as_bytes(), 0)
 }
 
 /// open a directory as a pinned cgroup v2 handle, never following a final symlink.
@@ -275,11 +293,12 @@ pub fn rmdir_child_retrying(parent: &File, name: &CStr, retry: Duration) -> io::
 }
 
 /// remove every cgroup beneath the pinned directory `dir`, deepest first, each through the
-/// handle of its parent (`openat` with `O_NOFOLLOW`, `ensure_cgroup2`, `unlinkat` with
-/// `AT_REMOVEDIR`), never through a path. the tree must already be empty of processes;
-/// `EBUSY` is retried for `retry`, because the kernel releases the last dead tasks a moment
-/// after `populated 0`.
+/// handle of its parent (`openat` with `O_NOFOLLOW`, `ensure_cgroup2`, `fchmod` to `0o700`,
+/// `unlinkat` with `AT_REMOVEDIR`), never through a path. the tree must already be empty of
+/// processes; `EBUSY` is retried for `retry`, because the kernel releases the last dead tasks
+/// a moment after `populated 0`.
 pub fn remove_descendants(dir: &File, retry: Duration) -> io::Result<()> {
+    ensure_cgroup2(dir)?;
     remove_descendants_at(dir, retry, 0)
 }
 
@@ -287,30 +306,85 @@ fn remove_descendants_at(dir: &File, retry: Duration, depth: usize) -> io::Resul
     if depth > MAX_REMOVE_DEPTH {
         return Err(io::Error::other("cgroup tree is too deep to remove"));
     }
+    // restore rwx on this pinned directory so an agent `chmod 0` cannot block readdir or
+    // unlinkat on its descendants.
+    fchmod_dir_rwx(dir)?;
     for name in child_dirs(dir)? {
-        // SAFETY: dir and name are live; openat returns a new owned descriptor.
-        let fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
+        let Some(child) = open_descendant_dir(dir, &name)? else {
+            continue;
         };
-        if fd < 0 {
-            let e = io::Error::last_os_error();
-            if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) {
-                continue;
-            }
-            return Err(e);
-        }
-        // SAFETY: fd was returned by openat and is uniquely owned here.
-        let child = unsafe { File::from_raw_fd(fd) };
         ensure_cgroup2(&child)?;
         remove_descendants_at(&child, retry, depth + 1)?;
         drop(child);
         rmdir_child_retrying(dir, &name, retry)?;
     }
     Ok(())
+}
+
+fn fchmod_dir_rwx(dir: &File) -> io::Result<()> {
+    // SAFETY: dir is a live open directory descriptor; fchmod reads no memory.
+    if unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn open_descendant_dir(parent: &File, name: &CStr) -> io::Result<Option<File>> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: parent and name are live; openat returns a new owned descriptor.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd >= 0 {
+        // SAFETY: fd was returned by openat and is uniquely owned here.
+        return Ok(Some(unsafe { File::from_raw_fd(fd) }));
+    }
+    let e = io::Error::last_os_error();
+    if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) {
+        return Ok(None);
+    }
+    if e.raw_os_error() != Some(libc::EACCES) {
+        return Err(e);
+    }
+    // if an agent ran `chmod 0` on a nested cgroup directory, verify it is a cgroup2
+    // directory through an O_PATH + O_NOFOLLOW handle before restoring 0o700 and reopening.
+    // SAFETY: parent and name are live; O_PATH does not require read permission on name.
+    let path_fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if path_fd < 0 {
+        let pe = io::Error::last_os_error();
+        if matches!(pe.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) {
+            return Ok(None);
+        }
+        return Err(pe);
+    }
+    // SAFETY: path_fd was returned by openat and is uniquely owned here.
+    let path_file = unsafe { File::from_raw_fd(path_fd) };
+    ensure_cgroup2(&path_file)?;
+    drop(path_file);
+    // SAFETY: parent is a verified cgroup2 directory (which cannot hold symlinks) and name
+    // was just verified as a cgroup2 directory.
+    if unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), 0o700, 0) } != 0 {
+        let ce = io::Error::last_os_error();
+        if ce.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(None);
+        }
+        return Err(ce);
+    }
+    // SAFETY: parent and name are live; openat returns a new owned descriptor.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        let re = io::Error::last_os_error();
+        if matches!(re.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) {
+            return Ok(None);
+        }
+        return Err(re);
+    }
+    // SAFETY: fd was returned by openat and is uniquely owned here.
+    Ok(Some(unsafe { File::from_raw_fd(fd) }))
 }
 
 /// the names of the subdirectories of `dir`, read through a fresh descriptor so the
@@ -427,7 +501,7 @@ pub fn probe_delegation(parent: &Path, timeout: Duration) -> io::Result<()> {
         if result.is_err()
             && let Some(group) = group.as_ref()
         {
-            thaw = group.write_control(c"cgroup.freeze", "0");
+            thaw = write_control(&group.freeze, "0");
         }
         // SAFETY: pid is our forked probe child, still unreaped.
         unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -692,14 +766,27 @@ mod tests {
         assert!(text.contains("remove failed"));
     }
 
+    fn fake_cgroup(dir: &Path) -> Cgroup {
+        for name in [
+            "cgroup.procs",
+            "cgroup.freeze",
+            "cgroup.events",
+            "cgroup.kill",
+        ] {
+            let path = dir.join(name);
+            if !path.exists() {
+                std::fs::write(path, "").unwrap();
+            }
+        }
+        Cgroup::open_controls(File::open(dir).unwrap()).unwrap()
+    }
+
     #[test]
     fn attach_rejects_supervisor_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("cgroup.procs");
         std::fs::write(&file, "unchanged").unwrap();
-        let group = Cgroup {
-            dir: File::open(dir.path()).unwrap(),
-        };
+        let group = fake_cgroup(dir.path());
         assert_eq!(
             group.attach(std::process::id()).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
@@ -712,9 +799,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("cgroup.procs");
         std::fs::write(&file, "unchanged").unwrap();
-        let group = Cgroup {
-            dir: File::open(dir.path()).unwrap(),
-        };
+        let group = fake_cgroup(dir.path());
         assert_eq!(
             group.attach(0).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
@@ -729,9 +814,7 @@ mod tests {
         let moved = root.path().join("moved");
         std::fs::create_dir(&original).unwrap();
         std::fs::write(original.join("cgroup.procs"), "original").unwrap();
-        let group = Cgroup {
-            dir: File::open(&original).unwrap(),
-        };
+        let group = fake_cgroup(&original);
         std::fs::rename(&original, &moved).unwrap();
         std::fs::create_dir(&original).unwrap();
         std::fs::write(original.join("cgroup.procs"), "decoy").unwrap();
@@ -752,10 +835,10 @@ mod tests {
         let target = root.path().join("target");
         std::fs::write(&target, "unchanged").unwrap();
         std::os::unix::fs::symlink(&target, root.path().join("cgroup.procs")).unwrap();
-        let group = Cgroup {
-            dir: File::open(root.path()).unwrap(),
-        };
-        assert!(group.attach(123456).is_err());
+        for name in ["cgroup.freeze", "cgroup.events", "cgroup.kill"] {
+            std::fs::write(root.path().join(name), "").unwrap();
+        }
+        assert!(Cgroup::open_controls(File::open(root.path()).unwrap()).is_err());
         assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
     }
 
@@ -770,9 +853,7 @@ mod tests {
         ] {
             std::fs::write(dir.path().join(name), content).unwrap();
         }
-        let group = Cgroup {
-            dir: File::open(dir.path()).unwrap(),
-        };
+        let group = fake_cgroup(dir.path());
         assert_eq!(
             group.set_frozen(true, Duration::ZERO).unwrap_err().kind(),
             io::ErrorKind::TimedOut
@@ -809,9 +890,7 @@ mod tests {
             writes
         });
 
-        let group = Cgroup {
-            dir: File::open(dir.path()).unwrap(),
-        };
+        let group = fake_cgroup(dir.path());
         group.kill(Duration::from_secs(2)).unwrap();
         assert!(watcher.join().unwrap() >= 2);
     }

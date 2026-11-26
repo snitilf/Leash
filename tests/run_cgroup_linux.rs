@@ -952,6 +952,129 @@ fn a_policy_grant_that_overlaps_the_cgroup_control_plane_is_refused() {
 }
 
 #[test]
+fn chmod_zero_on_run_cgroup_and_controls_cannot_block_freeze_kill_or_remove() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("chmod_zero_escape") {
+        return;
+    }
+    // SAFETY: geteuid takes no arguments.
+    if unsafe { libc::geteuid() } == 0 {
+        assert!(
+            std::env::var("LEASH_REQUIRE_FREEZER").as_deref() != Ok("1"),
+            "LEASH_REQUIRE_FREEZER=1: chmod_zero_escape must run as an unprivileged user because root ignores mode 0o000"
+        );
+        eprintln!("skipping chmod_zero_escape: root ignores mode 0o000");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = CgroupParent::locate().unwrap();
+    let id = generate_run_id(SystemTime::now()).unwrap();
+    let mut cgroup = RunCgroup::create(&parent, &id).unwrap();
+    let cg_path = cgroup.path().to_path_buf();
+
+    let mut shell = Command::new("/bin/sh")
+        .args(["-c", "read x; sleep 60 & sleep 60 & wait"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = shell.stdin.take().unwrap();
+    cgroup.cgroup().attach(shell.id()).unwrap();
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if cgroup.cgroup().members().unwrap().len() >= 3 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        cgroup.cgroup().members().unwrap().len() >= 3,
+        "shell and both sleeps must be live in the run cgroup"
+    );
+
+    let nested = cg_path.join("nested");
+    let deep = nested.join("deep");
+    std::fs::create_dir_all(&deep).unwrap();
+    let mut deep_sleeper = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    std::fs::write(deep.join("cgroup.procs"), deep_sleeper.id().to_string()).unwrap();
+    assert!(deep_sleeper.try_wait().unwrap().is_none());
+
+    struct Restore {
+        cg: PathBuf,
+        nested: PathBuf,
+        deep: PathBuf,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let mode = std::fs::Permissions::from_mode(0o700);
+            let _ = std::fs::set_permissions(&self.cg, mode.clone());
+            for name in [
+                "cgroup.kill",
+                "cgroup.freeze",
+                "cgroup.events",
+                "cgroup.procs",
+            ] {
+                let _ = std::fs::set_permissions(self.cg.join(name), mode.clone());
+            }
+            let _ = std::fs::set_permissions(&self.nested, mode.clone());
+            let _ = std::fs::set_permissions(&self.deep, mode);
+        }
+    }
+    let _restore = Restore {
+        cg: cg_path.clone(),
+        nested: nested.clone(),
+        deep: deep.clone(),
+    };
+
+    // chmod 0 nested dirs, control files, and the run cgroup directory itself
+    let zero = std::fs::Permissions::from_mode(0o000);
+    std::fs::set_permissions(&deep, zero.clone()).unwrap();
+    std::fs::set_permissions(&nested, zero.clone()).unwrap();
+    for name in [
+        "cgroup.kill",
+        "cgroup.freeze",
+        "cgroup.events",
+        "cgroup.procs",
+    ] {
+        std::fs::set_permissions(cg_path.join(name), zero.clone()).unwrap();
+    }
+    std::fs::set_permissions(&cg_path, zero).unwrap();
+
+    // confirm reopening by path is genuinely blocked by chmod 0
+    let reopen_err = std::fs::OpenOptions::new()
+        .write(true)
+        .open(cg_path.join("cgroup.kill"))
+        .unwrap_err();
+    assert_eq!(reopen_err.kind(), io::ErrorKind::PermissionDenied);
+
+    // held control descriptors and fchmod-before-removal must still freeze, thaw, kill, and remove
+    cgroup
+        .cgroup()
+        .set_frozen(true, Duration::from_secs(2))
+        .unwrap();
+    cgroup
+        .cgroup()
+        .set_frozen(false, Duration::from_secs(2))
+        .unwrap();
+    cgroup.cgroup().kill(Duration::from_secs(5)).unwrap();
+    cgroup.remove().unwrap();
+
+    let shell_status = shell.wait().unwrap();
+    assert!(
+        !shell_status.success(),
+        "shell tree must be terminated: {shell_status:?}"
+    );
+    let deep_status = deep_sleeper.wait().unwrap();
+    assert!(
+        !deep_status.success(),
+        "nested/deep sleeper must be terminated: {deep_status:?}"
+    );
+    assert!(!deep.exists(), "chmod-0 nested/deep cgroup was removed");
+    assert!(!cg_path.exists(), "chmod-0 run cgroup was removed");
+}
+
+#[test]
 fn a_nested_cgroup_inside_a_live_run_cgroup_is_removed_depth_first_and_run_end_is_written() {
     let _guard = spawn_lock();
     if !common::delegated_cgroup_or_skip("nested_cgroup_removal") {
