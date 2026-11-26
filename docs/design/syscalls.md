@@ -291,6 +291,7 @@ identity the policy sees is still read back from the opened handle, so a symlink
 denied.
 For a child `openat2`, v1 accepts the base `open_how` layout plus zero-filled extension bytes.
 Nonzero extension bytes return `E2BIG`.
+`O_PATH` with any flag outside `O_DIRECTORY`, `O_NOFOLLOW`, and `O_CLOEXEC` (an access mode, `O_CREAT`, `O_TRUNC`) returns `EINVAL`, as the kernel's `openat2` does, and nothing is opened or created; when several apply, `E2BIG` takes precedence, then `EINVAL`, then `EOPNOTSUPP`.
 Nonzero caller `resolve` flags return `EOPNOTSUPP` until their exact interaction with the broker's mandatory resolution flags is specified and tested.
 
 ## 5. The denied-and-recorded set
