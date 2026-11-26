@@ -720,7 +720,9 @@ fn handle_fs<N: Notifier, S: TraceSink>(
                 FsInvocation::Mutation(mutation_invocation(sys_nr, notif, &path)?),
             ),
             AccessSpec::OpenFlags { arg } => {
-                let flags = notif.data.args[arg];
+                // with O_PATH the kernel ignores every other bit (access mode, O_CREAT,
+                // O_TRUNC), so the fact and the realization see only the bits it honors
+                let flags = crate::supervisor::fact::effective_open_flags(notif.data.args[arg]);
                 (
                     crate::supervisor::fact::open_flags_access(flags),
                     FsInvocation::Open {
@@ -751,6 +753,10 @@ fn handle_fs<N: Notifier, S: TraceSink>(
                     || bytes[OPEN_HOW_SIZE..].iter().any(|byte| *byte != 0)
                 {
                     Some(libc::E2BIG)
+                } else if crate::supervisor::fact::openat2_o_path_invalid(flags) {
+                    // openat2(2) refuses O_PATH with a bit O_PATH does not honor, where the
+                    // legacy calls ignore it. nothing is opened, so the raw access stands
+                    Some(libc::EINVAL)
                 } else if resolve != 0 {
                     Some(libc::EOPNOTSUPP)
                 } else {

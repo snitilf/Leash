@@ -712,6 +712,9 @@ impl BrokerState<'_> {
         let Some(held) = self.held.remove(&token) else {
             return self.errno(libc::EBADF);
         };
+        // the supervisor already hands over the bits an O_PATH open honors; masking again
+        // here keeps a stray O_CREAT or O_TRUNC from ever creating or truncating
+        let flags = crate::supervisor::fact::effective_open_flags(flags);
         if flags & u64::try_from(libc::O_TMPFILE).unwrap_or_default()
             == u64::try_from(libc::O_TMPFILE).unwrap_or_default()
         {
