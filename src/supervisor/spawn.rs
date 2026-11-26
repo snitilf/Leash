@@ -273,7 +273,7 @@ const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 ///
 /// # Safety
 /// the same contract as `libc::fork`: the child may only do async-signal-safe work.
-unsafe fn fork_process(cgroup_fd: Option<RawFd>) -> libc::pid_t {
+pub(crate) unsafe fn fork_process(cgroup_fd: Option<RawFd>) -> libc::pid_t {
     let Some(fd) = cgroup_fd else {
         // SAFETY: forwarded from the caller.
         return unsafe { libc::fork() };
