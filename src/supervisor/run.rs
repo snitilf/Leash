@@ -2790,6 +2790,31 @@ mod tests {
         assert_eq!(events[0]["errno"], "EOPNOTSUPP");
     }
 
+    /// an O_PATH open needs no read permission, but its substitute is a read-only reopen, so
+    /// EACCES on a file whose mode refuses the broker a read is a realization failure too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dac_refused_o_path_reopen_is_recorded_then_answered() {
+        use crate::recorder::FsAccess::Read;
+        let kernel = FakeNotifier::default();
+        let mut w = writer();
+        let handled = deliver(
+            &kernel,
+            &mut w,
+            &[Read],
+            BrokerResult::Errno(libc::EACCES),
+            true,
+        )
+        .unwrap();
+        assert_eq!(handled, Handled::Responded);
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        let events = events(w);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["decision"], "deny");
+        assert_eq!(events[0]["matched_rule"], "failsafe:realization");
+        assert_eq!(events[0]["errno"], "EACCES");
+    }
+
     /// any other broker errno is the answer the open would have had, already covered by
     /// the allow event: it is sent as is with no second event.
     #[cfg(target_os = "linux")]
@@ -2798,6 +2823,7 @@ mod tests {
         use crate::recorder::FsAccess::Read;
         for (errno, o_path) in [
             (libc::EOPNOTSUPP, false),
+            (libc::EACCES, false),
             (libc::ENOTDIR, true),
             (libc::EEXIST, false),
         ] {

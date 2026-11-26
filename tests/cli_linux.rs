@@ -1578,6 +1578,41 @@ fn enforce_o_path_of_a_fifo_or_symlink_is_recorded_as_a_realization_failure() {
     assert_allow_then_realization_failure(&events, "/link", "EOPNOTSUPP");
 }
 
+/// an O_PATH open needs no read permission, but its substitute is a read-only reopen. on a
+/// mode-000 file that reopen fails EACCES, which must be recorded as a realization failure
+/// after the allow rather than pass as an answer the kernel would have given.
+#[test]
+fn enforce_o_path_of_an_unreadable_file_is_recorded_as_a_realization_failure() {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root bypasses the file mode, so the reopen cannot fail EACCES");
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let locked = ws.path().join("locked");
+    std::fs::write(&locked, b"payload").unwrap();
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    let script = "import ctypes, errno, os\n\
+                  libc=ctypes.CDLL(None,use_errno=True)\n\
+                  fd=libc.syscall(257,-100,b'locked',os.O_PATH)\n\
+                  assert fd == -1 and ctypes.get_errno() == errno.EACCES, (fd,ctypes.get_errno())\n\
+                  print('refused')";
+    let (out, state) = run_enforce(
+        READ_EXEC_POLICY,
+        ws.path(),
+        &["/usr/bin/python3", "-c", script],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "refused\n",
+        "{stderr}"
+    );
+    let events = trace_events(&only_run_dir(state.path()));
+    assert_allow_then_realization_failure(&events, "/locked", "EACCES");
+}
+
 /// escape: with O_PATH the kernel ignores the access mode, and the broker realizes the
 /// open as a read-only descriptor. judging O_PATH | O_WRONLY as a write would let a
 /// write-allowed path hand out a readable descriptor on a file whose reads are denied.
