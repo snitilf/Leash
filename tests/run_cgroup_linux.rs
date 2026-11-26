@@ -1488,3 +1488,39 @@ fn cleanup_stale_isolates_fifo_and_symlink_errors_and_still_cleans_valid_stale_c
     assert!(!valid_cg.cgroup.exists());
     valid_cg.sleeper.wait().unwrap();
 }
+
+#[test]
+fn run_cgroup_gone_walks_missing_parent_under_cgroup2_but_marks_non_cgroup2_unknown() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("run_cgroup_gone_ancestor") {
+        return;
+    }
+    let parent = CgroupParent::locate().unwrap();
+    let id = generate_run_id(SystemTime::now()).unwrap();
+    let name = format!("leash-{id}");
+
+    // a missing parent beneath a real cgroup2 ancestor (such as a vanished systemd-run scope)
+    // reports Gone, whether one or several parent levels disappeared.
+    let vanished_scope = parent.path().join("vanished.scope").join(&name);
+    assert_eq!(
+        run_cgroup_gone(&vanished_scope, &id).unwrap(),
+        RunCgroupState::Gone
+    );
+    let vanished_nested = parent
+        .path()
+        .join("vanished.slice")
+        .join("vanished.scope")
+        .join(&name);
+    assert_eq!(
+        run_cgroup_gone(&vanished_nested, &id).unwrap(),
+        RunCgroupState::Gone
+    );
+
+    // a missing parent under /tmp has a non-cgroup2 nearest existing ancestor, so it stays Unknown.
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_missing = tmp.path().join("vanished.scope").join(&name);
+    assert_eq!(
+        run_cgroup_gone(&tmp_missing, &id).unwrap(),
+        RunCgroupState::Unknown
+    );
+}

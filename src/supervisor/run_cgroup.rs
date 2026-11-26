@@ -116,12 +116,14 @@ pub enum RunCgroupError {
 /// cgroup namespace can expose a different hierarchy at the same path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunCgroupState {
-    /// the parent cgroup2 directory exists in this namespace and `leash-<run-id>` is absent.
+    /// the run cgroup is absent under its pinned cgroup2 parent, or its parent directory is
+    /// absent under an existing cgroup2 ancestor (such as a vanished transient scope).
     Gone,
     /// the parent cgroup2 directory exists and `leash-<run-id>` is still present under it.
     Present,
-    /// the parent directory is missing, not on a cgroup2 filesystem, or inaccessible here,
-    /// so absence cannot be proven; callers must treat this as not gone.
+    /// the nearest existing ancestor is not on a cgroup2 filesystem, or the parent directory
+    /// is inaccessible or unresolvable here, so absence cannot be proven; callers must treat
+    /// this as not gone.
     Unknown,
 }
 
@@ -314,6 +316,9 @@ impl RunLock {
             path: path.clone(),
             source,
         };
+        // acquire opens run.lock inside the newly created run directory with O_NONBLOCK |
+        // O_NOFOLLOW | O_CLOEXEC and verifies it is a regular file via fstat below; openat2
+        // is not needed here because the supervisor just created run_dir.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -676,16 +681,22 @@ pub fn cleanup_stale(
 /// check whether the run cgroup recorded for `run_id` is gone, still present, or
 /// unresolvable from this mount and cgroup namespace (ADR-0024 decision 17).
 ///
-/// `recorded` is `run_cgroup` from the run metadata; it must be an absolute path ending in
-/// `leash-<run_id>`, or this returns `Err(InvalidInput)` rather than trust a forged path.
-/// when the parent directory is missing, not on a cgroup2 filesystem, or inaccessible here,
-/// this returns `Ok(RunCgroupState::Unknown)` instead of failing open as `Gone`.
+/// `recorded` is `run_cgroup` from the run metadata; it must be an absolute path without
+/// `..` components ending in `leash-<run_id>`, or this returns `Err(InvalidInput)` rather
+/// than trust a forged path. when opening the parent directory returns `ENOENT` (for example
+/// after a transient `systemd-run --scope` unit tears down), this walks up to the nearest
+/// existing ancestor and returns `Ok(RunCgroupState::Gone)` if that ancestor is on a cgroup2
+/// filesystem; a non-cgroup2 ancestor, `EACCES`, or any other unresolvable path returns
+/// `Ok(RunCgroupState::Unknown)` instead of failing open as `Gone`.
 ///
 /// `leash rewind` must treat `RunCgroupState::Unknown` as not gone and must also take
 /// `<run_dir>/run.lock` before modifying the workspace.
 pub fn run_cgroup_gone(recorded: &Path, run_id: &str) -> io::Result<RunCgroupState> {
     let (name, cname) = cgroup_name(run_id).map_err(io::Error::other)?;
     if !recorded.is_absolute()
+        || recorded
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
         || recorded.file_name().and_then(|n| n.to_str()) != Some(name.as_str())
     {
         return Err(io::Error::new(
@@ -699,8 +710,22 @@ pub fn run_cgroup_gone(recorded: &Path, run_id: &str) -> io::Result<RunCgroupSta
             "recorded run cgroup has no parent directory",
         ));
     };
-    let Ok(parent_dir) = cgroup::open_cgroup_dir(parent_path) else {
-        return Ok(RunCgroupState::Unknown);
+    let parent_dir = match cgroup::open_cgroup_dir(parent_path) {
+        Ok(dir) => dir,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+            let mut ancestor = parent_path.parent();
+            while let Some(dir) = ancestor {
+                match cgroup::open_cgroup_dir(dir) {
+                    Ok(_) => return Ok(RunCgroupState::Gone),
+                    Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {
+                        ancestor = dir.parent();
+                    }
+                    Err(_) => return Ok(RunCgroupState::Unknown),
+                }
+            }
+            return Ok(RunCgroupState::Unknown);
+        }
+        Err(_) => return Ok(RunCgroupState::Unknown),
     };
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: parent_dir, cname, and stat are live for the call.
@@ -811,13 +836,26 @@ mod tests {
         );
         assert!(run_cgroup_gone(Path::new("/nonexistent/leash-other"), id).is_err());
         assert!(run_cgroup_gone(Path::new("relative/leash-20260708T183005Z-7k3m4q"), id).is_err());
+        assert!(
+            run_cgroup_gone(
+                Path::new("/sys/fs/cgroup/../tmp/leash-20260708T183005Z-7k3m4q"),
+                id
+            )
+            .is_err()
+        );
         assert!(run_cgroup_gone(Path::new("/nonexistent/x"), "not-an-id").is_err());
-        // a directory on a regular filesystem is not a cgroup2 mount, so it stays Unknown
+        // a directory on a regular filesystem is not a cgroup2 mount, so it stays Unknown,
+        // including when its parent directory is missing under /tmp
         let dir = tempfile::tempdir().unwrap();
         let present = dir.path().join(format!("leash-{id}"));
         std::fs::create_dir(&present).unwrap();
         assert_eq!(
             run_cgroup_gone(&present, id).unwrap(),
+            RunCgroupState::Unknown
+        );
+        let missing_parent = dir.path().join("missing-scope").join(format!("leash-{id}"));
+        assert_eq!(
+            run_cgroup_gone(&missing_parent, id).unwrap(),
             RunCgroupState::Unknown
         );
     }
