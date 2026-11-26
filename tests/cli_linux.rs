@@ -1413,3 +1413,58 @@ fn enforce_survives_an_addfd_the_kernel_refuses() {
         "{failed:?}"
     );
 }
+
+/// escape: with O_PATH the kernel ignores the access mode, and the broker realizes the
+/// open as a read-only descriptor. judging O_PATH | O_WRONLY as a write would let a
+/// write-allowed path hand out a readable descriptor on a file whose reads are denied.
+/// the open must be judged as the read it is and denied by the read-deny rule. openat2
+/// refuses the same combination with EINVAL, as the kernel does.
+#[test]
+fn escape_o_path_with_write_access_bits_cannot_bypass_a_read_deny() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join(".env"), b"SECRET=1").unwrap();
+    let policy = format!(
+        "schema_version = 1\n\
+         [[fs]]\npath={:?}\nmode=[\"read\"]\naction=\"deny\"\n\
+         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+         [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+        ws.path().join(".env").to_string_lossy()
+    );
+    let script = "import ctypes, errno, os\n\
+                  libc=ctypes.CDLL(None,use_errno=True)\n\
+                  for extra in (os.O_WRONLY, os.O_RDWR, os.O_WRONLY|os.O_CREAT|os.O_TRUNC):\n    \
+                      fd=libc.syscall(257,-100,b'.env',os.O_PATH|extra)\n    \
+                      assert fd == -1 and ctypes.get_errno() == errno.EACCES, (extra,fd,ctypes.get_errno())\n\
+                  how=(ctypes.c_ulonglong*3)(os.O_PATH|os.O_WRONLY,0,0)\n\
+                  rc=libc.syscall(437,-100,b'.env',ctypes.byref(how),24)\n\
+                  assert rc == -1 and ctypes.get_errno() == errno.EINVAL, (rc,ctypes.get_errno())\n\
+                  print('denied')";
+    let (out, state) = run_enforce(&policy, ws.path(), &["/usr/bin/python3", "-c", script]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "denied\n", "{stderr}");
+    assert_eq!(std::fs::read(ws.path().join(".env")).unwrap(), b"SECRET=1");
+    let events = trace_events(&only_run_dir(state.path()));
+    let denied: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["syscall"] == "openat"
+                && event["fact"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/.env"))
+        })
+        .collect();
+    assert_eq!(denied.len(), 3, "{events:?}");
+    for event in denied {
+        assert_eq!(event["decision"], "deny", "{event:?}");
+        assert_eq!(event["matched_rule"], "fs.1", "{event:?}");
+        assert_eq!(event["fact"]["access"], serde_json::json!(["read"]));
+    }
+    assert!(
+        events.iter().any(|event| event["syscall"] == "openat2"
+            && event["fact"]["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("/.env"))),
+        "the openat2 attempt is recorded: {events:?}"
+    );
+}
