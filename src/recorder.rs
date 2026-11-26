@@ -166,9 +166,12 @@ pub struct CgroupKillEvent {
     /// processes listed in `cgroup.procs` just before the kill, when it could be read
     #[serde(skip_serializing_if = "Option::is_none")]
     pub processes: Option<u32>,
-    /// present when the kill or the removal failed or did not finish in time
+    /// present when opening or killing the cgroup failed or did not reach `populated 0` in time
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// present when `cgroup.kill` succeeded but removing the cgroup or its descendants failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removal_error: Option<String>,
 }
 
 /// a mediated syscall event (trace.md section 2).
@@ -888,6 +891,7 @@ mod tests {
                 cgroup: "leash-x".into(),
                 processes: Some(2),
                 error: None,
+                removal_error: None,
             }),
         };
         assert_eq!(
@@ -895,6 +899,26 @@ mod tests {
             json!({
                 "seq": 3, "ts": 9, "type": "cgroup_kill",
                 "reason": "stale_cleanup", "cgroup": "leash-x", "processes": 2
+            })
+        );
+
+        let removal_failed = Event {
+            seq: 4,
+            ts: 10,
+            body: EventBody::CgroupKill(CgroupKillEvent {
+                reason: CgroupKillReason::RunEnd,
+                cgroup: "leash-x".into(),
+                processes: Some(0),
+                error: None,
+                removal_error: Some("permission denied".into()),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&removal_failed).unwrap(),
+            json!({
+                "seq": 4, "ts": 10, "type": "cgroup_kill",
+                "reason": "run_end", "cgroup": "leash-x", "processes": 0,
+                "removal_error": "permission denied"
             })
         );
     }

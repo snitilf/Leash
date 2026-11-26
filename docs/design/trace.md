@@ -126,7 +126,8 @@ Non-snapshot runs write neither.
   `reason` is `run_end` (the root exited and leftover processes were killed), `abort` (the run failed closed and the whole tree was killed), or `stale_cleanup` (the cgroup of a dead run was found at the start of this run and removed).
   `cgroup` is the killed cgroup's name.
   `processes` is the count listed in `cgroup.procs` just before the kill, and is absent when the list could not be read.
-  `error` is present only when the kill or the removal failed or did not reach `populated 0` in time.
+  `error` is present only when opening or killing the cgroup failed or did not reach `populated 0` in time.
+  `removal_error` is present only when the kill succeeded and removing the cgroup directory or its descendants failed; at run end that failure is recorded here without discarding `run_end`.
   At run end the event precedes `run_end`.
   An abort event is written on a best-effort basis, because the trace itself may be what failed.
 

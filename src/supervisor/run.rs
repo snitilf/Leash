@@ -1736,7 +1736,7 @@ fn require_matching_filter(installed: bool, required: bool) -> Result<(), RunErr
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::run_loop;
+pub use linux::{run_loop, run_loop_with_cgroup_kill};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -1827,33 +1827,73 @@ mod linux {
     /// and every error kills the whole cgroup, not only the direct child, and the cgroup
     /// directory is removed on the way out (ADR-0024 decisions 11 and 12).
     pub fn run_loop<S: TraceSink>(
-        mut child: SupervisedChild,
+        child: SupervisedChild,
         config: RunConfig<'_>,
         writer: &mut TraceWriter<S>,
     ) -> Result<RunOutcome, RunError> {
+        run_loop_with_cgroup_kill(child, config, writer, &RunCgroup::kill_all)
+    }
+
+    /// `run_loop` with an injectable cgroup kill operation, the seam tests use to exercise a
+    /// `cgroup.kill` timeout failing closed without test-only branches in production code.
+    pub fn run_loop_with_cgroup_kill<S: TraceSink>(
+        mut child: SupervisedChild,
+        config: RunConfig<'_>,
+        writer: &mut TraceWriter<S>,
+        kill_cgroup: &dyn Fn(
+            &RunCgroup,
+            crate::recorder::CgroupKillReason,
+        ) -> crate::recorder::CgroupKillEvent,
+    ) -> Result<RunOutcome, RunError> {
         let Some(mut cgroup) = child.cgroup.take() else {
-            return run_loop_in(child, config, writer, None);
+            let mut run_end_kill_done = false;
+            return run_loop_in(
+                child,
+                config,
+                writer,
+                None,
+                kill_cgroup,
+                &mut run_end_kill_done,
+            );
         };
-        let result = run_loop_in(child, config, writer, Some(&cgroup));
+        let mut run_end_kill_done = false;
+        let result = run_loop_in(
+            child,
+            config,
+            writer,
+            Some(&mut cgroup),
+            kill_cgroup,
+            &mut run_end_kill_done,
+        );
         if result.is_err() {
-            // the loop already killed the direct child; take the rest of the tree with it.
-            // best-effort record: the run is already failing, so a trace error here only
-            // loses the note, never the kill.
-            let event = cgroup.kill_all(crate::recorder::CgroupKillReason::Abort);
-            let _ = writer.append(now_ms(), EventBody::CgroupKill(event));
+            if !run_end_kill_done {
+                // the loop already killed the direct child; take the rest of the tree with it.
+                // best-effort record: the run is already failing, so a trace error here only
+                // loses the note, never the kill.
+                let mut event = kill_cgroup(&cgroup, crate::recorder::CgroupKillReason::Abort);
+                if event.error.is_none()
+                    && let Err(e) = cgroup.remove()
+                {
+                    event.removal_error = Some(e.to_string());
+                }
+                let _ = writer.append(now_ms(), EventBody::CgroupKill(event));
+            } else {
+                let _ = cgroup.remove();
+            }
         }
-        let removed = cgroup.remove().map_err(RunError::RunCgroup);
-        match result {
-            Ok(outcome) => removed.map(|()| outcome),
-            Err(e) => Err(e),
-        }
+        result
     }
 
     fn run_loop_in<S: TraceSink>(
         child: SupervisedChild,
         config: RunConfig<'_>,
         writer: &mut TraceWriter<S>,
-        cgroup: Option<&RunCgroup>,
+        cgroup: Option<&mut RunCgroup>,
+        kill_cgroup: &dyn Fn(
+            &RunCgroup,
+            crate::recorder::CgroupKillReason,
+        ) -> crate::recorder::CgroupKillEvent,
+        run_end_kill_done: &mut bool,
     ) -> Result<RunOutcome, RunError> {
         let config = match config.validate() {
             Ok(config) => config,
@@ -1875,7 +1915,7 @@ mod linux {
             .capture
             .map(|_| crate::snapshot::StepClock::new(crate::snapshot::STEP_WINDOW));
         // a run cgroup ends the run at the root's exit: a pidfd for the root joins the poll set
-        let root_pidfd = match cgroup.map(|_| pidfd_open(child.pid)).transpose() {
+        let root_pidfd = match cgroup.as_ref().map(|_| pidfd_open(child.pid)).transpose() {
             Ok(fd) => fd,
             Err(e) => {
                 abort_run(&child);
@@ -1975,8 +2015,16 @@ mod linux {
         if let Some(cgroup) = cgroup {
             // the root is reaped; whatever is left in the cgroup outlived it. kill it and
             // wait for populated 0 before the final capture (ADR-0024 decision 12).
-            let event = cgroup.kill_all(crate::recorder::CgroupKillReason::RunEnd);
+            *run_end_kill_done = true;
+            let mut event = kill_cgroup(cgroup, crate::recorder::CgroupKillReason::RunEnd);
             let incomplete = event.error.clone();
+            if incomplete.is_none()
+                && let Err(e) = cgroup.remove()
+            {
+                // kill succeeded and populated reached 0, so a removal failure is recorded
+                // on the event without discarding the completed run or blocking run_end.
+                event.removal_error = Some(e.to_string());
+            }
             writer.append(now_ms(), EventBody::CgroupKill(event))?;
             if let Some(error) = incomplete {
                 return Err(RunError::RunCgroup(io::Error::other(error)));
