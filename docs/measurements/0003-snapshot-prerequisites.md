@@ -381,3 +381,55 @@ Numbers refer to the decisions in ADR-0024.
   Freeze and kill worked with no controller and with the parent holding processes.
   Enabling controllers needs a supervisor leaf and an empty parent, and the root cgroup of a container needs evacuating first, so the no-controller choice avoids all three failure modes.
   The `systemd-run --user --scope -p Delegate=yes` hint in decision 2 rests on documentation, not on this measurement, because systemd was not available.
+
+## 8. Addendum: `CLONE_INTO_CGROUP` after `cgroup.kill` (kill-sequence rule)
+
+Measured 2026-11-26 in the same privileged GitHub codespace environment (`Linux 6.8.0-1070-azure #78~22.04.1-Ubuntu SMP`, `x86_64`, `uid=1000(vscode)` inside a `vscode`-owned delegated cgroup under `/sys/fs/cgroup`).
+
+### Method
+
+Question: when does `clone3(CLONE_INTO_CGROUP)` deliver an immediate `SIGKILL` to the newly created child after `cgroup.kill` has been written to a cgroup?
+
+A small C harness (`test_killseq.c`) ran unprivileged as `vscode` inside a `vscode`-owned delegated cgroup `BASE=/sys/fs/cgroup/leash-exp-<pid>` (`sudo mkdir -p "$BASE" && sudo chown -R "$(id -u):$(id -g)" "$BASE"` and `echo $$ | sudo tee "$BASE/cgroup.procs"`).
+For each scenario, the harness created fresh test cgroups under `BASE`, wrote `"1"` to the specified `cgroup.kill` control files zero, one, or two times, then forked a helper that moved itself into the caller cgroup via `cgroup.procs` and called `syscall(SYS_clone3, &args, sizeof(args))` with `CLONE_INTO_CGROUP` and `exit_signal = SIGCHLD` targeting the destination cgroup directory fd.
+The child attempted to write one byte to a pipe and call `_exit(0)`; the helper recorded the child's wait status (`EXITED` or `SIGNALED`) and whether the byte arrived (`pipe=1` or `pipe=0`).
+Every scenario ran in 3 consecutive trials, and all test cgroups were removed on exit.
+
+```sh
+gcc -O2 -Wall -o test_killseq test_killseq.c
+echo $$ | sudo tee "$BASE/cgroup.procs" > /dev/null
+./test_killseq "$BASE"
+```
+
+### Result
+
+All 13 scenarios behaved identically in 3 of 3 trials:
+
+| Scenario | Caller kill count | Target kill count | Result (3 of 3) |
+|---|---|---|---|
+| 1. control: fresh caller -> fresh target | 0 | 0 | `EXITED:0:pipe=1` |
+| 2. target killed once while empty | 0 | 1 | `SIGNALED:9:pipe=0` |
+| 3. caller killed once -> fresh target | 1 | 0 | `SIGNALED:9:pipe=0` |
+| 4. caller killed once -> target killed once | 1 | 1 | `EXITED:0:pipe=1` |
+| 5. caller killed once -> target killed twice | 1 | 2 | `SIGNALED:9:pipe=0` |
+| 6. parent P killed with existing child C; caller in P -> C | 1 | 1 | `EXITED:0:pipe=1` |
+| 7a. sibling B killed; caller in A -> fresh sibling C | 0 | 0 | `EXITED:0:pipe=1` |
+| 7b. sibling B killed; caller in A -> killed sibling B | 0 | 1 | `SIGNALED:9:pipe=0` |
+| 8a. only child C killed; caller in P -> C | 0 | 1 | `SIGNALED:9:pipe=0` |
+| 8b. only child C killed; caller in P -> fresh child D | 0 | 0 | `EXITED:0:pipe=1` |
+| 9. caller in killed P -> unrelated fresh Z | 1 | 0 | `SIGNALED:9:pipe=0` |
+| 10. caller in killed K -> child `K/after` created after kill | 1 | 0 | `SIGNALED:9:pipe=0` |
+| 11. target killed after holding a process and reaching `populated 0` | 0 | 1 | `SIGNALED:9:pipe=0` |
+| 12. caller in killed K -> same K | 1 | 1 | `EXITED:0:pipe=1` |
+| 13. caller killed twice -> target killed twice | 2 | 2 | `EXITED:0:pipe=1` |
+
+Every helper process that migrated into a previously killed cgroup via `cgroup.procs` survived migration without error (scenarios 3, 4, 5, 6, 9, 10, 12 and 13).
+In every killed case (`SIGNALED:9:pipe=0`), the child never ran a user instruction and closed the pipe with 0 bytes written.
+
+A companion check (`test_xattr.c`) on the same kernel verified that unprivileged `fsetxattr` and `fgetxattr` for `user.leash.lock` succeed on a `vscode`-owned cgroup2 directory fd (`fsetxattr+fgetxattr OK: 123:456789 (len=10)`).
+
+### Verdict
+
+- On Linux 6.8, each cgroup starts at kill count 0 at `mkdir` even when its parent has a nonzero kill count (scenario 10), and writing `cgroup.kill` increments the kill count of the written cgroup and every existing descendant whether or not processes are present (scenarios 2, 6, 7a, 8b, 11): CONFIRMED (3 of 3 across all scenarios).
+- `clone3(CLONE_INTO_CGROUP)` delivers immediate `SIGKILL` to the child whenever the caller's cgroup kill count differs from the target cgroup's kill count, and allows the child to survive whenever the two counts are equal (scenarios 1 to 13): CONFIRMED (3 of 3 across all scenarios).
+- Consequence for Leash: Leash must never write `cgroup.kill` to the run cgroup before spawning the agent into it, and `probe_delegation` must enter its sacrificial probe cgroup through `clone3(CLONE_INTO_CGROUP)` rather than `cgroup.procs` so a Leash process running inside a previously killed parent cgroup refuses before creating a run directory.
