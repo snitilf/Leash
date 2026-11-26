@@ -1416,18 +1416,17 @@ fn assert_allow_then_realization_failure(
     let failed: Vec<_> = events
         .iter()
         .enumerate()
-        .filter(|(_, event)| event["errno"] == errno)
+        .filter(|(_, event)| {
+            event["errno"] == errno
+                && event["fact"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with(path_suffix))
+        })
         .collect();
     assert_eq!(failed.len(), 1, "one recorded failure: {events:?}");
     let (at, failure) = failed[0];
     assert_eq!(failure["decision"], "deny");
     assert_eq!(failure["matched_rule"], "failsafe:realization");
-    assert!(
-        failure["fact"]["path"]
-            .as_str()
-            .is_some_and(|path| path.ends_with(path_suffix)),
-        "{failure:?}"
-    );
     let allowed = events[..at]
         .iter()
         .rposition(|event| {
@@ -1539,6 +1538,44 @@ fn enforce_o_path_descriptor_serves_as_a_dirfd_with_the_requested_close_on_exec(
         assert_eq!(event["decision"], "allow", "{event:?}");
         assert_eq!(event["fact"]["access"], serde_json::json!(["read"]));
     }
+}
+
+/// the O_PATH substitute reopens only directories and regular files. an allowed O_PATH open
+/// of a fifo, or of a symlink under O_NOFOLLOW, must fail EOPNOTSUPP, be recorded as the
+/// allow followed by its realization failure, and leave the loop serving the agent.
+#[test]
+fn enforce_o_path_of_a_fifo_or_symlink_is_recorded_as_a_realization_failure() {
+    let ws = tempfile::tempdir().unwrap();
+    let fifo = ws.path().join("fifo");
+    let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(made.success(), "mkfifo must succeed");
+    std::fs::write(ws.path().join("target.txt"), b"payload").unwrap();
+    std::os::unix::fs::symlink("target.txt", ws.path().join("link")).unwrap();
+    let script = "import ctypes, errno, os\n\
+                  libc=ctypes.CDLL(None,use_errno=True)\n\
+                  for name, extra in ((b'fifo',0),(b'link',os.O_NOFOLLOW)):\n    \
+                      fd=libc.syscall(257,-100,name,os.O_PATH|extra)\n    \
+                      assert fd == -1 and ctypes.get_errno() == errno.EOPNOTSUPP, (name,fd,ctypes.get_errno())\n\
+                  print(open('target.txt').read())";
+    let (out, state) = run_enforce(
+        READ_EXEC_POLICY,
+        ws.path(),
+        &["/usr/bin/python3", "-c", script],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("notify fd failed"),
+        "a refused kind must not end the loop: {stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "payload\n",
+        "{stderr}"
+    );
+    let events = trace_events(&only_run_dir(state.path()));
+    assert_allow_then_realization_failure(&events, "/fifo", "EOPNOTSUPP");
+    assert_allow_then_realization_failure(&events, "/link", "EOPNOTSUPP");
 }
 
 /// escape: with O_PATH the kernel ignores the access mode, and the broker realizes the
