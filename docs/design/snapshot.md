@@ -54,7 +54,7 @@ Any failure after that and before the run directory exists removes the empty cgr
 Stale cleanup skips a cgroup that has no `run.lock`, so no other run touches the new cgroup in the meantime.
 The run lock is taken and bound to the cgroup once the run directory exists, after `run_start` is synced and before the broker forks.
 The lock is close-on-exec and the broker closes every other descriptor first, so it never holds the lock.
-A failure to take or bind the lock happens after the run directory exists, so it is recorded: a `cgroup_kill` event with reason `abort` and the error, removes the empty cgroup, writes no `run_end` and exits 125.
+A failure to take or bind the lock happens after the run directory exists, so the run records a `cgroup_kill` event with reason `abort` and the error, removes the empty cgroup, writes no `run_end` and exits 125.
 A per-run `flock` on `<run_dir>/run.lock`, held for the whole run, marks the run alive, and its `<st_dev>:<st_ino>` identity is stored in the `user.leash.lock` xattr of the run cgroup directory.
 At the start of every snapshot run Leash kills and removes the sibling `leash-<run-id>` cgroups under its current parent whose name validates, whose `run.lock` resolves beneath its state root without symlinks as a regular file, whose lock can be taken, and whose `user.leash.lock` xattr matches that lock inode, and records each in the new trace.
 It never touches a cgroup whose lock is held, whose lock file does not exist under its state root, whose `user.leash.lock` xattr is absent or differs (such as a copied state root with a fresh `run.lock` inode), or whose name is not exactly `leash-` and a generated run id.
