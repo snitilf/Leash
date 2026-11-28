@@ -36,6 +36,10 @@ pub enum RecorderError {
     /// the trace could not be written; the action it describes must not proceed
     #[error("trace write failed: {0}")]
     Write(#[source] io::Error),
+    /// the trace was written but could not be flushed or made durable. the event is whole in
+    /// the file, unlike after a `Write` error, which may have left a torn line
+    #[error("trace sync failed: {0}")]
+    Sync(#[source] io::Error),
     /// the per-run directory could not be established; the run does not start
     #[error("run directory setup failed: {0}")]
     Setup(#[source] io::Error),
@@ -527,47 +531,30 @@ impl<S: TraceSink> TraceSink for FailNthWrite<S> {
 pub struct TraceWriter<S: TraceSink> {
     sink: S,
     next_seq: u64,
-    /// set when a write failed: the sink may now end in a torn line, so every later append
-    /// is refused rather than glued onto it
-    torn: bool,
 }
 
 impl<S: TraceSink> TraceWriter<S> {
     /// wrap a sink; the first event gets seq 0.
     pub fn new(sink: S) -> Self {
-        Self {
-            sink,
-            next_seq: 0,
-            torn: false,
-        }
+        Self { sink, next_seq: 0 }
     }
 
     /// append one event, assigning the next sequence number. returns the seq on success.
-    /// a serialization error leaves the writer usable. a write error may leave a torn line in
-    /// the sink, so the writer refuses every later append: an event glued onto a torn line
-    /// would make the whole trace unparseable. a failed `sync` does not tear anything and
-    /// does not stop later appends.
+    /// on any error the event did not land and the writer must not be used again. a
+    /// `RecorderError::Write` may have left a torn line in the sink.
     pub fn append(&mut self, ts: u64, body: EventBody) -> Result<u64, RecorderError> {
-        if self.torn {
-            return Err(RecorderError::Write(io::Error::other(
-                "the trace may end in a torn line after a failed write",
-            )));
-        }
         let seq = self.next_seq;
         let mut line = serde_json::to_vec(&Event { seq, ts, body })?;
         line.push(b'\n');
-        if let Err(e) = self.sink.write_all(&line) {
-            self.torn = true;
-            return Err(RecorderError::Write(e));
-        }
+        self.sink.write_all(&line).map_err(RecorderError::Write)?;
         self.next_seq = seq + 1;
         Ok(seq)
     }
 
     /// flush and fsync; called at step boundaries and run end (trace.md section 4).
     pub fn sync(&mut self) -> Result<(), RecorderError> {
-        self.sink.flush().map_err(RecorderError::Write)?;
-        self.sink.sync().map_err(RecorderError::Write)
+        self.sink.flush().map_err(RecorderError::Sync)?;
+        self.sink.sync().map_err(RecorderError::Sync)
     }
 
     /// give the sink back (used by tests to inspect what was written).
@@ -1260,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_write_leaves_a_torn_line_and_refuses_every_later_append() {
+    fn a_failed_write_leaves_a_torn_line_and_is_a_write_error() {
         let mut writer = TraceWriter::new(FailNthWrite::new(FakeSink::default(), 2));
         writer.append(1, step_body(0)).unwrap();
         let err = writer.append(2, step_body(1)).unwrap_err();
@@ -1268,9 +1255,8 @@ mod tests {
             err.to_string().contains("injected failure of write 2"),
             "{err}"
         );
-        let refused = writer.append(3, step_body(2)).unwrap_err();
-        assert!(matches!(refused, RecorderError::Write(_)), "{refused}");
-        // the sink holds the first line and half of the second, and nothing was glued on
+        assert!(matches!(err, RecorderError::Write(_)), "{err}");
+        // the sink holds the first line and half of the second
         let bytes = writer.into_inner().inner.bytes;
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text.lines().count(), 2, "{text}");
@@ -1278,11 +1264,13 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_sync_does_not_stop_later_appends() {
+    fn a_failed_sync_is_a_sync_error_and_the_event_is_whole() {
         let mut writer = TraceWriter::new(FailNthSync::new(FakeSink::default(), 1));
         writer.append(1, step_body(0)).unwrap();
-        writer.sync().unwrap_err();
-        writer.append(2, step_body(1)).unwrap();
+        let err = writer.sync().unwrap_err();
+        assert!(matches!(err, RecorderError::Sync(_)), "{err}");
+        let text = String::from_utf8(writer.into_inner().inner.bytes).unwrap();
+        assert!(text.ends_with('\n'), "{text}");
     }
 
     #[test]

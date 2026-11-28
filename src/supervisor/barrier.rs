@@ -248,6 +248,28 @@ pub fn fail_boundary<S: TraceSink>(
     }
 }
 
+/// record that the step event failed and build the error that aborts the run. after a
+/// `RecorderError::Write` the trace may end in a torn line, and a `capture_failed` appended
+/// to it would be glued onto that line and make the trace unparseable, so none is written. a
+/// `RecorderError::Sync` leaves the event whole in the file, so `capture_failed` follows it
+/// and un-commits the step.
+pub fn fail_step_event<S: TraceSink>(
+    writer: &mut TraceWriter<S>,
+    ts: u64,
+    step: u64,
+    error: RecorderError,
+) -> RunError {
+    let message = error.to_string();
+    if !matches!(error, RecorderError::Write(_)) {
+        record_capture_failed(writer, ts, step, CapturePhase::StepEvent, &message);
+    }
+    RunError::Barrier {
+        step,
+        phase: CapturePhase::StepEvent,
+        message,
+    }
+}
+
 /// commit one step: write its event, make the trace durable, add the digest to the chain,
 /// and print it to stderr so a crashed run still showed its digests (ADR-0024 decision
 /// 16). an error means the step is not committed.
@@ -413,7 +435,7 @@ mod tests {
         // the first write is the step event: half of it lands, then the write fails
         let mut writer = TraceWriter::new(FailNthWrite::new(Sink(Vec::new()), 1));
         let error = commit_step(&mut writer, 5, &capture, 0, &published, Duration::ZERO)
-            .map_err(|e| fail_boundary(&mut writer, 6, 0, CapturePhase::StepEvent, e))
+            .map_err(|e| fail_step_event(&mut writer, 6, 0, e))
             .unwrap_err();
         assert!(matches!(
             error,
@@ -436,7 +458,7 @@ mod tests {
         let published = capture.capture(0).unwrap();
         let mut writer = TraceWriter::new(FailNthSync::new(Sink(Vec::new()), 1));
         let error = commit_step(&mut writer, 5, &capture, 0, &published, Duration::ZERO)
-            .map_err(|e| fail_boundary(&mut writer, 6, 0, CapturePhase::StepEvent, e))
+            .map_err(|e| fail_step_event(&mut writer, 6, 0, e))
             .unwrap_err();
         assert!(matches!(error, RunError::Barrier { .. }));
         let text = String::from_utf8(writer.into_inner().into_inner().0).unwrap();

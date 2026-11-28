@@ -2626,7 +2626,7 @@ mod linux {
     use super::*;
     use crate::recorder::CapturePhase;
     use crate::supervisor::barrier::{
-        BarrierOps, commit_step, fail_boundary, record_capture_failed,
+        BarrierOps, commit_step, fail_boundary, fail_step_event, record_capture_failed,
     };
     use crate::supervisor::mem::proc::ChildMem;
     use crate::supervisor::notify::NotifyFd;
@@ -2963,9 +2963,8 @@ mod linux {
                 let published = capture
                     .capture(step)
                     .map_err(|e| fail_boundary(writer, now_ms(), step, CapturePhase::Capture, e))?;
-                commit_step(writer, now_ms(), capture, step, &published, Duration::ZERO).map_err(
-                    |e| fail_boundary(writer, now_ms(), step, CapturePhase::StepEvent, e),
-                )?;
+                commit_step(writer, now_ms(), capture, step, &published, Duration::ZERO)
+                    .map_err(|e| fail_step_event(writer, now_ms(), step, e))?;
                 // the final step is committed by now, so this failure is recorded as its own
                 // phase and never uncommits the step (trace.md section 2)
                 let head = capture.chain_head().map_err(|e| {
@@ -3033,7 +3032,7 @@ mod linux {
         // the event must be durable before the thaw, so the pause it records ends here
         let pause = froze_at.elapsed();
         commit_step(writer, now_ms(), capture, step, &published, pause)
-            .map_err(|e| fail_boundary(writer, now_ms(), step, CapturePhase::StepEvent, e))?;
+            .map_err(|e| fail_step_event(writer, now_ms(), step, e))?;
         (ops.thaw)(cgroup, ops.thaw_timeout)
             .map_err(|e| fail_boundary(writer, now_ms(), step, CapturePhase::Thaw, e))?;
         Ok(())

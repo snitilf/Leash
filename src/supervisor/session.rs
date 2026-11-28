@@ -242,7 +242,9 @@ mod linux {
     };
     use crate::snapshot::BoundaryCapture;
     use crate::snapshot::store::Limits;
-    use crate::supervisor::barrier::{BarrierOps, StoreCapture, commit_step, fail_boundary};
+    use crate::supervisor::barrier::{
+        BarrierOps, StoreCapture, commit_step, fail_boundary, fail_step_event,
+    };
     use crate::supervisor::broker::Broker;
     use crate::supervisor::cgroup;
     use crate::supervisor::cgroup_mounts::CgroupMounts;
@@ -760,15 +762,7 @@ mod linux {
                 ))
             })?;
             commit_step(writer, now_ms()?, &capture, 0, &published, Duration::ZERO).map_err(
-                |e| {
-                    SessionError::Run(fail_boundary(
-                        writer,
-                        now_ms().unwrap_or(0),
-                        0,
-                        CapturePhase::StepEvent,
-                        e,
-                    ))
-                },
+                |e| SessionError::Run(fail_step_event(writer, now_ms().unwrap_or(0), 0, e)),
             )?;
             Some(capture)
         } else {
