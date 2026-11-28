@@ -45,7 +45,7 @@ pub enum Change {
     MetadataChanged {
         /// relative path.
         path: String,
-        /// changed fields, in the fixed order mode, uid, gid, mtime, xattrs.
+        /// changed fields, in the fixed order mode, uid, gid, mtime, xattrs, acl.
         fields: Vec<&'static str>,
     },
     /// a regular file removed at `from` and added at `to` with identical content.
@@ -93,8 +93,8 @@ impl Change {
 /// compare two manifests. output is sorted by path (a rename by its `from`), and a
 /// manifest compared with itself yields no changes.
 ///
-/// a file whose content changed reports `Modified` and, separately, any mode, uid, gid
-/// or xattr change; its mtime is expected to move and is not reported. hard links are
+/// a file whose content changed reports `Modified` and, separately, any mode, uid, gid,
+/// xattr or ACL change; its mtime is expected to move and is not reported. hard links are
 /// treated as one object: names sharing an inode that gain new content are each
 /// `Modified`, never renamed. `LinkChanged` considers only names present in both
 /// manifests, so adding or removing one name does not flag its surviving siblings.
@@ -219,8 +219,20 @@ fn compare_present(
     if !content_changed && (o.mtime_sec, o.mtime_nsec) != (n.mtime_sec, n.mtime_nsec) {
         fields.push("mtime");
     }
-    if o.xattrs != n.xattrs {
+    // the ACLs live in the same map as the user xattrs but read as their own field
+    fn split(e: &ManifestEntry) -> (BTreeMap<&String, &String>, BTreeMap<&String, &String>) {
+        let (acl, user) = e
+            .xattrs
+            .iter()
+            .partition(|(name, _)| super::acl::is_acl_name(name));
+        (user, acl)
+    }
+    let ((old_user, old_acl), (new_user, new_acl)) = (split(o), split(n));
+    if old_user != new_user {
         fields.push("xattrs");
+    }
+    if old_acl != new_acl {
+        fields.push("acl");
     }
     if !fields.is_empty() {
         out.push(Change::MetadataChanged {
@@ -533,6 +545,45 @@ mod tests {
         assert_eq!(
             diff(&man(vec![file("a", "one")]), &man(vec![s])),
             vec![modified("a")]
+        );
+    }
+
+    #[test]
+    fn an_acl_change_is_labelled_acl_and_not_xattrs() {
+        let old = man(vec![file("a", "x"), dir("d")]);
+        let mut a = file("a", "x");
+        a.xattrs
+            .insert("system.posix_acl_access".into(), "02".into());
+        let mut d = dir("d");
+        d.xattrs
+            .insert("system.posix_acl_default".into(), "02".into());
+        d.xattrs.insert("user.k".into(), "00".into());
+        assert_eq!(
+            diff(&old, &man(vec![a, d])),
+            vec![
+                Change::MetadataChanged {
+                    path: "a".into(),
+                    fields: vec!["acl"]
+                },
+                Change::MetadataChanged {
+                    path: "d".into(),
+                    fields: vec!["xattrs", "acl"]
+                },
+            ]
+        );
+        // an ACL that did not change is not reported when only a user xattr did
+        let mut with_acl = file("a", "x");
+        with_acl
+            .xattrs
+            .insert("system.posix_acl_access".into(), "02".into());
+        let mut both = with_acl.clone();
+        both.xattrs.insert("user.k".into(), "00".into());
+        assert_eq!(
+            diff(&man(vec![with_acl]), &man(vec![both])),
+            vec![Change::MetadataChanged {
+                path: "a".into(),
+                fields: vec!["xattrs"]
+            }]
         );
     }
 

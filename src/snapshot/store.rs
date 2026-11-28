@@ -22,6 +22,7 @@ use std::io;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::acl;
 use super::diff::display_path;
 
 /// current manifest schema version.
@@ -162,13 +163,24 @@ pub enum StoreError {
         /// lossy or escaped relative path for diagnostics.
         path: String,
     },
-    /// an unsupported extended attribute (anything other than `user.*` and `security.selinux`).
+    /// an unsupported extended attribute (anything other than `user.*`, the two POSIX ACL
+    /// attributes and `security.selinux`).
     #[error("unsupported extended attribute {attr:?} at {}", display_path(.path))]
     UnsupportedMetadata {
         /// relative path of the entry.
         path: String,
         /// attribute name.
         attr: String,
+    },
+    /// a POSIX ACL attribute whose value the store cannot record or restore exactly.
+    #[error("malformed POSIX ACL {attr:?} at {}: {reason}", display_path(.path))]
+    MalformedAcl {
+        /// relative path of the entry.
+        path: String,
+        /// attribute name (`system.posix_acl_access` or `system.posix_acl_default`).
+        attr: String,
+        /// what is wrong with the value.
+        reason: &'static str,
     },
     /// a regular file changed size or mtime while it was being read.
     #[error("file modified during capture at {}", display_path(.path))]
@@ -331,7 +343,9 @@ pub struct ManifestEntry {
     /// shared group id for regular-file entries that are hard links to the same inode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_group: Option<u64>,
-    /// `user.*` extended attributes with lowercase hex-encoded values (files and dirs only).
+    /// `user.*` extended attributes and the POSIX ACLs (`system.posix_acl_access`, and
+    /// `system.posix_acl_default` on directories) with lowercase hex-encoded values (files and
+    /// dirs only).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub xattrs: BTreeMap<String, String>,
 }
@@ -414,7 +428,7 @@ pub fn check_file_unchanged(
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum XattrAction {
-    /// record this `user.*` attribute.
+    /// record this `user.*` or POSIX ACL attribute.
     Record,
     /// ignore `security.selinux` so SELinux-labeled hosts do not fail captures.
     Ignore,
@@ -424,13 +438,14 @@ pub(crate) enum XattrAction {
 
 /// decide how to handle an extended attribute name.
 ///
-/// `user.*` is recorded, `security.selinux` is ignored, and all other namespaces are
-/// rejected fail-closed.
+/// `user.*` and the two POSIX ACL attributes are recorded, `security.selinux` is ignored, and
+/// all other names are rejected fail-closed. whether an ACL value is well formed, and
+/// whether a default ACL is on a directory, is checked where the entry kind is known.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn classify_xattr(name: &str) -> XattrAction {
     if name == "security.selinux" {
         XattrAction::Ignore
-    } else if name.starts_with("user.") {
+    } else if name.starts_with("user.") || acl::is_acl_name(name) {
         XattrAction::Record
     } else {
         XattrAction::Reject
@@ -461,7 +476,9 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, StoreError> {
 /// - entries whose parent directory is missing or not a directory
 /// - invalid mode bits (`> 0o7777`) or invalid `mtime_nsec`
 /// - missing or extraneous kind-specific fields
-/// - malformed lowercase hex in `sha256` or `xattrs` values, or non-`user.` xattr names
+/// - malformed lowercase hex in `sha256` or `xattrs` values, xattr names other than `user.*` and
+///   the two POSIX ACLs (the default ACL only on directories), and ACL values that are not a
+///   well-formed blob or whose access ACL disagrees with the entry mode
 /// - `link_group` members that disagree on size, digest, mode, owner, mtime or xattrs
 /// - `totals` that disagree with `entries`
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), StoreError> {
@@ -512,7 +529,11 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), StoreError> {
         }
 
         for (attr, hex_val) in &entry.xattrs {
-            if !attr.starts_with("user.") || attr.contains('\0') {
+            let is_acl = acl::is_acl_name(attr);
+            if !(attr.starts_with("user.") || is_acl)
+                || attr.contains('\0')
+                || (attr == acl::DEFAULT && entry.kind != EntryKind::Dir)
+            {
                 return Err(StoreError::InvalidManifest {
                     reason: format!(
                         "entry {:?} has disallowed xattr name {:?}",
@@ -520,13 +541,30 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), StoreError> {
                     ),
                 });
             }
-            if !is_valid_hex(hex_val) {
+            let Some(value) = hex_decode(hex_val) else {
                 return Err(StoreError::InvalidManifest {
                     reason: format!(
                         "entry {:?} xattr {:?} has malformed hex value",
                         entry.path, attr
                     ),
                 });
+            };
+            if is_acl {
+                let checked = acl::validate_blob(&value).and_then(|()| {
+                    if attr == acl::ACCESS {
+                        acl::check_mode(&value, entry.mode)
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(why) = checked {
+                    return Err(StoreError::InvalidManifest {
+                        reason: format!(
+                            "entry {:?} xattr {:?} is not a usable POSIX ACL: {why}",
+                            entry.path, attr
+                        ),
+                    });
+                }
             }
         }
 
@@ -721,6 +759,20 @@ pub(crate) fn is_valid_hex(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// decode lowercase hex, or `None` when `s` is not valid lowercase hex.
+pub(crate) fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !is_valid_hex(s) {
+        return None;
+    }
+    s.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let digits = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(digits, 16).ok()
+        })
+        .collect()
+}
+
 pub(crate) fn is_valid_sha256_hex(s: &str) -> bool {
     s.len() == 64 && is_valid_hex(s)
 }
@@ -766,7 +818,7 @@ mod linux {
         CaptureStats, EntryKind, FileFingerprint, Limits, MANIFEST_READ_CAP,
         MANIFEST_SCHEMA_VERSION, Manifest, ManifestEntry, ManifestTotals, Published, RefusedEntry,
         StoreError, TRACE_LINE_CAP, TRACE_STEP_CAP, TraceRead, TraceRunStart, UNCAPTURED_SHA256,
-        XattrAction, check_file_unchanged, classify_xattr, hex_encode, is_valid_sha256_hex,
+        XattrAction, acl, check_file_unchanged, classify_xattr, hex_encode, is_valid_sha256_hex,
         manifest_digest, parse_manifest, parse_step_filename, step_manifest_filename,
     };
 
@@ -1036,7 +1088,14 @@ mod linux {
         })
     }
 
-    fn read_xattrs(fd: RawFd, path: &str) -> Result<BTreeMap<String, String>, StoreError> {
+    /// read the recorded xattrs of the open entry: `user.*` and the POSIX ACLs. `kind` and
+    /// `mode` are those of the entry, which decide whether an ACL value is acceptable.
+    fn read_xattrs(
+        fd: RawFd,
+        path: &str,
+        kind: EntryKind,
+        mode: u32,
+    ) -> Result<BTreeMap<String, String>, StoreError> {
         let list_buf = {
             let mut result = Vec::new();
             for _ in 0..MAX_XATTR_RETRIES {
@@ -1098,6 +1157,26 @@ mod linux {
                             attr: name.to_owned(),
                         })?;
                     let value = read_one_xattr(fd, &c_name, path)?;
+                    if acl::is_acl_name(name) {
+                        let checked = if name == acl::DEFAULT && kind != EntryKind::Dir {
+                            Err("a default ACL on something other than a directory")
+                        } else {
+                            acl::validate_blob(&value).and_then(|()| {
+                                if name == acl::ACCESS {
+                                    acl::check_mode(&value, mode)
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                        };
+                        if let Err(reason) = checked {
+                            return Err(StoreError::MalformedAcl {
+                                path: path.to_owned(),
+                                attr: name.to_owned(),
+                                reason,
+                            });
+                        }
+                    }
                     xattrs.insert(name.to_owned(), hex_encode(&value));
                 }
             }
@@ -1401,7 +1480,12 @@ mod linux {
                         });
                     }
 
-                    let xattrs = read_xattrs(entry_file.as_raw_fd(), &rel_path)?;
+                    let xattrs = read_xattrs(
+                        entry_file.as_raw_fd(),
+                        &rel_path,
+                        EntryKind::File,
+                        st.st_mode & 0o7777,
+                    )?;
                     let inode_key = (st.st_nlink > 1).then_some((st.st_dev, st.st_ino));
 
                     let sha256 = if let Some(key) = inode_key
@@ -1451,7 +1535,12 @@ mod linux {
                     });
                 }
                 libc::S_IFDIR => {
-                    let xattrs = read_xattrs(entry_file.as_raw_fd(), &rel_path)?;
+                    let xattrs = read_xattrs(
+                        entry_file.as_raw_fd(),
+                        &rel_path,
+                        EntryKind::Dir,
+                        st.st_mode & 0o7777,
+                    )?;
                     let child_names =
                         DirStream::open_from_dir_fd(entry_file.as_raw_fd(), &rel_path)?
                             .read_names(&rel_path)?;
@@ -1847,10 +1936,13 @@ mod linux {
         if !is_reg_mode(st.st_mode) || u64::try_from(st.st_size).ok() != Some(size) {
             return Err("changed while scanning");
         }
-        let xattrs = read_xattrs(file.as_raw_fd(), "").map_err(|e| match e {
-            StoreError::UnsupportedMetadata { .. } => "unsupported extended attribute",
-            _ => "unreadable file",
-        })?;
+        let xattrs = read_xattrs(file.as_raw_fd(), "", EntryKind::File, st.st_mode & 0o7777)
+            .map_err(|e| match e {
+                StoreError::UnsupportedMetadata { .. } | StoreError::MalformedAcl { .. } => {
+                    "unsupported extended attribute"
+                }
+                _ => "unreadable file",
+            })?;
         let Some(buf) = buf else {
             return Ok((None, xattrs));
         };
@@ -1968,9 +2060,17 @@ mod linux {
                     };
                     match openat_dir(parent_fd, &c_name, &rel_path) {
                         Ok(dir) => {
-                            match read_xattrs(dir.as_raw_fd(), &rel_path) {
+                            match read_xattrs(
+                                dir.as_raw_fd(),
+                                &rel_path,
+                                EntryKind::Dir,
+                                st.st_mode & 0o7777,
+                            ) {
                                 Ok(xattrs) => dir_entry.xattrs = xattrs,
-                                Err(StoreError::UnsupportedMetadata { .. }) => {
+                                Err(
+                                    StoreError::UnsupportedMetadata { .. }
+                                    | StoreError::MalformedAcl { .. },
+                                ) => {
                                     refused.push(RefusedEntry {
                                         path: rel_path.clone(),
                                         reason: "unsupported extended attribute (left in place)",
@@ -2903,19 +3003,125 @@ mod tests {
     }
 
     #[test]
-    fn classify_xattr_allows_user_ignores_selinux_rejects_others() {
+    fn classify_xattr_records_user_and_posix_acls_ignores_selinux_rejects_others() {
         assert_eq!(classify_xattr("user.foo"), XattrAction::Record);
         assert_eq!(classify_xattr("user.a.b"), XattrAction::Record);
         assert_eq!(classify_xattr("security.selinux"), XattrAction::Ignore);
         assert_eq!(classify_xattr("security.capability"), XattrAction::Reject);
         assert_eq!(
             classify_xattr("system.posix_acl_access"),
-            XattrAction::Reject
+            XattrAction::Record
         );
+        assert_eq!(
+            classify_xattr("system.posix_acl_default"),
+            XattrAction::Record
+        );
+        assert_eq!(classify_xattr("system.posix_acl"), XattrAction::Reject);
+        assert_eq!(classify_xattr("system.other"), XattrAction::Reject);
         assert_eq!(
             classify_xattr("trusted.overlay.opaque"),
             XattrAction::Reject
         );
+    }
+
+    /// rwx owner, r-x mask, a named user, nothing for other (mode 0o750), as hex.
+    fn acl_hex() -> String {
+        let mut b = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (1u16, 7u16, u32::MAX),
+            (2, 5, 1000),
+            (4, 4, u32::MAX),
+            (0x10, 5, u32::MAX),
+            (0x20, 0, u32::MAX),
+        ] {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&perm.to_le_bytes());
+            b.extend_from_slice(&id.to_le_bytes());
+        }
+        hex_encode(&b)
+    }
+
+    #[test]
+    fn a_manifest_accepts_the_two_acl_names_where_they_belong() {
+        let mut f = sample_file("a", 1, &valid_sha('a'));
+        f.mode = 0o750;
+        f.xattrs.insert(acl::ACCESS.into(), acl_hex());
+        let mut d = sample_dir("d");
+        d.mode = 0o750;
+        d.xattrs.insert(acl::ACCESS.into(), acl_hex());
+        d.xattrs.insert(acl::DEFAULT.into(), acl_hex());
+        d.xattrs.insert("user.tag".into(), "6869".into());
+        let m = manifest_from_entries(vec![f, d]);
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn a_manifest_refuses_a_default_acl_off_a_directory() {
+        let mut f = sample_file("a", 1, &valid_sha('a'));
+        f.xattrs.insert(acl::DEFAULT.into(), acl_hex());
+        let m = manifest_from_entries(vec![f]);
+        assert!(matches!(
+            validate_manifest(&m),
+            Err(StoreError::InvalidManifest { .. })
+        ));
+    }
+
+    #[test]
+    fn a_manifest_refuses_a_malformed_or_inconsistent_acl() {
+        let good = acl_hex();
+        let wrong_version = format!("01000000{}", &good[8..]);
+        let torn = good[..good.len() - 2].to_owned();
+        for (name, value) in [
+            (acl::ACCESS, String::new()),
+            (acl::ACCESS, "02000000".to_owned()),
+            (acl::ACCESS, wrong_version),
+            (acl::ACCESS, torn),
+            (acl::DEFAULT, "zz".to_owned()),
+            (acl::DEFAULT, "00".to_owned()),
+        ] {
+            let mut d = sample_dir("d");
+            d.mode = 0o750;
+            d.xattrs.insert(name.into(), value.clone());
+            let m = manifest_from_entries(vec![d]);
+            assert!(
+                matches!(
+                    validate_manifest(&m),
+                    Err(StoreError::InvalidManifest { .. })
+                ),
+                "{name} {value}"
+            );
+        }
+        // the access ACL must agree with the mode, or setting the mode would rewrite it
+        let mut f = sample_file("a", 1, &valid_sha('a'));
+        f.mode = 0o644;
+        f.xattrs.insert(acl::ACCESS.into(), good);
+        let m = manifest_from_entries(vec![f]);
+        assert!(matches!(
+            validate_manifest(&m),
+            Err(StoreError::InvalidManifest { .. })
+        ));
+    }
+
+    #[test]
+    fn a_manifest_still_refuses_other_system_and_privileged_names() {
+        for name in [
+            "system.posix_acl",
+            "system.posix_acl_access2",
+            "system.other",
+            "security.capability",
+            "trusted.overlay.opaque",
+        ] {
+            let mut f = sample_file("a", 1, &valid_sha('a'));
+            f.xattrs.insert(name.into(), "00".into());
+            let m = manifest_from_entries(vec![f]);
+            assert!(
+                matches!(
+                    validate_manifest(&m),
+                    Err(StoreError::InvalidManifest { .. })
+                ),
+                "{name}"
+            );
+        }
     }
 
     #[test]

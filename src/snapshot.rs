@@ -23,6 +23,9 @@ use std::time::{Duration, Instant};
 /// content-addressed exact snapshot store (ADR-0022).
 pub mod store;
 
+/// POSIX ACL xattr blobs: names and structural validation (ADR-0022 supported state).
+pub mod acl;
+
 /// pure comparison of two snapshot manifests (FR-13).
 pub mod diff;
 
