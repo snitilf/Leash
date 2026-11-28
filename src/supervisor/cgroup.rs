@@ -486,14 +486,7 @@ pub fn probe_delegation(parent: &Path, timeout: Duration) -> io::Result<()> {
         child_pid = Some(pid);
 
         let handshake = read_probe_handshake(ready_rx.as_raw_fd(), timeout)?;
-        if handshake.is_empty() {
-            return Err(io::Error::other(
-                "probe child died before starting (possible cgroup kill-sequence mismatch)",
-            ));
-        }
-        if handshake != b"R" {
-            return Err(io::Error::other("probe child sent an unexpected handshake"));
-        }
+        check_probe_handshake(&handshake)?;
 
         let pid_u32 = u32::try_from(pid).map_err(io::Error::other)?;
         if !group.members()?.contains(&pid_u32) {
@@ -566,9 +559,13 @@ fn spawn_probe_child(cgroup_fd: Option<RawFd>) -> io::Result<(libc::pid_t, Owned
         unsafe {
             // die with the supervisor: a leaked probe would keep its cgroup populated for
             // good. the parent may already be gone, which getppid reveals.
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0
-                || libc::getppid() != parent_pid
-            {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                // say so, so the parent does not blame the kill sequence for a silent exit
+                let failed = *b"P";
+                let _ = libc::write(write_fd, failed.as_ptr().cast(), 1);
+                libc::_exit(125);
+            }
+            if libc::getppid() != parent_pid {
                 libc::_exit(125);
             }
             libc::close(read_fd);
@@ -599,6 +596,22 @@ fn spawn_probe_child(cgroup_fd: Option<RawFd>) -> io::Result<(libc::pid_t, Owned
     drop(write_end);
     drop(dev_null);
     Ok((pid, read_end))
+}
+
+/// what the probe child's handshake bytes say: `R` is ready, `P` is a failed
+/// `PR_SET_PDEATHSIG`, nothing at all is a child that died at birth.
+fn check_probe_handshake(handshake: &[u8]) -> io::Result<()> {
+    match handshake {
+        b"R" => Ok(()),
+        b"P" => Err(io::Error::other(
+            "probe child could not ask the kernel to kill it when the supervisor dies \
+             (prctl PR_SET_PDEATHSIG failed)",
+        )),
+        [] => Err(io::Error::other(
+            "probe child died before starting (possible cgroup kill-sequence mismatch)",
+        )),
+        _ => Err(io::Error::other("probe child sent an unexpected handshake")),
+    }
 }
 
 /// read up to 2 bytes from the probe pipe until EOF or `timeout`.
@@ -748,6 +761,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(probe_delegation(dir.path(), Duration::ZERO).is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_probe_handshake_names_each_way_the_child_can_fail() {
+        assert!(check_probe_handshake(b"R").is_ok());
+        let pdeathsig = check_probe_handshake(b"P").unwrap_err().to_string();
+        assert!(pdeathsig.contains("PR_SET_PDEATHSIG"), "{pdeathsig}");
+        let silent = check_probe_handshake(b"").unwrap_err().to_string();
+        assert!(silent.contains("kill-sequence"), "{silent}");
+        assert!(check_probe_handshake(b"X").is_err());
     }
 
     #[test]
