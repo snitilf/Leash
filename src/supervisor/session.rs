@@ -225,7 +225,10 @@ pub enum SessionError {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{SessionHooks, run_session, run_session_with_hooks, run_session_with_writer};
+pub use linux::{
+    SessionHooks, run_session, run_session_with_hooks, run_session_with_trace_sink,
+    run_session_with_writer,
+};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -281,6 +284,9 @@ mod linux {
         pub barrier: BarrierOps<'a>,
         /// the hard caps of every capture of a snapshot run (ADR-0024 decision 14).
         pub limits: Limits,
+        /// computes the chain head over the committed digests at run end; tests make it fail,
+        /// which a store of valid digests never does.
+        pub chain_head: crate::supervisor::barrier::ChainHeadFn<'a>,
     }
 
     impl Default for SessionHooks<'_> {
@@ -292,6 +298,7 @@ mod linux {
                 capabilities: &preflight::probe,
                 barrier: BarrierOps::default(),
                 limits: Limits::default(),
+                chain_head: &crate::snapshot::restore::chain_head,
             }
         }
     }
@@ -318,6 +325,17 @@ mod linux {
     pub fn run_session_with_hooks(
         spec: SessionSpec,
         hooks: SessionHooks<'_>,
+    ) -> Result<SessionOutcome, SessionError> {
+        run_session_with_trace_sink(spec, hooks, |file| file)
+    }
+
+    /// `run_session_with_hooks` with the trace file wrapped before the run writes to it: the
+    /// seam tests use to make a sync fail (`recorder::FailNthSync`) at a point no agent can
+    /// reach. a real run passes the file through unchanged.
+    pub fn run_session_with_trace_sink<S: TraceSink>(
+        spec: SessionSpec,
+        hooks: SessionHooks<'_>,
+        wrap_trace: impl FnOnce(std::fs::File) -> S,
     ) -> Result<SessionOutcome, SessionError> {
         refuse_snapshot_integrity_outside_enforce(&spec)?;
         // first, before any run directory, broker or child exists (ADR-0024 decision 9)
@@ -403,7 +421,7 @@ mod linux {
             Some(id) => RunDir::create_with_id(&spec.state_root, &meta, id)?,
             None => RunDir::create(&spec.state_root, &meta, SystemTime::now())?,
         };
-        let mut writer = run_dir.trace_writer()?;
+        let mut writer = TraceWriter::new(wrap_trace(run_dir.trace_file()?));
         run_session_with_writer_and_ruleset(
             &spec,
             meta,
@@ -729,7 +747,8 @@ mod linux {
                 &run_dir.path.join("snapshots"),
                 hooks.limits,
             )
-            .map_err(SessionError::SnapshotStore)?;
+            .map_err(SessionError::SnapshotStore)?
+            .with_chain_head(hooks.chain_head);
             let published = capture.capture(0).map_err(|e| {
                 SessionError::Run(fail_boundary(
                     writer,

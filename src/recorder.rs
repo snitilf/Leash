@@ -417,6 +417,51 @@ impl TraceSink for File {
     }
 }
 
+/// a sink that fails exactly one `sync`, the Nth (counting from 1), and passes everything else
+/// through. it is the seam tests use to make an event reach the file but never become
+/// durable, which a real disk produces only on a failing device: the writes of every other
+/// call, and the syncs before and after the Nth, behave normally, so the failure path can
+/// still record what went wrong.
+pub struct FailNthSync<S: TraceSink> {
+    inner: S,
+    fail_at: u64,
+    syncs: u64,
+}
+
+impl<S: TraceSink> FailNthSync<S> {
+    /// wrap `inner` so its `fail_at`th `sync` fails. `fail_at` 0 never fails.
+    pub fn new(inner: S, fail_at: u64) -> Self {
+        Self {
+            inner,
+            fail_at,
+            syncs: 0,
+        }
+    }
+}
+
+impl<S: TraceSink> Write for FailNthSync<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<S: TraceSink> TraceSink for FailNthSync<S> {
+    fn sync(&mut self) -> io::Result<()> {
+        self.syncs += 1;
+        if self.syncs == self.fail_at {
+            return Err(io::Error::other(format!(
+                "injected failure of sync {}",
+                self.syncs
+            )));
+        }
+        self.inner.sync()
+    }
+}
+
 /// the single writer of `trace.jsonl` (I2). append-only, decision order, one json object
 /// per line. a write failure is returned, never swallowed: the caller denies the pending
 /// action and aborts the run (notify-loop.md case E).
@@ -500,8 +545,13 @@ impl RunDir {
 
     /// open `trace.jsonl` for appending; fails if it already exists (single writer, I2).
     pub fn trace_writer(&self) -> Result<TraceWriter<File>, RecorderError> {
-        let file = File::create_new(self.path.join("trace.jsonl")).map_err(RecorderError::Setup)?;
-        Ok(TraceWriter::new(file))
+        Ok(TraceWriter::new(self.trace_file()?))
+    }
+
+    /// create `trace.jsonl`, failing if it already exists. the file a writer wraps; a seam
+    /// for tests that wrap it in another sink.
+    pub fn trace_file(&self) -> Result<File, RecorderError> {
+        File::create_new(self.path.join("trace.jsonl")).map_err(RecorderError::Setup)
     }
 }
 
@@ -1090,6 +1140,41 @@ mod tests {
             sink.bytes.len(),
             "sync happens after the step event's bytes reached the sink"
         );
+    }
+
+    #[test]
+    fn fail_nth_sync_fails_only_that_sync_and_keeps_the_event_written() {
+        let mut writer = TraceWriter::new(FailNthSync::new(FakeSink::default(), 2));
+        writer.append(1, step_body(0)).unwrap();
+        writer.sync().unwrap();
+        writer.append(2, step_body(1)).unwrap();
+        let err = writer.sync().unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure of sync 2"),
+            "{err}"
+        );
+        // the event written before the failed sync is in the sink, and later syncs work
+        writer.append(3, step_body(2)).unwrap();
+        writer.sync().unwrap();
+        let sink = writer.into_inner();
+        assert_eq!(
+            sink.inner.syncs_at.len(),
+            2,
+            "syncs 1 and 3 reached the sink"
+        );
+        assert_eq!(
+            String::from_utf8(sink.inner.bytes).unwrap().lines().count(),
+            3
+        );
+    }
+
+    #[test]
+    fn fail_nth_sync_with_zero_never_fails() {
+        let mut writer = TraceWriter::new(FailNthSync::new(FakeSink::default(), 0));
+        for step in 0..3 {
+            writer.append(1, step_body(step)).unwrap();
+            writer.sync().unwrap();
+        }
     }
 
     // --- run directory ---

@@ -95,14 +95,20 @@ impl Default for BarrierOps<'static> {
 /// the snapshot sink of one run over its store: the workspace and the store are pinned
 /// directory handles opened before the agent exists, and every digest the store returned
 /// and the trace committed is kept to recompute the chain head at run end.
-pub struct StoreCapture {
+pub struct StoreCapture<'a> {
     workspace: File,
     store: File,
     limits: Limits,
     committed: RefCell<Vec<(u64, String)>>,
+    chain: ChainHeadFn<'a>,
 }
 
-impl StoreCapture {
+/// how the chain head is computed from the committed `(step, digest)` pairs. production uses
+/// `restore::chain_head`; tests substitute a failure, which a store of valid digests never
+/// produces.
+pub type ChainHeadFn<'a> = &'a dyn Fn(&[(u64, String)]) -> Result<String, StoreError>;
+
+impl StoreCapture<'static> {
     /// open `workspace` and `store_dir` as pinned directory handles. both are opened
     /// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, so a symlink in either place is refused.
     pub fn open(workspace: &Path, store_dir: &Path, limits: Limits) -> io::Result<Self> {
@@ -119,7 +125,21 @@ impl StoreCapture {
             store: open_pinned_dir(store_dir)?,
             limits,
             committed: RefCell::new(Vec::new()),
+            chain: &chain_head,
         })
+    }
+}
+
+impl<'a> StoreCapture<'a> {
+    /// compute the chain head with `chain` instead of `restore::chain_head`.
+    pub fn with_chain_head<'b>(self, chain: ChainHeadFn<'b>) -> StoreCapture<'b> {
+        StoreCapture {
+            workspace: self.workspace,
+            store: self.store,
+            limits: self.limits,
+            committed: self.committed,
+            chain,
+        }
     }
 
     /// the store handle, for checking a run's snapshots from the supervisor side.
@@ -128,7 +148,7 @@ impl StoreCapture {
     }
 }
 
-impl BoundaryCapture for StoreCapture {
+impl BoundaryCapture for StoreCapture<'_> {
     fn capture_gated(
         &self,
         step: u64,
@@ -150,7 +170,7 @@ impl BoundaryCapture for StoreCapture {
     }
 
     fn chain_head(&self) -> Result<String, StoreError> {
-        chain_head(&self.committed.borrow())
+        (self.chain)(&self.committed.borrow())
     }
 }
 
