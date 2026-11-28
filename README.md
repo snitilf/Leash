@@ -62,7 +62,7 @@ A camera, not a bouncer.
 | Record | Working and tested. |
 | Enforce | Working and tested. |
 | Run history | `leash runs` lists recorded runs with their mode, command, and exit. Pruning is not available yet. |
-| Rewind | Planned for milestone M3: workspace snapshots, rewind to a step, diff two runs. The copy-based snapshot primitives exist; capture in a live run stays switched off until it is proven exact ([ADR-0022](docs/adr/0022-exact-snapshot-capture-barrier.md)). `leash rewind` and `leash diff` print "not implemented yet". |
+| Rewind | `leash run --snapshots --policy <path> -- <command>` captures the workspace before the agent starts, at each quiet boundary and when it ends (enforce mode only, Linux, needs a delegated cgroup v2 and Landlock ABI 3). `leash diff` compares two steps or runs, and `leash rewind <run-id> --expect <chain head>` restores the workspace to a step. See [ADR-0024](docs/adr/0024-enforce-mode-snapshots-without-a-custodian.md). |
 | Platform | Linux 5.19 or later, x86-64. |
 
 ## Quick start

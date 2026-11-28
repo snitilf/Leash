@@ -895,6 +895,12 @@ mod linux {
             run_dir.id,
             report_path.display()
         );
+        if let Some(head) = outcome.chain_head.as_deref() {
+            eprintln!(
+                "{}",
+                crate::rewind::rewind_hint(&run_dir.id, head, &spec.workspace, &spec.state_root)
+            );
+        }
 
         Ok(SessionOutcome {
             run_id: run_dir.id.clone(),

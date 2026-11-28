@@ -191,6 +191,8 @@ It has no size cap, because the trace grows with agent activity and a cap would 
 The read stops at the size the file had when it was opened, so a file that keeps growing cannot extend it.
 Each line is at most 1 MiB (`TRACE_LINE_CAP`), an empty line is refused because the recorder never writes one, and there are at most 1,000,000 step events (`TRACE_STEP_CAP`).
 Step events must ascend, and a malformed event that could decide commitment is an error.
+Readers also check three more things: the first event is a `run_start` (rewind requires it, and requires it to agree with `meta.json`), there is only one `run_start`, and every step digest is 64 lowercase hex digits.
+The shared reader refuses a second `run_start` and a malformed digest itself, and reports whether the first event was a `run_start` for the caller to require.
 A final line with no newline is a write torn by a crash and is ignored.
 
 The `fact` is what the supervisor resolved, not what the child's memory said after the fact: the

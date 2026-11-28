@@ -1,7 +1,8 @@
 //! content-addressed exact snapshot store (ADR-0022, docs/design/snapshot.md).
 //!
 //! layout under a caller-provided store root directory handle (e.g. `<run_dir>/snapshots`):
-//! - `objects/<2-hex>/<64-hex-sha256>` (mode 0400, staged, fsynced, renamed into place)
+//! - `objects/<2-hex>/<64-hex-sha256>` (mode 0400, staged, fsynced, renamed into place; an
+//!   object already present is not written again)
 //! - `manifests/step-<6-digit>.json` (mode 0400, staged, fsynced, renamed, parent fsynced)
 //! - `staging/` (temporary files; ignored by loads and step listings)
 //!
@@ -379,6 +380,9 @@ pub struct CaptureStats {
     pub total_bytes: u64,
     /// number of new content objects written to `objects/`.
     pub new_objects: u64,
+    /// number of staging files this capture created for file content. an object that was
+    /// already in the store needs none, so a capture of an unchanged tree stages nothing.
+    pub staged: u64,
     /// number of file objects deduplicated against existing objects or hard links.
     pub reused_objects: u64,
     /// bytes of new objects written to `objects/` by this capture.
@@ -1400,6 +1404,7 @@ mod linux {
             symlinks: 0,
             total_bytes: 0,
             new_objects: 0,
+            staged: 0,
             reused_objects: 0,
             store_growth: 0,
         };
@@ -1702,6 +1707,65 @@ mod linux {
         })
     }
 
+    /// read `src` from its current position to its end, hashing every byte and, when `sink` is
+    /// given, writing it there too. returns the lowercase hex sha256 and the byte count. a file
+    /// that yields more than `size` bytes grew during the read.
+    fn read_pass(
+        src: &mut File,
+        size: u64,
+        rel_path: &str,
+        copy_buf: &mut [u8],
+        mut sink: Option<&mut File>,
+    ) -> Result<(String, u64), StoreError> {
+        let mut hasher = Sha256::new();
+        let mut bytes_read = 0u64;
+        loop {
+            let n = match src.read(copy_buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(io_err("read", rel_path, e)),
+            };
+            bytes_read = bytes_read.saturating_add(n as u64);
+            if bytes_read > size {
+                return Err(StoreError::ConcurrentModification {
+                    path: rel_path.to_owned(),
+                });
+            }
+            hasher.update(&copy_buf[..n]);
+            if let Some(sink) = sink.as_deref_mut() {
+                sink.write_all(&copy_buf[..n])
+                    .map_err(|e| io_err("write staging", rel_path, e))?;
+            }
+        }
+        Ok((hex_encode(&hasher.finalize()), bytes_read))
+    }
+
+    /// refuse a file whose size or mtime moved while it was read, or whose read came up short.
+    fn check_unchanged_after_read(
+        src: &File,
+        before_fp: FileFingerprint,
+        bytes_read: u64,
+        rel_path: &str,
+    ) -> Result<(), StoreError> {
+        let after_stat = fstat_fd(src.as_raw_fd(), "fstat", rel_path)?;
+        let after_fp = FileFingerprint {
+            size: stat_size(&after_stat, rel_path)?,
+            mtime_sec: after_stat.st_mtime,
+            mtime_nsec: after_stat.st_mtime_nsec,
+        };
+        check_file_unchanged(rel_path, before_fp, after_fp, bytes_read)
+    }
+
+    /// store the content of one regular file as an object and return its sha256.
+    ///
+    /// the file is read once to hash it. an object that is already in the store needs nothing
+    /// more, which is the common case on every step after the first, so no staging file is
+    /// written and no fsync is paid for it. only a new object is read a second time into a
+    /// staging file, and that copy must hash to the same digest and leave the file unchanged,
+    /// or the capture is refused. a new object is fsynced, renamed into place and its bucket
+    /// directory fsynced before this returns, so the manifest that names it is published only
+    /// after the object is durable.
     #[allow(clippy::too_many_arguments)]
     fn store_regular_file(
         mut src: File,
@@ -1719,122 +1783,68 @@ mod linux {
             mtime_sec: before_stat.st_mtime,
             mtime_nsec: before_stat.st_mtime_nsec,
         };
-        let (mut staged, staged_name) = create_staging_file(staging_dir)?;
-        let mut hasher = Sha256::new();
-        let mut bytes_read = 0u64;
+        let (sha256_hex, bytes_read) = read_pass(&mut src, size, rel_path, copy_buf, None)?;
+        check_unchanged_after_read(&src, before_fp, bytes_read, rel_path)?;
 
-        loop {
-            let n = match src.read(copy_buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    drop(staged);
-                    unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                    return Err(io_err("read", rel_path, e));
-                }
-            };
-            bytes_read = bytes_read.saturating_add(n as u64);
-            if bytes_read > size {
-                drop(staged);
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                return Err(StoreError::ConcurrentModification {
-                    path: rel_path.to_owned(),
-                });
-            }
-            hasher.update(&copy_buf[..n]);
-            if let Err(e) = staged.write_all(&copy_buf[..n]) {
-                drop(staged);
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                return Err(io_err("write staging", rel_path, e));
-            }
-        }
-
-        let after_stat = match fstat_fd(src.as_raw_fd(), "fstat", rel_path) {
-            Ok(st) => st,
-            Err(err) => {
-                drop(staged);
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                return Err(err);
-            }
-        };
-        let after_size = match stat_size(&after_stat, rel_path) {
-            Ok(sz) => sz,
-            Err(err) => {
-                drop(staged);
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                return Err(err);
-            }
-        };
-        let after_fp = FileFingerprint {
-            size: after_size,
-            mtime_sec: after_stat.st_mtime,
-            mtime_nsec: after_stat.st_mtime_nsec,
-        };
-        if let Err(err) = check_file_unchanged(rel_path, before_fp, after_fp, bytes_read) {
-            drop(staged);
-            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-            return Err(err);
-        }
-
-        if let Err(e) = staged.sync_all() {
-            drop(staged);
-            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-            return Err(io_err("fsync staging", rel_path, e));
-        }
-        drop(staged);
-
-        let sha256_hex = hex_encode(&hasher.finalize());
         let bucket = &sha256_hex[..2];
         let c_bucket =
             CString::new(bucket).map_err(|_| StoreError::InvalidDigest(sha256_hex.clone()))?;
         let c_hash = CString::new(sha256_hex.as_str())
             .map_err(|_| StoreError::InvalidDigest(sha256_hex.clone()))?;
-
         let bucket_path = format!("objects/{bucket}");
         let object_path = format!("objects/{bucket}/{sha256_hex}");
-        let bucket_dir = match ensure_dir(objects_dir.as_raw_fd(), &c_bucket, &bucket_path) {
-            Ok(dir) => dir,
-            Err(err) => {
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                return Err(err);
-            }
-        };
+        let bucket_dir = ensure_dir(objects_dir.as_raw_fd(), &c_bucket, &bucket_path)?;
 
-        let already_exists =
-            match fstatat_exists(bucket_dir.as_raw_fd(), &c_hash, "fstatat", &object_path) {
-                Ok(exists) => exists,
-                Err(err) => {
-                    unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                    return Err(err);
-                }
-            };
-        if already_exists {
-            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+        if existing_object(
+            bucket_dir.as_raw_fd(),
+            &c_hash,
+            &object_path,
+            &sha256_hex,
+            bytes_read,
+        )? {
             stats.reused_objects += 1;
             return Ok(sha256_hex);
         }
 
-        let next_growth = stats.store_growth.checked_add(bytes_read).ok_or(
-            StoreError::StoreGrowthLimitExceeded {
-                growth: u64::MAX,
-                limit: limits.max_store_growth,
-            },
-        );
-        let next_growth = match next_growth {
-            Ok(g) if g <= limits.max_store_growth => g,
-            Ok(g) => {
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+        let next_growth = match stats.store_growth.checked_add(bytes_read) {
+            Some(growth) if growth <= limits.max_store_growth => growth,
+            Some(growth) => {
                 return Err(StoreError::StoreGrowthLimitExceeded {
-                    growth: g,
+                    growth,
                     limit: limits.max_store_growth,
                 });
             }
-            Err(err) => {
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                return Err(err);
+            None => {
+                return Err(StoreError::StoreGrowthLimitExceeded {
+                    growth: u64::MAX,
+                    limit: limits.max_store_growth,
+                });
             }
         };
+
+        // a new object: copy it through a staging file, checking that the second read is the
+        // content the first read hashed
+        src.seek(SeekFrom::Start(0))
+            .map_err(|e| io_err("seek", rel_path, e))?;
+        let (mut staged, staged_name) = create_staging_file(staging_dir)?;
+        stats.staged += 1;
+        let staged_result = read_pass(&mut src, size, rel_path, copy_buf, Some(&mut staged))
+            .and_then(|(second_hex, second_len)| {
+                if second_hex != sha256_hex || second_len != bytes_read {
+                    return Err(StoreError::ConcurrentModification {
+                        path: rel_path.to_owned(),
+                    });
+                }
+                check_unchanged_after_read(&src, before_fp, second_len, rel_path)?;
+                staged
+                    .sync_all()
+                    .map_err(|e| io_err("fsync staging", rel_path, e))
+            });
+        drop(staged);
+        if let Err(err) = staged_result {
+            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+            return Err(err);
+        }
 
         let placed = match rename_noreplace(
             staging_dir.as_raw_fd(),
@@ -1849,15 +1859,73 @@ mod linux {
             }
         };
         if placed {
-            fsync_fd(bucket_dir.as_raw_fd(), "fsync", &bucket_path)?;
+            if let Err(err) = fsync_fd(bucket_dir.as_raw_fd(), "fsync", &bucket_path) {
+                // the object is in place but the rename is not known to be durable, so it
+                // must not be left for a later capture to take as present
+                unlink_best_effort(bucket_dir.as_raw_fd(), &c_hash);
+                return Err(err);
+            }
             stats.new_objects += 1;
             stats.store_growth = next_growth;
         } else {
+            // another writer placed the object first: this capture names it, so make its
+            // directory entry durable here too
             unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+            fsync_fd(bucket_dir.as_raw_fd(), "fsync", &bucket_path)?;
             stats.reused_objects += 1;
         }
 
         Ok(sha256_hex)
+    }
+
+    /// is a usable object for `sha256_hex` already in the bucket? absent is `false`. anything
+    /// at that name that is not a regular file of exactly `size` bytes, a symlink, a fifo, a
+    /// directory or a file of the wrong length, is refused, because a manifest naming it
+    /// would name an object that cannot be restored. the content itself is checked when the
+    /// object is read back, as it was before this check existed.
+    fn existing_object(
+        bucket_fd: RawFd,
+        name: &CStr,
+        object_path: &str,
+        sha256_hex: &str,
+        size: u64,
+    ) -> Result<bool, StoreError> {
+        // SAFETY: bucket_fd and name are live; O_NOFOLLOW refuses a symlink and O_NONBLOCK
+        // keeps a planted FIFO from blocking the open.
+        let fd = unsafe {
+            libc::openat(
+                bucket_fd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            return match err.raw_os_error() {
+                Some(libc::ENOENT) => Ok(false),
+                Some(libc::ELOOP) => Err(StoreError::InvalidObject {
+                    digest: sha256_hex.to_owned(),
+                    reason: "object is a symlink",
+                }),
+                _ => Err(io_err("openat", object_path, err)),
+            };
+        }
+        // SAFETY: fd was returned by openat and is uniquely owned here.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let st = fstat_fd(file.as_raw_fd(), "fstat", object_path)?;
+        if !is_reg_mode(st.st_mode) {
+            return Err(StoreError::InvalidObject {
+                digest: sha256_hex.to_owned(),
+                reason: "object is not a regular file",
+            });
+        }
+        if u64::try_from(st.st_size).ok() != Some(size) {
+            return Err(StoreError::InvalidObject {
+                digest: sha256_hex.to_owned(),
+                reason: "object size differs from the content",
+            });
+        }
+        Ok(true)
     }
 
     fn fstatat_nofollow(dir_fd: RawFd, name: &CStr, path: &str) -> Result<libc::stat, StoreError> {

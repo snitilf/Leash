@@ -2,7 +2,7 @@
 
 - Status: architecture revised 2026-11-01 by ADR-0022.
   Snapshot scope, protected storage and rewind rules revised 2026-11-24 by ADR-0024 (enforce-mode snapshots without a custodian).
-  The ADR-0024 capture barrier, workspace lock, step digests and chain head (sections 2 and 3), the restore engine and the `leash rewind` command (section 5) are implemented.
+  The ADR-0024 capture barrier, workspace lock, step digests and chain head (sections 2 and 3), the restore engine and the `leash rewind` command (section 5), and the `leash run --snapshots` flag are implemented.
   Exact-capture implementation and adversarial validation pending.
   The historical M0 results below do not prove concurrent capture correctness.
 - Governs: FR-11, FR-12, FR-13, FR-17, FR-21; ADR-0005, ADR-0009, ADR-0022, ADR-0024, ADR-0026.
@@ -63,7 +63,7 @@ It never kills anything in a cgroup with that name, and the age limit keeps it f
 It also removes a `leash-<run-id>` cgroup that has no `user.leash.lock` xattr, holds no process and is at least 30 seconds old, which a supervisor killed between creating the cgroup and binding its lock leaves behind, and records it as a `stale_cleanup` event with `processes` 0.
 It only removes such a directory and never kills, so a cgroup that holds a process is left alone whatever its age.
 The age limit keeps it from removing the cgroup of a run that is setting up at that moment.
-Because stale cleanup scans only Leash's current parent cgroup, when each run is launched in its own per-run `systemd-run --user --scope -p Delegate=yes` scope a crashed run's cgroup tree sits under that earlier scope and is not cleaned by a later run in a fresh scope; systemd scope behavior remains unverified because systemd is absent in the codespace.
+Because a run's stale cleanup scans only Leash's current parent cgroup, when each run is launched in its own per-run `systemd-run --user --scope -p Delegate=yes` scope a crashed run's cgroup tree sits under that earlier scope and is not cleaned by a later run in a fresh scope; systemd scope behavior remains unverified because systemd is absent in the codespace.
 Snapshot-enabled runs refuse before spawn when any prerequisite is unavailable.
 Process enumeration and SIGSTOP are not substitutes for this barrier.
 
@@ -228,6 +228,8 @@ modified while mounted. Capturing a layer still requires the section 2 barrier.
 
 Rewind and diff follow ADR-0024 rules 17-22.
 
+Rewind reads and checks the trace and the store first, and only then looks at the run's cgroup.
+The stale cleanup below is driven by the untrusted `meta.json`, so it never runs for a run whose trace or store failed those read-only checks.
 Rewind requires the run's cgroup to be gone, not a `run_end` event, so a crashed run can be rewound.
 The cgroup-gone check returns a tri-state (`Gone`, `Present`, `Unknown`) by pinning the recorded parent directory on a cgroup2 mount first, or walking up to the nearest existing ancestor when opening the parent returns `ENOENT`, so a vanished transient scope under a cgroup2 mount reports `Gone` while a non-cgroup2, inaccessible, or unresolvable path never fails open as `Gone`.
 Rewind treats `Unknown` as not gone and also takes `<run_dir>/run.lock` before modifying the workspace.

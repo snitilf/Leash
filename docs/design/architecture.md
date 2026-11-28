@@ -21,7 +21,7 @@ boundary where the running ABI supports it (ADR-0003, ADR-0013). It holds even w
 logic has a gap. **Record-only** applies no general policy enforcement (ADR-0010).
 Snapshots exist only in enforce mode and only when the operator passes `--snapshots` (ADR-0024).
 The ADR-0022 capture barrier applies to them.
-The ADR-0024 snapshot controls are implemented in the supervisor; the `--snapshots` flag that turns them on and `leash rewind` are not yet implemented.
+The ADR-0024 snapshot controls are implemented in the supervisor, and `leash run --snapshots` turns them on.
 
 ```
   leash (supervisor, trusted)              child (agent + whole process tree, untrusted)
@@ -142,7 +142,7 @@ claim, and refuses to run rather than silently degrade (FR-14). Preflight bundle
   A `--snapshots` run (enforce mode only, ADR-0024) requires a usable delegated cgroup v2, verified freezer completion, whole-tree termination, Landlock ABI 3 or higher, and protection against child migration and control-plane writes.
   The run-time protection is the implicit state-root and cgroup denies plus refusal of overlapping write-class Landlock grants.
   Missing support refuses before spawn; unfrozen copy is not a fallback.
-  All of this is implemented in the supervisor; the `--snapshots` flag that turns it on is not yet implemented.
+  All of this is implemented in the supervisor, and `leash run --snapshots` turns it on.
   The ADR-0022 custodian (a separately provisioned, distinct-host-UID snapshot custodian) is deferred hardening, not a prerequisite.
   It would protect canonical state across runs, and implementation and adversarial validation remain pending.
 - **Snapshot backend.** Copy is the initial backend under ADR-0022. Overlay support alone

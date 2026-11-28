@@ -610,6 +610,157 @@ fn second_capture_of_unchanged_tree_writes_zero_new_objects() {
     assert_eq!(published_steps(&store_fd).unwrap(), vec![0, 1]);
 }
 
+/// every regular file of the published manifest `step` has its object in the store, intact.
+fn assert_every_object_of(store_fd: &File, step: u64) {
+    let (manifest, _) = load_manifest(store_fd, step).unwrap();
+    for entry in &manifest.entries {
+        if let Some(sha) = entry.sha256.as_deref() {
+            verify_object(store_fd, sha)
+                .unwrap_or_else(|e| panic!("manifest {step}: object {sha} of {}: {e}", entry.path));
+        }
+    }
+}
+
+#[test]
+fn an_object_already_in_the_store_is_not_written_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_path = tmp.path().join("ws");
+    let store_path = tmp.path().join("store");
+    create_workspace_dir(&ws_path);
+    fs::create_dir(&store_path).unwrap();
+    fs::write(ws_path.join("one.txt"), b"alpha").unwrap();
+    let ws_fd = open_dir(&ws_path);
+    let store_fd = open_dir(&store_path);
+
+    let first = capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
+    assert_eq!(first.stats.staged, 1, "a new object is staged once");
+    let (manifest, _) = load_manifest(&store_fd, 0).unwrap();
+    let sha = manifest.entries[0].sha256.clone().unwrap();
+    let object = store_path.join("objects").join(&sha[..2]).join(&sha);
+    let inode = fs::metadata(&object).unwrap().ino();
+
+    let second = capture(&ws_fd, &store_fd, 1, &Limits::default()).unwrap();
+    assert_eq!(
+        second.stats.staged, 0,
+        "an object already stored is not staged"
+    );
+    assert_eq!(second.stats.new_objects, 0);
+    assert_eq!(
+        fs::metadata(&object).unwrap().ino(),
+        inode,
+        "the object was left alone"
+    );
+    assert_eq!(
+        fs::read_dir(store_path.join("staging")).unwrap().count(),
+        0,
+        "nothing was staged for it"
+    );
+}
+
+/// anything planted at an object's name that is not a regular file of the right size is
+/// refused, because a manifest naming it would name an object that cannot be restored.
+#[test]
+fn a_planted_entry_at_an_object_path_refuses_the_capture_and_publishes_no_manifest() {
+    for plant in ["symlink", "fifo", "directory", "short file"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_path = tmp.path().join("ws");
+        let store_path = tmp.path().join("store");
+        create_workspace_dir(&ws_path);
+        fs::create_dir(&store_path).unwrap();
+        fs::write(ws_path.join("one.txt"), b"alpha").unwrap();
+        let ws_fd = open_dir(&ws_path);
+        let store_fd = open_dir(&store_path);
+
+        capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
+        let (manifest, _) = load_manifest(&store_fd, 0).unwrap();
+        let sha = manifest.entries[0].sha256.clone().unwrap();
+        let object = store_path.join("objects").join(&sha[..2]).join(&sha);
+        fs::remove_file(&object).unwrap();
+        match plant {
+            "symlink" => symlink("/etc/hostname", &object).unwrap(),
+            "fifo" => {
+                let c_object = CString::new(object.as_os_str().as_bytes()).unwrap();
+                // SAFETY: c_object is NUL-terminated inside a temp directory we own.
+                assert_eq!(unsafe { libc::mkfifo(c_object.as_ptr(), 0o600) }, 0);
+            }
+            "directory" => fs::create_dir(&object).unwrap(),
+            _ => fs::write(&object, b"al").unwrap(),
+        }
+
+        let err = capture(&ws_fd, &store_fd, 1, &Limits::default()).unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidObject { .. }),
+            "{plant}: {err:?}"
+        );
+        assert_eq!(
+            published_steps(&store_fd).unwrap(),
+            vec![0],
+            "{plant}: no manifest was published for step 1"
+        );
+    }
+}
+
+#[test]
+fn an_object_lost_from_the_store_is_stored_again_before_the_next_manifest_names_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_path = tmp.path().join("ws");
+    let store_path = tmp.path().join("store");
+    create_workspace_dir(&ws_path);
+    fs::create_dir(&store_path).unwrap();
+    fs::write(ws_path.join("one.txt"), b"alpha").unwrap();
+    fs::write(ws_path.join("two.txt"), b"beta").unwrap();
+    let ws_fd = open_dir(&ws_path);
+    let store_fd = open_dir(&store_path);
+
+    capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
+    let (manifest, _) = load_manifest(&store_fd, 0).unwrap();
+    let sha = manifest.entries[0].sha256.clone().unwrap();
+    let object = store_path.join("objects").join(&sha[..2]).join(&sha);
+    fs::remove_file(&object).unwrap();
+
+    let again = capture(&ws_fd, &store_fd, 1, &Limits::default()).unwrap();
+    assert_eq!(
+        again.stats.new_objects, 1,
+        "only the lost object is written"
+    );
+    assert_eq!(again.stats.reused_objects, 1);
+    assert_every_object_of(&store_fd, 1);
+}
+
+#[test]
+fn a_capture_that_fails_after_storing_objects_publishes_nothing_and_the_retry_has_every_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_path = tmp.path().join("ws");
+    let store_path = tmp.path().join("store");
+    create_workspace_dir(&ws_path);
+    fs::create_dir(&store_path).unwrap();
+    fs::write(ws_path.join("a.txt"), b"first").unwrap();
+    fs::write(ws_path.join("z.txt"), b"last").unwrap();
+    let fifo = ws_path.join("m-fifo");
+    let c_fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: c_fifo is NUL-terminated inside a temp directory we own.
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+    let ws_fd = open_dir(&ws_path);
+    let store_fd = open_dir(&store_path);
+
+    // the refusal falls in the middle of the walk, after some objects were stored
+    let err = capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap_err();
+    assert!(
+        matches!(err, StoreError::UnsupportedEntry { .. }),
+        "{err:?}"
+    );
+    assert_eq!(published_steps(&store_fd).unwrap(), Vec::<u64>::new());
+    assert_eq!(
+        fs::read_dir(store_path.join("staging")).unwrap().count(),
+        0,
+        "no staged file survives the failure"
+    );
+
+    fs::remove_file(&fifo).unwrap();
+    capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
+    assert_every_object_of(&store_fd, 0);
+}
+
 #[test]
 fn manifest_bytes_are_identical_across_two_stores_for_same_tree_and_step() {
     let tmp = tempfile::tempdir().unwrap();

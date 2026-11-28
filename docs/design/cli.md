@@ -17,14 +17,14 @@ is announced and torn down, and what the shell sees when it finishes. Terms in *
 The `run` command starts a supervised run:
 
 ```
-leash run [--unattended] [--state-dir <dir>] [--policy <path>] [--ask-timeout <seconds>] -- <command...>
+leash run [--unattended] [--state-dir <dir>] [--policy <path> [--snapshots]] [--ask-timeout <seconds>] -- <command...>
 ```
 
 The `--` separator is required. Everything after it is the child command and passes to the child
 verbatim, including arguments that look like flags: `leash run -- rm -rf ./build` runs `rm` with
 `-rf ./build`, and the `-rf` is never parsed by Leash. Both `--state-dir <dir>` and
 `--state-dir=<dir>` forms are accepted. Both `--policy <path>` and `--policy=<path>` forms are
-accepted. `--unattended` takes no value. `--ask-timeout <seconds>` sets the FR-10 attended-ask
+accepted. `--unattended` takes no value. `--snapshots` takes no value and is described in the snapshots section below. `--ask-timeout <seconds>` sets the FR-10 attended-ask
 timeout (both `--ask-timeout <n>` and `--ask-timeout=<n>` forms; whole seconds in 1..=3600,
 default 60).
 
@@ -46,7 +46,8 @@ normative set:
 | unknown subcommand or flag | a subcommand that is not `run`, `runs`, `diff` or `rewind`, or a flag the subcommand does not accept |
 | `run` without `--` | `run` invoked with no `--` separator |
 | empty command after `--` | `--` present but nothing follows it |
-| a flag given twice | `--unattended`, `--state-dir`, `--policy`, or `--ask-timeout` repeated |
+| a flag given twice | `--unattended`, `--state-dir`, `--policy`, `--snapshots`, or `--ask-timeout` repeated |
+| `--snapshots` without `--policy` | `--snapshots` given and no `--policy` (snapshots are enforce mode only, FR-22) |
 | `--state-dir` missing its value | `--state-dir` is the last token before `--`, or is immediately followed by `--` |
 | `--policy` missing its value | `--policy` is the last token before `--`, is immediately followed by `--`, or is given as `--policy=` |
 | `--ask-timeout` missing its value | `--ask-timeout` is immediately followed by `--`, or is given as `--ask-timeout=` |
@@ -146,17 +147,7 @@ The order of checks, each before any write to the workspace:
 1. The run is a directory under `<state-root>/runs`, opened component by component with `O_NOFOLLOW`; `meta.json` is a regular file of at most 64 KiB.
    An unknown run, a run with no `snapshots` directory, and a run whose metadata records no run cgroup (not a snapshot run) are refused.
 2. The workspace, the working directory or `--workspace` canonicalized, equals the workspace in `meta.json`.
-3. The run is over.
-   `run.lock` is taken without blocking; a held lock means the run is live.
-   The recorded run cgroup must be `Gone`; `Present` and `Unknown` are refused and the message names the cgroup.
-   A present cgroup of a dead run is first offered to the stale cleanup (ADR-0024 decision 17), which runs on the parent cgroup that `meta.json` records for the run cgroup.
-   It does not skip any cgroup, so it may kill and remove every stale Leash cgroup under that parent, not only this run's.
-   It touches a cgroup only when its name is a valid Leash run name, its run lock under this state root can be taken, and its lock xattr matches that lock file's inode.
-   A missing `run_end` is fine, so a crashed run can be rewound.
-4. The workspace lock (the `flock` on the workspace directory and the one under the state root, ADR-0026) is taken without blocking, and held to the end; a held lock refuses, whatever state directory the holder used.
-   The locked directory handle is the one that is scanned, captured and restored.
-   The canonical path read back from that handle must equal the workspace that check 2 compared, or rewind refuses with `the workspace changed while rewind opened it`; a path component swapped for a symlink between the two cannot redirect the restore.
-5. The target step has a committed `step` event in `trace.jsonl` and a manifest in the store.
+3. The target step has a committed `step` event in `trace.jsonl` and a manifest in the store.
    The committed steps are derived from the `step` events of the trace (`store::committed_steps_from_trace`), never from the manifests on disk.
    A `step` event followed by `capture_failed` with phase `step_event` for the same step is not committed.
    The trace is untrusted input, read once through a handle by the same streaming reader that `diff` uses, so the two agree on the committed steps.
@@ -165,8 +156,19 @@ The order of checks, each before any write to the workspace:
    A final line without a newline (a crash mid-write) is ignored; any other malformed line refuses.
    The first event must be a `run_start` that agrees with `meta.json`.
    A manifest with no committed `step` event is an orphan of an aborted capture and is not a target.
-6. The chain is recomputed from the manifests of the committed steps; an orphan manifest is not in it.
+4. The chain is recomputed from the manifests of the committed steps; an orphan manifest is not in it.
    The recomputed digest of the target must equal the digest in the trace's step event, and `--expect`, when given, must equal the chain head or that digest.
+   These checks only read, and they come before the run is touched: the stale cleanup in check 5 is driven by the untrusted `meta.json`, so it runs only for a run whose trace and store passed.
+5. The run is over.
+   `run.lock` is taken without blocking; a held lock means the run is live.
+   The recorded run cgroup must be `Gone`; `Present` and `Unknown` are refused and the message names the cgroup.
+   A present cgroup of a dead run is first offered to the stale cleanup (ADR-0024 decision 17), which runs on the parent cgroup that `meta.json` records for the run cgroup.
+   It does not skip any cgroup, so it may kill and remove every stale Leash cgroup under that parent, not only this run's.
+   It touches a cgroup only when its name is a valid Leash run name, its run lock under this state root can be taken, and its lock xattr matches that lock file's inode.
+   A missing `run_end` is fine, so a crashed run can be rewound.
+6. The workspace lock (the `flock` on the workspace directory and the one under the state root, ADR-0026) is taken without blocking, and held to the end; a held lock refuses, whatever state directory the holder used.
+   The locked directory handle is the one that is scanned, captured and restored.
+   The canonical path read back from that handle must equal the workspace that check 2 compared, or rewind refuses with `the workspace changed while rewind opened it`; a path component swapped for a symlink between the two cannot redirect the restore.
 7. Every store object the plan writes is verified, so a corrupt object refuses the rewind before the workspace changes.
 
 Exit codes:
@@ -175,7 +177,7 @@ Exit codes:
 |---|---|
 | rewound, or the workspace already matched | 0 |
 | usage error; unknown run (a symlinked run directory counts as unknown); run without snapshots or not a snapshot run; unknown step, or a step with no committed event; workspace differs from the run's; state directory inside the workspace; unknown `--undo` number (a symlinked undo directory counts as unknown) | 2 |
-| live run (lock held); cgroup `Present` or `Unknown`; workspace lock held; the workspace changed while it was opened; trace, metadata, store or digest mismatch; a trace or metadata file that is not a regular file or is over its cap; `--expect` mismatch; an undo store that is not exactly step 0 (an incomplete or forged safety snapshot); safety snapshot impossible; running as root; apply failed; a failed write of the result to stdout | 125 |
+| live run (lock held); cgroup `Present` or `Unknown`; workspace lock held; the workspace changed while it was opened; trace, metadata, store or digest mismatch; a trace or metadata file that is not a regular file, a trace line over `TRACE_LINE_CAP`, or a `meta.json` over its cap; `--expect` mismatch; an undo store that is not exactly step 0 (an incomplete or forged safety snapshot); safety snapshot impossible; running as root; apply failed; a failed write of the result to stdout | 125 |
 
 A failed write to stdout after the workspace was restored also exits 125, because the operator cannot be shown the result; the workspace stays restored, and the error says that it could not write the output.
 
@@ -211,17 +213,16 @@ An unused safety snapshot is removed again: after a refusal, or when the plan is
 When the apply fails, the error names the safety snapshot and prints the `--undo` command that restores it.
 On macOS, `rewind` exits 125 with a message that it requires linux.
 
-### Snapshots (specified by ADR-0024, not yet implemented)
-
-The `run --snapshots` flag below is specified and not yet implemented; `run` does not accept it.
-`diff` and `rewind` are implemented; see their sections above.
+### `run --snapshots` (implemented, ADR-0024)
 
 ```
 leash run --snapshots [--unattended] [--state-dir <dir>] --policy <path> [--ask-timeout <seconds>] -- <command...>
 ```
 
-`--snapshots` is available in enforce mode only.
-`--snapshots` without `--policy` is a usage error that exits 2 (FR-22), not a supervisor failure.
+`--snapshots` is available in enforce mode only, and it takes no value.
+`--snapshots` without `--policy` is a usage error that exits 2 (FR-22), not a supervisor failure, so a record-only snapshot run cannot be asked for.
+The flag sets the run's `snapshot_integrity` stamp, which turns on everything ADR-0024 puts behind it: the run cgroup and run lock, the workspace lock, the implicit cgroup2 and state-root denies, the capture barrier with step 0 before the agent starts and a final step after it ends, and the chain head.
+`diff` and `rewind` read what such a run leaves; see their sections above.
 It refuses before spawn, as a supervisor failure with the message on stderr and no run directory created, in these cases:
 
 - the host has no writable, delegated cgroup v2 with working `cgroup.freeze` and `cgroup.kill`; the message names the hint `systemd-run --user --scope -p Delegate=yes`, which is unverified until a CI leg runs it;
@@ -232,8 +233,20 @@ The refusals come in this order: the Landlock ABI and the grant overlaps, then t
 A failure to create the run cgroup, or any later failure before the run directory exists, is a supervisor failure with no run directory created, and removes the cgroup.
 Taking or binding the run lock happens once the run directory exists, so a failure there leaves a run directory with `run_start`, a `cgroup_kill` event with reason `abort` that names the error, and no `run_end`, and exits 125 with the empty cgroup removed.
 
-The session already applies all three refusals and the implicit `implicit:cgroup` deny when its `snapshot_integrity` field is set.
-What is still missing is the `--snapshots` flag that sets it, which the capture slice adds.
+While the run goes and when it ends, stderr carries the steps and how to undo the run:
+
+```
+leash: step 0 snapshot <64 hex>
+leash: step <N> snapshot <64 hex>
+leash: snapshot chain head <64 hex>
+leash: run <run-id> recorded; report: <state-root>/runs/<run-id>/report.txt
+leash: to undo this run: leash rewind <run-id> --expect <chain head> --workspace <dir> --state-dir <dir>
+```
+
+Each step line is printed as the step is committed, so a run that crashed still showed its digests.
+The chain head is the one `rewind --expect` checks.
+The last line is shell-quoted so it can be pasted, and it carries the workspace and state directory so it works from any directory.
+Keep the chain head outside the state root: without it, `rewind` can only check the store against the trace beside it.
 
 ## 2. Mode selection
 

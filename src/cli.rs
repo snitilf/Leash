@@ -26,6 +26,9 @@ pub struct RunArgs {
     pub policy_path: Option<PathBuf>,
     /// the attended-ask timeout in seconds (FR-10); absent means the default of 60
     pub ask_timeout: Option<u64>,
+    /// capture workspace snapshots so the run can be rewound (ADR-0024); enforce mode only,
+    /// so the parser requires `policy_path` whenever it is set
+    pub snapshots: bool,
 }
 
 /// the parsed command line.
@@ -122,6 +125,11 @@ pub enum UsageError {
     /// `--ask-timeout` is not a whole number of seconds in 1..=3600
     #[error("leash: '--ask-timeout' must be a whole number of seconds in 1..=3600")]
     InvalidAskTimeoutValue,
+    /// `--snapshots` without `--policy`: snapshots exist in enforce mode only (FR-22)
+    #[error(
+        "leash: '--snapshots' requires '--policy <path>': snapshots are available in enforce mode only"
+    )]
+    SnapshotsNeedPolicy,
     /// prune requires at least one run id
     #[error("leash: 'runs prune' requires at least one run id")]
     MissingPruneRunId,
@@ -161,12 +169,14 @@ const HELP: &str = "\
 leash: supervise an AI coding agent at the operating-system boundary
 
 usage:
-  leash run [--unattended] [--state-dir <dir>] [--policy <path>] [--ask-timeout <seconds>] -- <command...>
+  leash run [--unattended] [--state-dir <dir>] [--policy <path> [--snapshots]] [--ask-timeout <seconds>] -- <command...>
 
 run flags:
   --unattended              treat the run as unattended even on a terminal
   --state-dir <dir>         state root for run traces (must be outside the workspace)
   --policy <path>           enforce this policy file (without it the run is record-only)
+  --snapshots               capture workspace snapshots so 'leash rewind' can undo the run
+                            (needs --policy; needs a delegated cgroup v2 and Landlock ABI 3)
   --ask-timeout <seconds>   attended-ask timeout, 1 to 3600 (default 60)
 
 everything after '--' is the command and is passed through verbatim.
@@ -444,6 +454,7 @@ fn parse_run(rest: &[String]) -> Result<RunArgs, UsageError> {
     let mut state_dir: Option<PathBuf> = None;
     let mut policy_path: Option<PathBuf> = None;
     let mut ask_timeout: Option<u64> = None;
+    let mut snapshots = false;
     let mut i = 0;
 
     let separator = loop {
@@ -455,6 +466,13 @@ fn parse_run(rest: &[String]) -> Result<RunArgs, UsageError> {
                     return Err(UsageError::DuplicateFlag("--unattended"));
                 }
                 unattended = true;
+                i += 1;
+            }
+            Some(tok) if tok == "--snapshots" => {
+                if snapshots {
+                    return Err(UsageError::DuplicateFlag("--snapshots"));
+                }
+                snapshots = true;
                 i += 1;
             }
             Some(tok) if tok == "--state-dir" => {
@@ -531,6 +549,9 @@ fn parse_run(rest: &[String]) -> Result<RunArgs, UsageError> {
     if command.is_empty() {
         return Err(UsageError::EmptyCommand);
     }
+    if snapshots && policy_path.is_none() {
+        return Err(UsageError::SnapshotsNeedPolicy);
+    }
 
     Ok(RunArgs {
         command,
@@ -538,6 +559,7 @@ fn parse_run(rest: &[String]) -> Result<RunArgs, UsageError> {
         state_dir,
         policy_path,
         ask_timeout,
+        snapshots,
     })
 }
 
@@ -745,10 +767,10 @@ pub fn run() -> ExitCode {
             .ask_timeout
             .map(std::time::Duration::from_secs)
             .unwrap_or(crate::supervisor::run::DEFAULT_ASK_TIMEOUT),
-        // ADR-0024 decisions 4 to 6 are in place in the session (the implicit cgroup2 deny and
-        // the metadata calls it needs, the Landlock overlap refusal, the ABI 3 floor). the
-        // `--snapshots` flag that turns this on is added by the capture slice, so it stays off here.
-        snapshot_integrity: false,
+        // `--snapshots` turns on everything ADR-0024 puts behind the flag: the implicit cgroup2
+        // deny, the overlap and ABI refusals, the run cgroup, the workspace lock and the capture
+        // barrier. the parser guarantees a policy, so this is enforce mode.
+        snapshot_integrity: run_args.snapshots,
     })
 }
 
@@ -977,6 +999,7 @@ mod tests {
                 state_dir: None,
                 policy_path: None,
                 ask_timeout: None,
+                snapshots: false,
             })
         );
     }
@@ -1001,6 +1024,7 @@ mod tests {
                 state_dir: Some(PathBuf::from("/tmp/state")),
                 policy_path: None,
                 ask_timeout: None,
+                snapshots: false,
             })
         );
     }
@@ -1023,6 +1047,7 @@ mod tests {
                 state_dir: Some(PathBuf::from("/tmp/state")),
                 policy_path: None,
                 ask_timeout: None,
+                snapshots: false,
             })
         );
     }
@@ -1045,6 +1070,7 @@ mod tests {
                 state_dir: None,
                 policy_path: Some(PathBuf::from("/tmp/policy.toml")),
                 ask_timeout: None,
+                snapshots: false,
             })
         );
 
@@ -1057,6 +1083,7 @@ mod tests {
                 state_dir: None,
                 policy_path: Some(PathBuf::from("/tmp/policy.toml")),
                 ask_timeout: None,
+                snapshots: false,
             })
         );
     }
@@ -1076,9 +1103,84 @@ mod tests {
                     state_dir: None,
                     policy_path: None,
                     ask_timeout: Some(30),
+                    snapshots: false,
                 })
             );
         }
+    }
+
+    #[test]
+    fn parse_run_accepts_snapshots_with_a_policy_in_any_order() {
+        for form in [
+            args(&["run", "--snapshots", "--policy", "p.toml", "--", "echo"]),
+            args(&["run", "--policy=p.toml", "--snapshots", "--", "echo"]),
+        ] {
+            assert_eq!(
+                parse(&form).unwrap(),
+                Command::Run(RunArgs {
+                    command: vec!["echo".into()],
+                    unattended: false,
+                    state_dir: None,
+                    policy_path: Some(PathBuf::from("p.toml")),
+                    ask_timeout: None,
+                    snapshots: true,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn parse_run_snapshots_without_a_policy_is_a_usage_error() {
+        // snapshots are enforce mode only, so there is no record-only snapshot run to parse
+        assert_eq!(
+            parse(&args(&["run", "--snapshots", "--", "echo"])),
+            Err(UsageError::SnapshotsNeedPolicy)
+        );
+        assert_eq!(
+            parse(&args(&["run", "--snapshots", "--unattended", "--", "echo"])),
+            Err(UsageError::SnapshotsNeedPolicy)
+        );
+        let message = UsageError::SnapshotsNeedPolicy.to_string();
+        assert!(
+            message.contains("--snapshots") && message.contains("--policy"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn parse_run_snapshots_takes_no_value_and_cannot_repeat() {
+        assert_eq!(
+            parse(&args(&[
+                "run",
+                "--snapshots",
+                "--snapshots",
+                "--policy",
+                "p.toml",
+                "--",
+                "echo",
+            ])),
+            Err(UsageError::DuplicateFlag("--snapshots"))
+        );
+        // an equals form is an unknown flag: the flag takes no value
+        assert_eq!(
+            parse(&args(&["run", "--snapshots=1", "--", "echo"])),
+            Err(UsageError::UnknownFlag("--snapshots=1".into()))
+        );
+    }
+
+    #[test]
+    fn parse_run_leaves_snapshots_after_the_separator_to_the_child() {
+        let Command::Run(run) = parse(&args(&["run", "--", "echo", "--snapshots"])).unwrap() else {
+            panic!("expected run");
+        };
+        assert!(!run.snapshots);
+        assert_eq!(run.command, vec!["echo", "--snapshots"]);
+    }
+
+    #[test]
+    fn help_names_the_snapshots_flag() {
+        assert!(HELP.contains("[--snapshots]"));
+        assert!(HELP.contains("--snapshots "));
     }
 
     #[test]
@@ -1142,6 +1244,7 @@ mod tests {
                 state_dir: None,
                 policy_path: None,
                 ask_timeout: None,
+                snapshots: false,
             })
         );
     }

@@ -82,29 +82,56 @@ pub fn undo_dir_name(n: u64) -> String {
 /// `$'...'` with every control character escaped, so a path can never inject a line break
 /// or a terminal escape into the output.
 pub fn shell_quote(text: &str) -> String {
-    let plain = |c: char| c.is_ascii_alphanumeric() || "_-./:@%+=,".contains(c);
-    if !text.is_empty() && text.chars().all(plain) {
-        return text.to_string();
+    shell_quote_bytes(text.as_bytes())
+}
+
+/// `shell_quote` for a path, from its raw bytes: a name that is not UTF-8 is not rewritten
+/// with replacement characters, which would name a different path, but written with each
+/// invalid byte as a three-digit octal escape `\ooo` inside `$'...'`, which is unambiguous
+/// whatever digits follow it (a `\x` escape is not, in ksh93). that form is bash and zsh
+/// syntax, not POSIX `sh`; a path made of valid UTF-8 without control characters is quoted
+/// for any shell.
+pub fn shell_quote_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    shell_quote_bytes(path.as_os_str().as_bytes())
+}
+
+fn shell_quote_bytes(bytes: &[u8]) -> String {
+    let plain = |b: &u8| b.is_ascii_alphanumeric() || b"_-./:@%+=,".contains(b);
+    if !bytes.is_empty() && bytes.iter().all(plain) {
+        return String::from_utf8_lossy(bytes).into_owned();
     }
-    if text.chars().any(char::is_control) {
+    let needs_escapes = bytes
+        .utf8_chunks()
+        .any(|chunk| !chunk.invalid().is_empty() || chunk.valid().chars().any(char::is_control));
+    if needs_escapes {
         let mut quoted = String::from("$'");
-        for c in text.chars() {
-            match c {
-                '\\' => quoted.push_str("\\\\"),
-                '\'' => quoted.push_str("\\'"),
-                c if c.is_control() => {
-                    let mut buf = [0u8; 4];
-                    for byte in c.encode_utf8(&mut buf).bytes() {
-                        quoted.push_str(&format!("\\x{byte:02x}"));
+        for chunk in bytes.utf8_chunks() {
+            for c in chunk.valid().chars() {
+                match c {
+                    '\\' => quoted.push_str("\\\\"),
+                    '\'' => quoted.push_str("\\'"),
+                    c if c.is_control() => {
+                        let mut buf = [0u8; 4];
+                        for byte in c.encode_utf8(&mut buf).bytes() {
+                            quoted.push_str(&format!("\\{byte:03o}"));
+                        }
                     }
+                    c => quoted.push(c),
                 }
-                c => quoted.push(c),
+            }
+            for byte in chunk.invalid() {
+                quoted.push_str(&format!("\\{byte:03o}"));
             }
         }
         quoted.push('\'');
         return quoted;
     }
-    format!("'{}'", text.replace('\'', "'\\''"))
+    // valid UTF-8 with no control character, so the lossy conversion changes nothing
+    format!(
+        "'{}'",
+        String::from_utf8_lossy(bytes).replace('\'', "'\\''")
+    )
 }
 
 /// the command that restores safety snapshot `n` of `run_id`, checked against the manifest
@@ -119,8 +146,21 @@ pub fn undo_command(
     format!(
         "leash rewind {} --undo {n} --expect {digest} --workspace {} --state-dir {}",
         shell_quote(run_id),
-        shell_quote(&workspace.to_string_lossy()),
-        shell_quote(&state_root.to_string_lossy()),
+        shell_quote_path(workspace),
+        shell_quote_path(state_root),
+    )
+}
+
+/// the last line a finished snapshot run prints: the command that rewinds it, checked against
+/// the chain head the run just printed. the workspace and state directory are spelled out so
+/// the command works from any directory and for a non-default state root, and every value
+/// is shell-quoted so the line can be pasted.
+pub fn rewind_hint(run_id: &str, chain_head: &str, workspace: &Path, state_root: &Path) -> String {
+    format!(
+        "leash: to undo this run: leash rewind {} --expect {chain_head} --workspace {} --state-dir {}",
+        shell_quote(run_id),
+        shell_quote_path(workspace),
+        shell_quote_path(state_root),
     )
 }
 
@@ -249,6 +289,11 @@ mod linux {
             .run_cgroup
             .clone()
             .ok_or_else(|| usage(format!("run '{label}' is not a snapshot run")))?;
+        // the target and the integrity checks are read-only, so they come before anything
+        // that acts on the run directory: the stale cleanup below is driven by the untrusted
+        // `meta.json` and may kill and remove cgroups, so it runs only for a run whose trace
+        // and store already passed
+        let target = resolve_target(req, &open, &label)?;
         let _run_lock = ensure_run_over(req, &open.run_dir, &recorded, &label)?;
         if let Some(hook) = hooks.before_workspace_open {
             hook();
@@ -266,9 +311,10 @@ mod linux {
             )));
         }
 
-        // the target and the integrity checks come before any write, the safety snapshot
-        // included
-        let target = resolve_target(req, &open, &label, out)?;
+        // the values the checks compared are printed once the whole of them has passed
+        for line in &target.heading {
+            writeln!(out, "{line}")?;
+        }
         if req.expect.is_none() {
             let what = match req.target {
                 RewindTarget::Step(_) => {
@@ -583,16 +629,18 @@ mod linux {
         label: String,
         /// "rewound the workspace to" or "restored the workspace from"
         verb: &'static str,
+        /// the lines to print once every check has passed: the chain head and the digest
+        /// the target was checked against
+        heading: Vec<String>,
     }
 
     fn resolve_target(
         req: &RewindRequest,
         open: &OpenRun,
         label: &str,
-        out: &mut dyn Write,
     ) -> Result<Target, RewindError> {
         match req.target {
-            RewindTarget::Step(step) => resolve_step(req, open, label, step, out),
+            RewindTarget::Step(step) => resolve_step(req, open, label, step),
             RewindTarget::Undo(n) => resolve_undo(&open.run_dir, label, n, req.expect.as_deref()),
         }
     }
@@ -602,7 +650,6 @@ mod linux {
         open: &OpenRun,
         label: &str,
         step: u64,
-        out: &mut dyn Write,
     ) -> Result<Target, RewindError> {
         let trace = read_checked_trace(&open.run_dir, &open.meta, label)?;
         // the committed set comes from the trace's step events, never from the manifests on
@@ -663,14 +710,17 @@ mod linux {
                  {store_digest} then {loaded_digest}"
             )));
         }
-        writeln!(out, "chain head: {}", chain.head)?;
-        writeln!(out, "step {step} digest: {store_digest}")?;
+        let heading = vec![
+            format!("chain head: {}", chain.head),
+            format!("step {step} digest: {store_digest}"),
+        ];
         let store = open.store.try_clone().map_err(|e| failure(e.to_string()))?;
         Ok(Target {
             manifest,
             store,
             label: format!("step {step}"),
             verb: "rewound the workspace to",
+            heading,
         })
     }
 
@@ -709,6 +759,7 @@ mod linux {
             store,
             label: format!("undo snapshot {n}"),
             verb: "restored the workspace from",
+            heading: Vec::new(),
         })
     }
 
@@ -1016,9 +1067,9 @@ mod tests {
 
     #[test]
     fn control_characters_are_escaped_never_printed() {
-        assert_eq!(shell_quote("a\nb"), "$'a\\x0ab'");
-        assert_eq!(shell_quote("\x1b[2J"), "$'\\x1b[2J'");
-        assert_eq!(shell_quote("a\\b\tc'"), "$'a\\\\b\\x09c\\''");
+        assert_eq!(shell_quote("a\nb"), "$'a\\012b'");
+        assert_eq!(shell_quote("\x1b[2J"), "$'\\033[2J'");
+        assert_eq!(shell_quote("a\\b\tc'"), "$'a\\\\b\\011c\\''");
     }
 
     #[test]
@@ -1036,5 +1087,55 @@ mod tests {
                 "ab".repeat(32)
             )
         );
+    }
+
+    #[test]
+    fn the_run_end_hint_names_the_run_the_head_the_workspace_and_the_state_root() {
+        assert_eq!(
+            rewind_hint(
+                "20260101T000000Z-abc123",
+                &"cd".repeat(32),
+                Path::new("/work/my repo"),
+                Path::new("/state")
+            ),
+            format!(
+                "leash: to undo this run: leash rewind 20260101T000000Z-abc123 --expect {} --workspace '/work/my repo' --state-dir /state",
+                "cd".repeat(32)
+            )
+        );
+    }
+
+    #[test]
+    fn a_path_that_is_not_utf8_is_quoted_from_its_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/w/caf\xe9 dir"));
+        assert_eq!(shell_quote_path(path), "$'/w/caf\\351 dir'");
+        let hint = rewind_hint("id", &"0".repeat(64), path, Path::new("/s"));
+        assert!(hint.contains("--workspace $'/w/caf\\351 dir' "), "{hint}");
+        assert!(!hint.contains('\u{fffd}'), "{hint}");
+    }
+
+    #[test]
+    fn a_valid_utf8_path_is_quoted_the_same_as_its_text() {
+        for text in [
+            "/w/plain",
+            "/w/a b",
+            "/w/it's",
+            "/w/caf\u{e9}",
+            "/w/a\nb",
+            "",
+        ] {
+            assert_eq!(
+                shell_quote_path(Path::new(text)),
+                shell_quote(text),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_run_end_hint_cannot_carry_a_line_break_from_a_path() {
+        let hint = rewind_hint("id", &"0".repeat(64), Path::new("/a\nb"), Path::new("/s"));
+        assert!(!hint.contains('\n'), "{hint:?}");
     }
 }
