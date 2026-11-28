@@ -377,6 +377,63 @@ fn removexattr_of_the_run_lock_is_denied() {
     );
 }
 
+/// python that defines `sc(number, *args)`, a raw `syscall(2)` returning `(rc, errno)`.
+/// integers go as `long`, pointers as they are.
+const RAW_SYSCALL: &str = r#"
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+def sc(number, *args):
+    conv = [a if isinstance(a, (ctypes.c_void_p, ctypes.c_char_p)) else ctypes.c_long(a) for a in args]
+    ctypes.set_errno(0)
+    rc = libc.syscall(ctypes.c_long(number), *conv)
+    return rc, ctypes.get_errno()
+"#;
+
+#[test]
+fn the_path_attribute_calls_that_libc_does_not_know_yet_are_answered_enosys_and_recorded() {
+    // setxattrat (463), removexattrat (466) and file_setattr (469) name a path and need no
+    // open, so an agent could set `user.leash.lock` on its run cgroup with one of them on a
+    // kernel new enough. this host's kernel may predate them, which answers ENOSYS by itself,
+    // so the trace event is what proves Leash intercepted the call before the kernel did
+    let _guard = spawn_lock();
+    if !delegated("xattrat_enosys") {
+        return;
+    }
+    let session = Session::new();
+    let script = format!(
+        "{}{RAW_SYSCALL}{}",
+        agent_prelude(),
+        r#"
+AT_FDCWD = -100
+target = ctypes.c_char_p(own.encode())
+name = ctypes.c_char_p(b'user.leash.lock')
+args = ctypes.create_string_buffer(16)
+attr = ctypes.create_string_buffer(32)
+args_p = ctypes.cast(args, ctypes.c_void_p)
+attr_p = ctypes.cast(attr, ctypes.c_void_p)
+calls = {
+    463: (AT_FDCWD, target, 0, name, args_p, 16),
+    466: (AT_FDCWD, target, 0, name),
+    469: (AT_FDCWD, target, attr_p, 32, 0),
+}
+for number, call in calls.items():
+    rc, err = sc(number, *call)
+    assert rc == -1 and err == errno.ENOSYS, (number, rc, err)
+"#
+    );
+    let run = session.python(&script).unwrap();
+    run.assert_exit_zero();
+    for name in ["setxattrat", "removexattrat", "file_setattr"] {
+        let seen: Vec<_> = run
+            .rule_events("snapshot:xattrat")
+            .into_iter()
+            .filter(|e| e["syscall"] == name)
+            .collect();
+        assert_eq!(seen.len(), 1, "{name} recorded once: {:#?}", run.events);
+        assert_eq!(seen[0]["decision"], "deny", "{name}");
+    }
+}
+
 #[test]
 fn utimensat_of_a_cgroup_control_file_is_denied() {
     escape(
