@@ -1084,7 +1084,7 @@ fn chown_held(path: &HeldPath, uid: u32, gid: u32, flags: i32) -> io::Result<i64
     if flags & !libc::AT_SYMLINK_NOFOLLOW != 0 {
         return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
     }
-    if flags == libc::AT_SYMLINK_NOFOLLOW {
+    if flags == libc::AT_SYMLINK_NOFOLLOW && !acts_on_pinned_target(path)? {
         let (parent, name) = required_parent_name(path)?;
         // SAFETY: name is retained and parent is a live directory descriptor.
         return rc_zero(unsafe {
@@ -1111,6 +1111,26 @@ fn target_is_symlink(target: BorrowedFd<'_>) -> io::Result<bool> {
         return Err(io::Error::last_os_error());
     }
     Ok(stat.st_mode & libc::S_IFMT == libc::S_IFLNK)
+}
+
+/// whether a no-follow call acts on the pinned target through its proc link, as the following
+/// form does, instead of through the parent and name.
+/// a target that is not a symlink is the same object either way, and the pinned handle is the
+/// object the policy decision was made on. an anchor root has no parent or name (it is a
+/// canonical directory, never a symlink), so the handle is the only way to reach it. a symlink
+/// cannot be reached through its proc link without being followed: it is acted on by name, and
+/// an anchor root that were one is refused rather than followed.
+fn acts_on_pinned_target(path: &HeldPath) -> io::Result<bool> {
+    let Some(target) = path.target.as_ref() else {
+        return Ok(false);
+    };
+    if !target_is_symlink(target.as_fd())? {
+        return Ok(true);
+    }
+    if path.parent.is_none() {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    Ok(false)
 }
 
 fn chmod_nofollow_held(path: &HeldPath, mode: u32) -> io::Result<i64> {
@@ -1190,7 +1210,7 @@ fn utimens_held(path: &HeldPath, times: Option<[i64; 4]>, flags: i32) -> io::Res
         ]
     });
     let spec_ptr = spec.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
-    if flags == libc::AT_SYMLINK_NOFOLLOW {
+    if flags == libc::AT_SYMLINK_NOFOLLOW && !acts_on_pinned_target(path)? {
         let (parent, name) = required_parent_name(path)?;
         // SAFETY: name is retained, parent is a live directory descriptor, and spec_ptr is
         // null or points at two live timespecs.
