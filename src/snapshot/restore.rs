@@ -24,7 +24,7 @@ pub use super::store::{RefusedEntry, UNCAPTURED_SHA256, scan_current};
 
 use super::diff::display_path;
 use super::store::{
-    EntryKind, Limits, Manifest, ManifestEntry, StoreError, capture, hex_encode,
+    EntryKind, Limits, Manifest, ManifestEntry, StoreError, capture, hex_decode, hex_encode,
     is_valid_sha256_hex, load_manifest, validate_manifest, validate_relative_path, verify_object,
 };
 
@@ -141,7 +141,7 @@ pub struct MetaChange {
     pub mtime: bool,
     /// owner or group differs.
     pub owner: bool,
-    /// user extended attributes differ.
+    /// user extended attributes or POSIX ACLs differ.
     pub xattrs: bool,
 }
 
@@ -441,7 +441,7 @@ fn meta_change(current: &ManifestEntry, target: &ManifestEntry) -> MetaChange {
 /// created shallowest first, files whose content or hard-link grouping differs are written
 /// (the first member of a group from the store, the others hard linked from it), symlinks
 /// whose target differs are recreated, and entries that differ only in mode, mtime, owner
-/// or user xattrs get a metadata fix. a kind change is a removal followed by a creation.
+/// user xattrs or ACLs get a metadata fix. a kind change is a removal followed by a creation.
 /// directory metadata is applied last, deepest first.
 pub fn plan(current: &Manifest, target: &Manifest) -> RestorePlan {
     let cur: HashMap<&str, &ManifestEntry> = current
@@ -959,20 +959,12 @@ fn commit_temp(tmp: &mut TempName<'_>, name: &CStr, path: &str) -> Result<(), Re
     Ok(())
 }
 
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    s.as_bytes()
-        .chunks(2)
-        .map(|pair| {
-            let digits = std::str::from_utf8(pair).ok()?;
-            u8::from_str_radix(digits, 16).ok()
-        })
-        .collect()
+/// the xattrs a snapshot records: `user.*` and the two POSIX ACLs.
+fn is_recorded_xattr(name: &[u8]) -> bool {
+    name.starts_with(b"user.") || std::str::from_utf8(name).is_ok_and(super::acl::is_acl_name)
 }
 
-fn list_user_xattrs(fd: RawFd, path: &str) -> Result<Vec<CString>, RestoreError> {
+fn list_recorded_xattrs(fd: RawFd, path: &str) -> Result<Vec<CString>, RestoreError> {
     for _ in 0..MAX_XATTR_RETRIES {
         // SAFETY: fd is live; a null list with size 0 queries the needed length.
         let needed = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
@@ -999,7 +991,7 @@ fn list_user_xattrs(fd: RawFd, path: &str) -> Result<Vec<CString>, RestoreError>
         list.truncate(got as usize);
         return Ok(list
             .split(|&b| b == 0)
-            .filter(|name| name.starts_with(b"user."))
+            .filter(|name| is_recorded_xattr(name))
             .filter_map(|name| CString::new(name).ok())
             .collect());
     }
@@ -1012,21 +1004,22 @@ fn list_user_xattrs(fd: RawFd, path: &str) -> Result<Vec<CString>, RestoreError>
     ))
 }
 
-/// make the `user.*` xattrs of `fd` exactly `wanted`. `elevate_mode` is applied first when
-/// anything changes, so an owner can write xattrs on a mode-000 entry; the caller sets the
-/// final mode afterwards.
+/// make the recorded xattrs of `fd` (`user.*` and the POSIX ACLs) exactly `wanted`.
+/// `elevate_mode` is applied first when anything changes, so an owner can write xattrs on a
+/// mode-000 entry; the caller sets the final mode afterwards.
+///
+/// the current xattrs are always listed, also on a file created a moment ago, because a
+/// new entry inherits the default ACL of its directory and the target may have none.
+/// `user.*` values go first and the ACLs last: setting the access ACL rewrites the group
+/// bits of the mode, and the owner entry of the new ACL can take away the owner's write
+/// access that a later `user.*` write would need.
 fn sync_xattrs(
     fd: RawFd,
     wanted: &BTreeMap<String, String>,
     path: &str,
-    existing: bool,
     elevate_mode: u32,
 ) -> Result<(), RestoreError> {
-    let have = if existing {
-        list_user_xattrs(fd, path)?
-    } else {
-        Vec::new()
-    };
+    let have = list_recorded_xattrs(fd, path)?;
     let stale: Vec<&CString> = have
         .iter()
         .filter(|name| !name.to_str().is_ok_and(|n| wanted.contains_key(n)))
@@ -1049,8 +1042,12 @@ fn sync_xattrs(
             }
         }
     }
-    for (name, hex) in wanted {
-        let value = decode_hex(hex).ok_or_else(|| RestoreError::InvalidPlan {
+    let (acls, users): (Vec<_>, Vec<_>) = wanted
+        .iter()
+        .partition(|(name, _)| super::acl::is_acl_name(name));
+    // access before default, which is also the map's order
+    for (name, hex) in users.into_iter().chain(acls) {
+        let value = hex_decode(hex).ok_or_else(|| RestoreError::InvalidPlan {
             path: path.to_owned(),
             reason: "xattr value is not hex",
         })?;
@@ -1076,16 +1073,22 @@ fn mtime_spec(entry: &ManifestEntry) -> [libc::timespec; 2] {
     ]
 }
 
-/// apply owner, xattrs, mode and mtime to an open inode, in an order that survives the
+/// apply xattrs, owner, mode and mtime to an open inode, in an order that survives the
 /// kernel clearing setuid bits on chown and requiring write access for xattrs.
+///
+/// the mode comes after the xattrs on purpose. setting an access ACL rewrites the owner,
+/// group (mask) and other bits of the mode, and a `chmod` on a file with an access ACL
+/// rewrites the ACL's owner, mask and other entries from the mode. a captured entry always
+/// has them equal (`acl::check_mode` holds for every validated manifest), so the final
+/// `fchmod` with the captured mode leaves the captured ACL byte for byte intact and puts
+/// the setuid, setgid and sticky bits back, which the ACL set and the `fchown` may clear.
 fn apply_inode_meta(
     fd: RawFd,
     entry: &ManifestEntry,
     path: &str,
-    existing: bool,
     elevate_mode: u32,
 ) -> Result<(), RestoreError> {
-    sync_xattrs(fd, &entry.xattrs, path, existing, elevate_mode)?;
+    sync_xattrs(fd, &entry.xattrs, path, elevate_mode)?;
     let st = fstat(fd, path)?;
     if st.st_uid != entry.uid || st.st_gid != entry.gid {
         // SAFETY: fd is a live descriptor.
@@ -1577,7 +1580,7 @@ impl<'a> Applier<'a> {
         }
         // SAFETY: tmp is a live descriptor.
         check(unsafe { libc::fsync(tmp.as_raw_fd()) }, "fsync", path)?;
-        apply_inode_meta(tmp.as_raw_fd(), entry, path, false, 0o600)?;
+        apply_inode_meta(tmp.as_raw_fd(), entry, path, 0o600)?;
         commit_temp(&mut guard, &name, path)?;
         self.stats.files_written += 1;
         self.stats.bytes_written += written;
@@ -1700,7 +1703,7 @@ impl<'a> Applier<'a> {
                     drop(dir);
                     return self.replace_shared_inode(path, entry);
                 }
-                apply_inode_meta(file.as_raw_fd(), entry, path, true, 0o600)?;
+                apply_inode_meta(file.as_raw_fd(), entry, path, 0o600)?;
             }
             EntryKind::Dir => {
                 return Err(RestoreError::InvalidPlan {
@@ -1751,7 +1754,7 @@ impl<'a> Applier<'a> {
         for path in ordered {
             let entry = self.entry(&path, EntryKind::Dir)?;
             let dir = open_dir_beneath(self.workspace, &path, &path)?;
-            apply_inode_meta(dir.as_raw_fd(), entry, &path, true, 0o700)?;
+            apply_inode_meta(dir.as_raw_fd(), entry, &path, 0o700)?;
             self.stats.dirs_finalized += 1;
         }
         Ok(())
