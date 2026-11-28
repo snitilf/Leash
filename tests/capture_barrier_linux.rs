@@ -156,7 +156,16 @@ impl Harness {
                     if first_run(&state).is_some_and(|run| manifest_path(&run, step).exists()) {
                         break;
                     }
-                    assert!(Instant::now() < deadline, "step {step} was never published");
+                    if Instant::now() >= deadline {
+                        let denied: Vec<String> = first_run(&state)
+                            .map(|run| events_of(&run))
+                            .unwrap_or_default()
+                            .iter()
+                            .filter(|e| e["decision"] == "deny")
+                            .map(Value::to_string)
+                            .collect();
+                        panic!("step {step} was never published; denied events: {denied:#?}");
+                    }
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 std::fs::write(ctl.join(name), "1").unwrap();
