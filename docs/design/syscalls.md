@@ -329,9 +329,16 @@ Nonzero extension bytes return `E2BIG`.
 `O_PATH` with any flag outside `O_DIRECTORY`, `O_NOFOLLOW`, and `O_CLOEXEC` (an access mode, `O_CREAT`, `O_TRUNC`) returns `EINVAL`, as the kernel's `openat2` does, and nothing is opened or created; when several apply, `E2BIG` takes precedence, then `EINVAL`, then `EOPNOTSUPP`.
 The caller's `resolve` flags `RESOLVE_NO_XDEV`, `RESOLVE_NO_MAGICLINKS`, `RESOLVE_NO_SYMLINKS`, and `RESOLVE_BENEATH` only narrow how the caller's own spelling of the path may resolve, so they add no authority and do not change the object the policy judged.
 After the policy allows the open, the supervisor resolves the spelling once more without opening anything, from the directory the spelling starts from and with the caller's bits, and answers the `EXDEV` or `ELOOP` the kernel would give.
+That directory is the real object the agent holds, opened as an `O_PATH` descriptor through `/proc/<pid>/cwd` or `/proc/<pid>/fd/<n>`, and never the directory its link reads back as text.
+Opening that magic link is safe here because it names the agent's own working directory or descriptor, the kernel jumps to the object without walking any path text, and the result is only a base to resolve from.
+The supervisor checks that the notification is still valid after that open and before it uses the result, and drops the call if it is not.
+An absolute spelling resolves from the supervisor's own root, as the kernel resolves it for every caller.
+With `O_CREAT|O_EXCL` the check does not follow a final symlink, as the kernel does not, so an existing one is left to the real open, which answers `EEXIST`.
 The refusal is recorded as a second event under `failsafe:realization` with the errno, like any other failure after a recorded allow.
 Any other outcome of that check is left to the real open, which answers it.
-A spelling that cannot be checked, because its directory cannot be read back, returns `EOPNOTSUPP`.
+A spelling that cannot be checked, because its directory cannot be opened, returns `EOPNOTSUPP`.
+The check and the open are separate resolutions of the spelling, so the caller's guarantee is best-effort under a concurrent swap of a path component, and the object the policy judged is still the one that is opened.
+The check runs in the supervisor, outside the broker's deadline, so a hung mount on the path could stall the loop; that is tracked in a follow-up issue.
 Modern `tar` opens each directory it extracts into with `RESOLVE_BENEATH`, so refusing these flags broke extraction on hosts whose `tar` does that.
 `RESOLVE_IN_ROOT` and `RESOLVE_CACHED` return `EOPNOTSUPP`, because the first changes what the spelling means and the second changes whether the call may block, and neither is checked by the same second resolution.
 A bit outside the six the kernel defines, and `RESOLVE_BENEATH` with `RESOLVE_IN_ROOT`, return `EINVAL`, as the kernel does.
