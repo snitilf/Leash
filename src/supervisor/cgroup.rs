@@ -73,6 +73,12 @@ impl Cgroup {
             .collect()
     }
 
+    /// whether `cgroup.events` reports `populated 1` right now: a process lives in the
+    /// cgroup or one of its descendants.
+    pub fn is_populated(&self) -> io::Result<bool> {
+        event_value(&read_control(&self.events)?, "populated")
+    }
+
     /// wait until the kernel reports `populated 0`.
     pub fn wait_unpopulated(&self, timeout: Duration) -> io::Result<()> {
         self.wait_event("populated", false, timeout)
@@ -446,8 +452,10 @@ pub fn child_dirs(dir: &File) -> io::Result<Vec<CString>> {
 /// the supervisor never enters the probe cgroup.
 ///
 /// the probe child enters its sacrificial cgroup through the same `clone3(CLONE_INTO_CGROUP)`
-/// path `spawn` uses, before the cgroup is ever killed, and writes a ready byte before
-/// execing `/bin/sleep`. on Linux 6.8 a child created that way is SIGKILLed at birth whenever
+/// path `spawn` uses, before the cgroup is ever killed, and writes a ready byte before it
+/// waits in `pause()`. it execs nothing, so the probe needs no binary on the host, and it
+/// asks the kernel to SIGKILL it when the supervisor dies, so a crashed supervisor leaves no
+/// populated probe cgroup behind. on Linux 6.8 a child created that way is SIGKILLed at birth whenever
 /// the caller's cgroup kill count differs from the target's (measurement 0003 section 8), so
 /// a Leash running inside a previously killed cgroup would have every agent SIGKILLed at
 /// birth; this probe turns that into a refusal before any run directory exists.
@@ -474,7 +482,7 @@ pub fn probe_delegation(parent: &Path, timeout: Duration) -> io::Result<()> {
             ));
         }
 
-        let (pid, ready_rx) = spawn_probe_child(group.dir_fd())?;
+        let (pid, ready_rx) = spawn_probe_child(Some(group.dir_fd()))?;
         child_pid = Some(pid);
 
         let handshake = read_probe_handshake(ready_rx.as_raw_fd(), timeout)?;
@@ -484,7 +492,7 @@ pub fn probe_delegation(parent: &Path, timeout: Duration) -> io::Result<()> {
             ));
         }
         if handshake != b"R" {
-            return Err(io::Error::other("probe child failed to exec /bin/sleep"));
+            return Err(io::Error::other("probe child sent an unexpected handshake"));
         }
 
         let pid_u32 = u32::try_from(pid).map_err(io::Error::other)?;
@@ -521,10 +529,12 @@ pub fn probe_delegation(parent: &Path, timeout: Duration) -> io::Result<()> {
     )
 }
 
-/// fork a probe child directly into `cgroup_fd` via `clone3(CLONE_INTO_CGROUP)` so the child
-/// writes `b'R'` on the CLOEXEC pipe (proving it survived birth) and execs `/bin/sleep 60`.
-/// if `execv` fails it writes `b'E'` before exiting 127.
-fn spawn_probe_child(cgroup_fd: RawFd) -> io::Result<(libc::pid_t, OwnedFd)> {
+/// fork a probe child directly into `cgroup_fd` via `clone3(CLONE_INTO_CGROUP)` (a plain
+/// fork when `None`, which the tests use) and have it write `b'R'` on a pipe, close the pipe
+/// and wait in `pause()`. the child asks for SIGKILL when its parent thread dies, then checks
+/// that the parent is still alive, which closes the race with a parent that died before the
+/// request took effect. it execs nothing.
+fn spawn_probe_child(cgroup_fd: Option<RawFd>) -> io::Result<(libc::pid_t, OwnedFd)> {
     let mut fds = [0 as RawFd; 2];
     // SAFETY: pipe2 writes two fresh descriptors into fds.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
@@ -539,21 +549,28 @@ fn spawn_probe_child(cgroup_fd: RawFd) -> io::Result<(libc::pid_t, OwnedFd)> {
         .custom_flags(libc::O_CLOEXEC)
         .open("/dev/null")?;
 
-    let exec_path = c"/bin/sleep";
-    let argv: [*const libc::c_char; 3] = [exec_path.as_ptr(), c"60".as_ptr(), std::ptr::null()];
     let read_fd = read_end.as_raw_fd();
     let write_fd = write_end.as_raw_fd();
     let null_fd = dev_null.as_raw_fd();
+    // SAFETY: getpid reads no memory.
+    let parent_pid = unsafe { libc::getpid() };
 
     // SAFETY: the child branch performs only async-signal-safe syscalls on pre-built
-    // descriptors and static string literals, then calls execv or _exit.
-    let pid = unsafe { crate::supervisor::spawn::fork_process(Some(cgroup_fd)) };
+    // descriptors, then waits in pause() or calls _exit.
+    let pid = unsafe { crate::supervisor::spawn::fork_process(cgroup_fd) };
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
-        // SAFETY: we are the child of clone3(CLONE_INTO_CGROUP); only raw syscalls below.
+        // SAFETY: we are the child of the fork; only raw syscalls below.
         unsafe {
+            // die with the supervisor: a leaked probe would keep its cgroup populated for
+            // good. the parent may already be gone, which getppid reveals.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0
+                || libc::getppid() != parent_pid
+            {
+                libc::_exit(125);
+            }
             libc::close(read_fd);
             for target in [0, 1, 2] {
                 if null_fd != target {
@@ -571,10 +588,11 @@ fn spawn_probe_child(cgroup_fd: RawFd) -> io::Result<(libc::pid_t, OwnedFd)> {
                 }
                 libc::_exit(126);
             }
-            libc::execv(exec_path.as_ptr(), argv.as_ptr());
-            let err_byte = *b"E";
-            let _ = libc::write(write_fd, err_byte.as_ptr().cast(), 1);
-            libc::_exit(127);
+            // closing the pipe ends the parent's handshake read with EOF
+            libc::close(write_fd);
+            loop {
+                libc::pause();
+            }
         }
     }
 
@@ -730,6 +748,53 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(probe_delegation(dir.path(), Duration::ZERO).is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_probe_execs_no_host_binary() {
+        // the needles are built in pieces so this test does not contain them itself
+        let source = include_str!("cgroup.rs");
+        for needle in [concat!("/bin/", "sleep"), concat!("exec", "v(")] {
+            assert!(!source.contains(needle), "the probe must not exec {needle}");
+        }
+    }
+
+    #[test]
+    fn a_probe_child_dies_with_its_parent_thread() {
+        // PR_SET_PDEATHSIG fires when the parent thread exits, so a thread that forks the
+        // probe child and ends stands in for a supervisor that crashed after the fork
+        let (pid, ready_rx) = std::thread::spawn(|| {
+            let (pid, ready_rx) = spawn_probe_child(None).unwrap();
+            let handshake = read_probe_handshake(ready_rx.as_raw_fd(), Duration::from_secs(5));
+            assert_eq!(handshake.unwrap(), b"R");
+            // the child waits instead of exiting
+            std::thread::sleep(Duration::from_millis(50));
+            let mut status = 0;
+            // SAFETY: pid is our probe child; WNOHANG never blocks.
+            let rc = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+            assert_eq!(rc, 0, "the probe child is alive while its parent thread is");
+            (pid, ready_rx)
+        })
+        .join()
+        .unwrap();
+        drop(ready_rx);
+        let start = Instant::now();
+        loop {
+            let mut status = 0;
+            // SAFETY: pid is our probe child; WNOHANG never blocks.
+            let rc = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+            if rc == pid {
+                assert!(libc::WIFSIGNALED(status));
+                assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+                return;
+            }
+            assert_eq!(rc, 0, "waitpid failed");
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the probe child outlived its parent thread"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
