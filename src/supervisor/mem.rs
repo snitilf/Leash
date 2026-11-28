@@ -30,6 +30,15 @@ pub enum MemReadError {
     /// accept is hostile by definition
     #[error("no nul terminator within the {0}-byte cap")]
     NoNulWithinCap(usize),
+    /// the value is longer than the ceiling on one read. it is refused, never clamped to a
+    /// shorter value the caller would take for the whole
+    #[error("a {wanted}-byte read is over the {cap}-byte ceiling")]
+    OverCap {
+        /// bytes the caller asked for
+        wanted: usize,
+        /// the ceiling on one read
+        cap: usize,
+    },
     /// the read returned fewer bytes than the fixed-size value needs
     #[error("short read: wanted {wanted} bytes, got {got}")]
     Short {
@@ -271,5 +280,38 @@ mod tests {
             read_exact_capped(|p, b| mem.read_at(p, b), 0x1000 + 4, 8),
             Err(MemReadError::Io(_) | MemReadError::Short { .. })
         ));
+    }
+
+    #[test]
+    fn a_read_at_the_ceiling_returns_every_byte() {
+        let mem = FakeMem {
+            base: 0x1000,
+            bytes: (0..ABSOLUTE_READ_CAP + 8)
+                .map(|i| (i % 251) as u8)
+                .collect(),
+        };
+        let got = read_exact_capped(|p, b| mem.read_at(p, b), 0x1000, ABSOLUTE_READ_CAP).unwrap();
+        assert_eq!(got.len(), ABSOLUTE_READ_CAP);
+        assert_eq!(got, mem.bytes[..ABSOLUTE_READ_CAP]);
+    }
+
+    #[test]
+    fn a_read_past_the_ceiling_is_an_error_never_a_shorter_value() {
+        let mem = FakeMem {
+            base: 0x1000,
+            bytes: vec![1u8; ABSOLUTE_READ_CAP + 8],
+        };
+        match read_exact_capped(|p, b| mem.read_at(p, b), 0x1000, ABSOLUTE_READ_CAP + 1) {
+            Err(MemReadError::OverCap { wanted, cap }) => {
+                assert_eq!((wanted, cap), (ABSOLUTE_READ_CAP + 1, ABSOLUTE_READ_CAP));
+            }
+            other => panic!("a longer read must not be clamped: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_ceiling_holds_the_largest_xattr_value() {
+        // the kernel's XATTR_SIZE_MAX is 65536; the value is read whole or not at all
+        assert_eq!(ABSOLUTE_READ_CAP, 65_536);
     }
 }
