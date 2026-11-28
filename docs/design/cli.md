@@ -146,13 +146,16 @@ The order of checks, each before any write to the workspace:
    The recorded run cgroup must be `Gone`; `Present` and `Unknown` are refused and the message names the cgroup.
    A present cgroup of a dead run is first offered to the stale cleanup (ADR-0024 decision 17), which kills and removes it only when its lock xattr matches this run's lock inode.
    A missing `run_end` is fine, so a crashed run can be rewound.
-4. The workspace lock is taken without blocking, and held to the end; a held lock refuses.
+4. The workspace lock (the `flock` on the workspace directory and the one under the state root, ADR-0026) is taken without blocking, and held to the end; a held lock refuses, whatever state directory the holder used.
+   The locked directory handle is the one that is scanned, captured and restored.
 5. The target step has a committed `step` event in `trace.jsonl` and a manifest in the store.
+   The committed steps are derived from the `step` events of the trace (`store::committed_steps_from_trace`), never from the manifests on disk.
+   A `step` event followed by `capture_failed` with phase `step_event` for the same step is not committed.
    The trace is untrusted input, read through a handle and capped at 256 MiB.
-   A final line without a newline that does not parse (a crash mid-write) is ignored; any other malformed line refuses.
+   A final line without a newline (a crash mid-write) is ignored; any other malformed line refuses.
    The `run_start` event must agree with `meta.json`.
    A manifest with no committed `step` event is an orphan of an aborted capture and is not a target.
-6. The chain is recomputed from the manifests in the store.
+6. The chain is recomputed from the manifests of the committed steps; an orphan manifest is not in it.
    The recomputed digest of the target must equal the digest in the trace's step event, and `--expect`, when given, must equal the chain head or that digest.
 7. Every store object the plan writes is verified, so a corrupt object refuses the rewind before the workspace changes.
 
