@@ -158,7 +158,8 @@ Both are read with `fgetxattr` on the opened descriptor and kept as opaque value
 A workspace under a directory with a default ACL, such as a `/tmp` that has one, therefore captures: every directory made in it inherits the default ACL, and files inherit an access ACL when the default has named entries.
 Capture and manifest validation both check an ACL value.
 It must carry the version 2 header and whole 8-byte entries with known tags in the order the kernel requires, with the undefined id on the owner, group, mask and other entries and a real id on named ones.
-An access ACL must also agree with the mode: its owner, mask (or group, when there is no mask) and other entries equal the owner, group and other bits.
+An access ACL must also agree with the mode: its owner, mask and other entries equal the owner, group and other bits.
+An access ACL with no mask entry is refused, because the kernel treats owner, group and other alone as the mode and never stores it.
 A value that fails a check is refused explicitly, never recorded or applied.
 `security.selinux` is still left out, and every other name outside these (`trusted.*`, other `security.*`, other `system.*`) still refuses the capture.
 The manifest schema version stays 1, because an ACL is one more name in an existing map.

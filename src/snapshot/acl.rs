@@ -116,29 +116,33 @@ pub fn validate_blob(blob: &[u8]) -> Result<(), &'static str> {
 
 /// check that the access ACL `blob` agrees with the permission bits `mode`.
 ///
-/// the kernel keeps the owner, mask (or group when there is no mask) and other entries of an
-/// access ACL equal to the owner, group and other bits of the mode. a value that disagrees
-/// cannot be restored exactly, because setting the mode rewrites those entries.
+/// the kernel keeps the owner, mask and other entries of an access ACL equal to the owner,
+/// group and other bits of the mode. a value that disagrees cannot be restored exactly,
+/// because setting the mode rewrites those entries.
+///
+/// an access ACL with no mask entry is refused too. the kernel (`posix_acl_update_mode`)
+/// treats owner, group and other alone as equivalent to the mode and stores no xattr for
+/// it, so such a value is never on disk, and restoring one would succeed without ever
+/// matching a capture.
 pub fn check_mode(blob: &[u8], mode: u32) -> Result<(), &'static str> {
     validate_blob(blob)?;
-    let (mut owner, mut group, mut mask, mut other) = (None, None, None, None);
+    let (mut owner, mut mask, mut other) = (None, None, None);
     for e in entries(blob)? {
         let perm = u32::from(e.perm);
         match e.tag {
             TAG_USER_OBJ => owner = Some(perm),
-            TAG_GROUP_OBJ => group = Some(perm),
             TAG_MASK => mask = Some(perm),
             TAG_OTHER => other = Some(perm),
             _ => {}
         }
     }
     if owner == Some((mode >> 6) & 0o7)
-        && mask.or(group) == Some((mode >> 3) & 0o7)
+        && mask == Some((mode >> 3) & 0o7)
         && other == Some(mode & 0o7)
     {
         Ok(())
     } else {
-        Err("owner, mask and other entries disagree with the mode bits")
+        Err("no mask entry, or owner, mask and other entries disagree with the mode bits")
     }
 }
 
@@ -270,7 +274,7 @@ mod tests {
             (OTHER, 0, UNDEF),
         ]);
         assert!(validate_blob(&no_mask).is_err());
-        // a mask without a named entry is also not a shape the kernel produces
+        // a mask without a named entry is a shape setfacl produces (`setfacl -m m::r`)
         let lone_mask = blob(&[
             (USER_OBJ, 7, UNDEF),
             (GROUP_OBJ, 4, UNDEF),
@@ -331,13 +335,28 @@ mod tests {
         assert!(check_mode(&extended(), 0o700).is_err());
         assert!(check_mode(&extended(), 0o740).is_err());
         assert!(check_mode(&extended(), 0o751).is_err());
-        // without a mask the group entry stands in for it
+        // a lone mask is a valid extended ACL and stands for the group bits
+        let lone_mask = blob(&[
+            (USER_OBJ, 6, UNDEF),
+            (GROUP_OBJ, 6, UNDEF),
+            (MASK, 4, UNDEF),
+            (OTHER, 0, UNDEF),
+        ]);
+        assert_eq!(check_mode(&lone_mask, 0o640), Ok(()));
+        assert!(check_mode(&lone_mask, 0o660).is_err());
+    }
+
+    #[test]
+    fn an_access_acl_without_a_mask_is_refused_because_the_kernel_would_drop_it() {
+        // owner, group and other only: `posix_acl_update_mode` treats it as the mode itself
+        // and stores no xattr, so it can never be restored as an ACL
         let bare = blob(&[
             (USER_OBJ, 6, UNDEF),
             (GROUP_OBJ, 4, UNDEF),
             (OTHER, 0, UNDEF),
         ]);
-        assert_eq!(check_mode(&bare, 0o640), Ok(()));
+        assert_eq!(validate_blob(&bare), Ok(()));
+        assert!(check_mode(&bare, 0o640).is_err());
         assert!(check_mode(&bare, 0o660).is_err());
     }
 }
