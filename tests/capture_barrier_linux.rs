@@ -744,12 +744,12 @@ fn descendants_and_an_orphan_are_frozen_at_a_boundary_and_killed_at_root_exit() 
             .collect()
     };
     let frozen_samples: Mutex<Vec<FrozenSample>> = Mutex::new(Vec::new());
-    let checks = AtomicU64::new(0);
+    let rechecks: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
     let ws = harness.ws.clone();
-    let state = harness.state.path().to_path_buf();
     // after the freeze: the live files do not move for 30 ms (the writers append every ms), and
-    // the cgroup lists every member. after the capture: the live sizes still equal the
-    // snapshot's, so the capture saw the frozen moment.
+    // the cgroup lists every member. at the re-check, which runs after the capture and before
+    // the manifest is published, the live sizes are recorded: the test compares them with the
+    // published snapshot once the run is over, so the capture saw the frozen moment.
     let freeze = |group: &Cgroup, timeout: Duration| -> std::io::Result<()> {
         group.set_frozen(true, timeout)?;
         let before = sizes(&ws);
@@ -763,23 +763,7 @@ fn descendants_and_an_orphan_are_frozen_at_a_boundary_and_killed_at_root_exit() 
         Ok(())
     };
     let is_frozen = |group: &Cgroup| -> std::io::Result<bool> {
-        let step = checks.fetch_add(1, Ordering::SeqCst) + 1;
-        let run = first_run(&state).unwrap();
-        let store = open_store(&run);
-        let (manifest, _) = load_manifest(&store, step).unwrap();
-        for file in files {
-            let live = std::fs::metadata(ws.join(file)).map_or(0, |m| m.len());
-            let captured = manifest
-                .entries
-                .iter()
-                .find(|e| e.path == file)
-                .and_then(|e| e.size)
-                .unwrap_or(0);
-            assert_eq!(
-                live, captured,
-                "step {step}: {file} moved after its capture"
-            );
-        }
+        rechecks.lock().unwrap().push(sizes(&ws));
         group.is_frozen()
     };
     let hooks = SessionHooks {
@@ -826,6 +810,33 @@ fn descendants_and_an_orphan_are_frozen_at_a_boundary_and_killed_at_root_exit() 
     assert!(matches!(outcome.exit, ExitDisposition::Exited(0)));
 
     let samples = frozen_samples.lock().unwrap();
+    let rechecks = rechecks.lock().unwrap();
+    assert_eq!(
+        rechecks.len(),
+        samples.len(),
+        "every boundary re-checked once"
+    );
+    let store = open_store(&outcome.run_path);
+    for (i, (_, after, _)) in samples.iter().enumerate() {
+        let step = i as u64 + 1;
+        assert_eq!(
+            &rechecks[i], after,
+            "step {step}: the live files moved between the freeze and the re-check"
+        );
+        let (manifest, _) = load_manifest(&store, step).unwrap();
+        for (file, live) in files.iter().zip(&rechecks[i]) {
+            let captured = manifest
+                .entries
+                .iter()
+                .find(|e| e.path == *file)
+                .and_then(|e| e.size)
+                .unwrap_or(0);
+            assert_eq!(
+                *live, captured,
+                "step {step}: {file} moved after its capture"
+            );
+        }
+    }
     assert!(samples.len() >= 2, "two boundaries ran: {}", samples.len());
     for (before, after, members) in samples.iter() {
         assert_eq!(before, after, "no writer moved while the cgroup was frozen");
