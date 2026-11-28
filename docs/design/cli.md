@@ -114,7 +114,7 @@ Rules the output follows:
 
 ```
 leash rewind <run-id> [--step N] [--expect <digest>] [--no-undo] [--workspace <dir>] [--state-dir <dir>]
-leash rewind <run-id> --undo <n> [--no-undo] [--workspace <dir>] [--state-dir <dir>]
+leash rewind <run-id> --undo <n> [--expect <digest>] [--no-undo] [--workspace <dir>] [--state-dir <dir>]
 ```
 
 `rewind` restores the workspace of a finished snapshot run to step `N`, or to step 0 (the workspace as it was before the agent started) when `--step` is omitted.
@@ -127,33 +127,43 @@ Flags:
 - `--step N` is a plain decimal number.
 - `--expect <digest>` is 64 hexadecimal digits, upper or lower case, kept outside the store by the operator.
   It must equal the chain head recomputed from the store, or the manifest digest of the target step.
+  With `--undo <n>` it must equal the manifest digest of the safety snapshot, which rewind prints when it takes one.
+  Without it, the store is checked only against the trace beside it, so an attacker who can write both the store and the trace is not detected; rewind says so (see the output below).
 - `--no-undo` skips the safety snapshot.
 - `--workspace <dir>` names the workspace when the working directory is not it.
   A relative path resolves against the working directory.
 - `--state-dir <dir>` is as for `run`, and must lie outside the workspace.
 - `--undo <n>` restores safety snapshot `n` of the run instead of a step.
-  It cannot be combined with `--step` or `--expect`, because a safety snapshot is outside the chain.
+  It cannot be combined with `--step`, because a safety snapshot is outside the chain.
+  The undo store has no trace and no chain, so `--expect` is its only check against forgery.
 
-The usage errors, all exit 2, are: no run id, a run id that is not a plain directory name, a flag given twice, an unknown flag, a missing flag value, `--step` or `--undo` that is not a non-negative whole number, `--expect` that is not 64 hexadecimal digits, `--undo` with `--step` or `--expect`, and an extra positional argument.
+The usage errors, all exit 2, are: no run id, a run id that is not a plain directory name, a flag given twice, an unknown flag, a missing flag value, `--step` or `--undo` that is not a non-negative whole number, `--expect` that is not 64 hexadecimal digits, `--undo` with `--step`, and an extra positional argument.
 
 The order of checks, each before any write to the workspace:
 
+0. The process is not root.
+   Root is refused first, before the run directory is opened, so no cleanup runs as root and no root-owned entry appears under the state root.
 1. The run is a directory under `<state-root>/runs`, opened component by component with `O_NOFOLLOW`; `meta.json` is a regular file of at most 64 KiB.
    An unknown run, a run with no `snapshots` directory, and a run whose metadata records no run cgroup (not a snapshot run) are refused.
 2. The workspace, the working directory or `--workspace` canonicalized, equals the workspace in `meta.json`.
 3. The run is over.
    `run.lock` is taken without blocking; a held lock means the run is live.
    The recorded run cgroup must be `Gone`; `Present` and `Unknown` are refused and the message names the cgroup.
-   A present cgroup of a dead run is first offered to the stale cleanup (ADR-0024 decision 17), which kills and removes it only when its lock xattr matches this run's lock inode.
+   A present cgroup of a dead run is first offered to the stale cleanup (ADR-0024 decision 17), which runs on the parent cgroup that `meta.json` records for the run cgroup.
+   It does not skip any cgroup, so it may kill and remove every stale Leash cgroup under that parent, not only this run's.
+   It touches a cgroup only when its name is a valid Leash run name, its run lock under this state root can be taken, and its lock xattr matches that lock file's inode.
    A missing `run_end` is fine, so a crashed run can be rewound.
 4. The workspace lock (the `flock` on the workspace directory and the one under the state root, ADR-0026) is taken without blocking, and held to the end; a held lock refuses, whatever state directory the holder used.
    The locked directory handle is the one that is scanned, captured and restored.
+   The canonical path read back from that handle must equal the workspace that check 2 compared, or rewind refuses with `the workspace changed while rewind opened it`; a path component swapped for a symlink between the two cannot redirect the restore.
 5. The target step has a committed `step` event in `trace.jsonl` and a manifest in the store.
    The committed steps are derived from the `step` events of the trace (`store::committed_steps_from_trace`), never from the manifests on disk.
    A `step` event followed by `capture_failed` with phase `step_event` for the same step is not committed.
-   The trace is untrusted input, read through a handle and capped at 256 MiB.
+   The trace is untrusted input, read once through a handle by the same streaming reader that `diff` uses, so the two agree on the committed steps.
+   It is capped at 1 GiB and 1 MiB per line, and only one line is held in memory at a time.
+   An empty line refuses, because the recorder never writes one.
    A final line without a newline (a crash mid-write) is ignored; any other malformed line refuses.
-   The `run_start` event must agree with `meta.json`.
+   The first event must be a `run_start` that agrees with `meta.json`.
    A manifest with no committed `step` event is an orphan of an aborted capture and is not a target.
 6. The chain is recomputed from the manifests of the committed steps; an orphan manifest is not in it.
    The recomputed digest of the target must equal the digest in the trace's step event, and `--expect`, when given, must equal the chain head or that digest.
@@ -164,8 +174,10 @@ Exit codes:
 | Outcome | Exit code |
 |---|---|
 | rewound, or the workspace already matched | 0 |
-| usage error; unknown run; run without snapshots or not a snapshot run; unknown step, or a step with no committed event; workspace differs from the run's; state directory inside the workspace; unknown `--undo` number | 2 |
-| live run (lock held); cgroup `Present` or `Unknown`; workspace lock held; trace, store or digest mismatch; `--expect` mismatch; safety snapshot impossible; running as root; apply failed | 125 |
+| usage error; unknown run (a symlinked run directory counts as unknown); run without snapshots or not a snapshot run; unknown step, or a step with no committed event; workspace differs from the run's; state directory inside the workspace; unknown `--undo` number (a symlinked undo directory counts as unknown) | 2 |
+| live run (lock held); cgroup `Present` or `Unknown`; workspace lock held; the workspace changed while it was opened; trace, metadata, store or digest mismatch; a trace or metadata file that is not a regular file or is over its cap; `--expect` mismatch; an undo store that is not exactly step 0 (an incomplete or forged safety snapshot); safety snapshot impossible; running as root; apply failed; a failed write of the result to stdout | 125 |
+
+A failed write to stdout after the workspace was restored also exits 125, because the operator cannot be shown the result; the workspace stays restored, and the error says that it could not write the output.
 
 Output goes to stdout except warnings and errors, which go to stderr and start with `leash: `.
 A successful rewind prints these lines, in order (angle brackets are values):
@@ -174,14 +186,18 @@ A successful rewind prints these lines, in order (angle brackets are values):
 chain head: <64 hex>
 step <N> digest: <64 hex>
 safety snapshot: <state-root>/runs/<run-id>/rewind/undo-<n> (undo <n>)
-to undo this rewind: leash rewind <run-id> --undo <n> --workspace <dir> --state-dir <dir>
+safety snapshot digest: <64 hex>
+to undo this rewind: leash rewind <run-id> --undo <n> --expect <64 hex> --workspace <dir> --state-dir <dir>
 <change summary>
 rewound the workspace to step <N>: <r> removed, <d> directories created, <w> files written, <l> hard links, <s> symlinks, <m> metadata fixes
 rewind reverses filesystem effects only; anything the agent sent off this machine is not undone
 ```
 
 - The first two lines are printed once the integrity checks pass; a refusal prints both values it compared in the error instead.
+- The safety snapshot digest is the manifest digest of the snapshot, and the undo command carries it as `--expect`, so the undo is checked against the value printed when the snapshot was taken.
 - The undo command is shell-quoted, so it can be pasted as printed.
+- Without `--expect`, stderr says `leash: note: no --expect given; the store is checked only against the trace beside it, so a forged store and trace are not detected; pass the chain head printed at run end`, before the first write.
+  With `--undo` the note reads `the undo store is checked against nothing, so a forged undo store is not detected; pass the safety snapshot digest printed by the earlier rewind`.
 - The change summary is the restore engine's: a counts line, then one `  <action> <path>` line per change, sorted by path, with a path that holds a control character printed quoted and escaped.
 - When the plan is empty, the output is `workspace already matches step <N>`, then the effects line, and nothing is written; no safety snapshot is kept.
 - With `--undo <n>`, the first two lines are absent, the result line reads `restored the workspace from undo snapshot <n>: ...`, and a new safety snapshot is still taken first.

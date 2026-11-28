@@ -209,9 +209,10 @@ It takes the run lock first, so a held lock means a live run, then checks the cg
 When the cgroup is `Present` and the lock was free, it releases the lock, runs the stale cleanup against the recorded parent, and takes the lock again before it checks once more.
 `leash rewind` is the command; its grammar, checks, output and exit codes are in [`cli.md`](cli.md) section 1.
 It also takes the workspace lock (both flocks, ADR-0026) for the whole rewind, and restores through the locked directory handle.
-Every snapshot `leash run` and `leash rewind` kills and removes stale run cgroups under its current parent cgroup that run metadata names; non-snapshot runs do not clean stale cgroups.
-A run cgroup is stale when its run lock can be taken and its `user.leash.lock` xattr matches that lock file's `<st_dev>:<st_ino>`.
-Only a Leash-named child of Leash's own cgroup is killed; a name from metadata is validated first.
+Every snapshot `leash run` kills and removes stale run cgroups under its current parent cgroup; non-snapshot runs do not clean stale cgroups.
+`leash rewind` cannot reach a dead run's cgroup any other way, so it runs the same cleanup on the parent that the run's `meta.json` records for its run cgroup, and with no cgroup skipped.
+That cleanup may therefore kill and remove every stale Leash cgroup under the recorded parent, not only the rewound run's.
+A run cgroup is stale when its name is a valid Leash run name, its run lock under this state root can be taken, and its `user.leash.lock` xattr matches that lock file's `<st_dev>:<st_ino>`; a name from metadata is validated first, and nothing else is killed.
 Under per-run `systemd-run --scope` launches, a crashed run's cgroup lives in its own earlier scope, so a later run's parent-cgroup scan does not reach it (unverified, as systemd is absent in the codespace).
 Rewind also requires exclusive workspace ownership, and no live overlay mount or remaining references that could mutate the restored state.
 It targets only steps with a committed step event.
