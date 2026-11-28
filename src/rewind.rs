@@ -161,7 +161,8 @@ mod linux {
         recompute_chain, scan_current,
     };
     use crate::snapshot::store::{
-        Limits, Manifest, ManifestEntry, committed_steps, load_manifest, verify_object,
+        Limits, Manifest, ManifestEntry, committed_steps_from_trace, load_manifest,
+        published_steps, verify_object,
     };
     use crate::supervisor::run_cgroup::{
         CgroupParent, RunCgroupState, RunLock, cleanup_stale, is_valid_run_id, run_cgroup_gone,
@@ -210,7 +211,7 @@ mod linux {
             .clone()
             .ok_or_else(|| usage(format!("run '{label}' is not a snapshot run")))?;
         let _run_lock = ensure_run_over(req, &open.run_dir, &recorded, &label)?;
-        let _workspace_lock = WorkspaceLock::acquire(&req.state_root, &req.workspace)
+        let workspace_lock = WorkspaceLock::acquire(&req.state_root, &req.workspace)
             .map_err(|e| failure(e.to_string()))?;
 
         // the target and the integrity checks come before any write, the safety snapshot
@@ -221,7 +222,9 @@ mod linux {
         if ctx.euid == 0 {
             return Err(failure(RestoreError::RunningAsRoot.to_string()));
         }
-        let workspace = open_workspace(req)?;
+        // the locked directory handle itself is what is scanned, captured and restored,
+        // so the directory that is locked is the directory that changes (ADR-0026)
+        let workspace = workspace_lock.workspace_dir();
         let limits = Limits::default();
 
         // the safety snapshot (decision 21): capture the workspace into a store of its own.
@@ -229,7 +232,7 @@ mod linux {
         // scan instead.
         let mut safety = None;
         let current = if req.no_undo {
-            let (manifest, refused) = scan_current(&workspace, &limits)
+            let (manifest, refused) = scan_current(workspace, &limits)
                 .map_err(|e| failure(format!("cannot scan the workspace: {e}")))?;
             writeln!(
                 err,
@@ -246,7 +249,7 @@ mod linux {
             manifest
         } else {
             let undo = create_undo_store(&open.run_dir, req)?;
-            let manifest = current_manifest(&workspace, &undo.store, 0, &limits).map_err(|e| {
+            let manifest = current_manifest(workspace, &undo.store, 0, &limits).map_err(|e| {
                 failure(format!(
                     "cannot take the safety snapshot of the workspace: {e}; \
                      pass --no-undo to rewind without one (the rewind then cannot be undone)"
@@ -285,7 +288,7 @@ mod linux {
             undo.keep = true;
         }
         match apply_with_context(
-            &workspace,
+            workspace,
             &target.store,
             &target.manifest,
             &rewind_plan,
@@ -526,16 +529,20 @@ mod linux {
         out: &mut dyn Write,
     ) -> Result<Target, RewindError> {
         let trace = read_trace(&open.run_dir, &open.meta, label)?;
-        let chain = recompute_chain(&open.store)
+        // the committed set comes from the trace's step events, never from the manifests on
+        // disk, so an orphan manifest is neither a target nor part of the chain
+        let committed = committed_steps_from_trace(&open.run_dir)
+            .map_err(|e| failure(format!("run '{label}': trace.jsonl: {e}")))?;
+        let published = published_steps(&open.store)
             .map_err(|e| failure(format!("run '{label}': snapshot store: {e}")))?;
-        let Some(trace_digest) = trace.get(&step) else {
-            let committed: Vec<String> = trace.keys().map(u64::to_string).collect();
-            let committed = if committed.is_empty() {
+        if !committed.contains(&step) {
+            let listed: Vec<String> = committed.iter().map(u64::to_string).collect();
+            let committed = if listed.is_empty() {
                 "none".to_string()
             } else {
-                committed.join(", ")
+                listed.join(", ")
             };
-            return Err(if chain.digest(step).is_some() {
+            return Err(if published.contains(&step) {
                 usage(format!(
                     "run '{label}' step {step} has a snapshot but no committed step event, so it is not a \
                      rewind target (committed steps: {committed})"
@@ -545,6 +552,13 @@ mod linux {
                     "run '{label}' has no committed step {step} (committed steps: {committed})"
                 ))
             });
+        }
+        let chain = recompute_chain(&open.store, &committed)
+            .map_err(|e| failure(format!("run '{label}': snapshot store: {e}")))?;
+        let Some(trace_digest) = trace.get(&step) else {
+            return Err(failure(format!(
+                "run '{label}' step {step} is committed but its step event carries no manifest digest"
+            )));
         };
         let Some(store_digest) = chain.digest(step) else {
             return Err(failure(format!(
@@ -591,7 +605,7 @@ mod linux {
             open_dir_at(Some(run_dir), &c_name(SAFETY_DIR)?, false).map_err(|_| missing())?;
         let store = open_dir_at(Some(&safety), &c_name(&undo_dir_name(n))?, false)
             .map_err(|_| missing())?;
-        let steps = committed_steps(&store)
+        let steps = published_steps(&store)
             .map_err(|e| failure(format!("run '{label}' undo snapshot {n}: {e}")))?;
         if steps != [0] {
             return Err(usage(format!(
@@ -624,12 +638,6 @@ mod linux {
     struct StepEvent {
         step: u64,
         manifest_digest: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    struct FailedEvent {
-        step: u64,
-        phase: String,
     }
 
     #[derive(Deserialize)]
@@ -678,18 +686,6 @@ mod linux {
                     }
                 }
                 _ if events == 0 => return Err(bad("the first event is not run_start".into())),
-                "capture_failed" => {
-                    let failed: FailedEvent = match serde_json::from_str(line) {
-                        Ok(failed) => failed,
-                        Err(_) if torn_tail => continue,
-                        Err(e) => return Err(bad(format!("line {at}: {e}"))),
-                    };
-                    // the step event of this boundary could not be made durable, so the
-                    // step is not committed even when its event reached the trace
-                    if failed.phase == "step_event" {
-                        steps.remove(&failed.step);
-                    }
-                }
                 "step" => {
                     let step: StepEvent = match serde_json::from_str(line) {
                         Ok(step) => step,
@@ -787,16 +783,6 @@ mod linux {
             });
         }
         Err(failure("no free undo snapshot number"))
-    }
-
-    fn open_workspace(req: &RewindRequest) -> Result<File, RewindError> {
-        let path = c_name(&req.workspace.to_string_lossy())?;
-        open_dir_at(None, &path, false).map_err(|e| {
-            failure(format!(
-                "cannot open the workspace {}: {e}",
-                display_path(&req.workspace.to_string_lossy())
-            ))
-        })
     }
 
     /// verify every store object the plan will write before the first write, so a corrupt

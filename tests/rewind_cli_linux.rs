@@ -147,6 +147,7 @@ struct Fixture {
     run_dir: PathBuf,
     meta: RunMeta,
     trace: Vec<String>,
+    committed: Vec<u64>,
 }
 
 impl Fixture {
@@ -195,6 +196,7 @@ impl Fixture {
             run_dir,
             meta,
             trace: vec![start.to_string()],
+            committed: Vec::new(),
         };
         fixture.flush_trace();
         Some(fixture)
@@ -246,6 +248,7 @@ impl Fixture {
             })
             .to_string(),
         );
+        self.committed.push(step);
         self.flush_trace();
         digest
     }
@@ -267,7 +270,9 @@ impl Fixture {
     }
 
     fn chain_head(&self) -> String {
-        recompute_chain(&self.store()).unwrap().head
+        recompute_chain(&self.store(), &self.committed)
+            .unwrap()
+            .head
     }
 
     fn undo_dir(&self) -> PathBuf {
@@ -637,6 +642,15 @@ fn an_orphan_manifest_is_not_a_target() {
         stderr(&out)
     );
     assert_eq!(tree_state(&f.ws), before);
+
+    // the orphan is not in the chain either: the head covers the committed steps only
+    let out = f.rewind(&["--step", "0"]);
+    assert_success_notice(&out);
+    assert!(
+        stdout(&out).contains(&format!("chain head: {}", f.chain_head())),
+        "{}",
+        stdout(&out)
+    );
 }
 
 #[test]
@@ -832,6 +846,28 @@ fn a_held_workspace_lock_is_refused() {
     agent_edits(&f);
     let before = tree_state(&f.ws);
     let _lock = WorkspaceLock::acquire(f.state.path(), &f.ws).unwrap();
+
+    let out = f.rewind(&[]);
+    assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("another leash run or rewind owns this workspace"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(tree_state(&f.ws), before);
+}
+
+#[test]
+fn a_workspace_lock_taken_under_another_state_directory_is_refused() {
+    let Some(mut f) = Fixture::gone() else { return };
+    populate(&f);
+    f.commit_step(0);
+    agent_edits(&f);
+    let before = tree_state(&f.ws);
+    // a run that names this workspace under a different --state-dir holds the lock on the
+    // workspace directory itself (ADR-0026)
+    let other_state = tempfile::tempdir().unwrap();
+    let _lock = WorkspaceLock::acquire(other_state.path(), &f.ws).unwrap();
 
     let out = f.rewind(&[]);
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
