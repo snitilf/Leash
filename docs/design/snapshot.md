@@ -2,7 +2,7 @@
 
 - Status: architecture revised 2026-11-01 by ADR-0022.
   Snapshot scope, protected storage and rewind rules revised 2026-11-24 by ADR-0024 (enforce-mode snapshots without a custodian).
-  The ADR-0024 controls in sections 2, 3 and 5 are specified, not yet implemented.
+  The ADR-0024 capture barrier, workspace lock, step digests and chain head (sections 2 and 3) are implemented; the other ADR-0024 controls in sections 2, 3 and 5 are specified, not yet implemented.
   Exact-capture implementation and adversarial validation pending.
   The historical M0 results below do not prove concurrent capture correctness.
 - Governs: FR-11, FR-12, FR-13, FR-17, FR-21; ADR-0005, ADR-0009, ADR-0022, ADR-0024.
@@ -70,7 +70,8 @@ Legacy AIO (`io_setup`, `io_submit`) is denied and recorded in a snapshot run, b
 The supervisor marks itself non-dumpable before it starts the broker.
 
 A freeze that does not complete in time aborts the run closed and kills the whole cgroup.
-An agent that parks a thread on its own nested seccomp listener reaches this path.
+The kernel allows one notify listener per filter chain, and Leash's is already in the agent's chain, so an agent's own `SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EBUSY` (tested in `tests/capture_barrier_linux.rs`).
+No agent action is known to wedge a freeze, and the path is exercised through the `BarrierOps` seam.
 A barrier, capture, publication or thaw error also aborts the run closed and kills the whole cgroup.
 Incomplete captures never appear as successful steps.
 Recovery ignores unpublished staging data.
@@ -85,6 +86,31 @@ The run takes an exclusive workspace lock (an `flock` under the state root) at s
 External writers remain the operator contract of ADR-0022.
 Captures enforce hard limits on entry count, total bytes, per-file apparent size and store growth, and a minimum interval between boundaries.
 Each step event records the capture pause.
+
+Implementation notes, with the constants chosen:
+
+- The workspace lock is `<state_root>/locks/<sha256 of the canonical workspace path>.lock`, taken non-blocking and `O_NOFOLLOW` through handles beneath the state root, before any run directory exists.
+  A held lock refuses the run before spawn: "another leash run or rewind owns this workspace".
+  `workspace_lock::WorkspaceLock::acquire` is the helper `leash rewind` reuses.
+  The descriptor is close-on-exec, so neither the broker nor the agent holds it.
+- The run's store is `<run_dir>/snapshots`.
+  The supervisor opens it and the workspace as pinned `O_DIRECTORY | O_NOFOLLOW` handles before spawn and captures through them for the whole run.
+- Step 0 is captured after the run cgroup exists and before `clone3` creates the agent, and its step event is durable before the agent exists.
+- The freeze wait is bounded by `FREEZE_TIMEOUT` (2 s) and the thaw wait by `THAW_TIMEOUT` (2 s).
+  An idle tree freezes in about 5 ms (measurement 0003), so the bounds are slack for a loaded host, not a working budget.
+- `MIN_BOUNDARY_INTERVAL` (1 s, provisional) holds a boundary back until that long after the previous boundary ended, on top of the 250 ms quiescence window.
+  Mutations that arrive meanwhile join the held-back step.
+  Step 0 counts as a boundary.
+- The step event records the pause from the start of the freeze to just before the event is written, because the event must be durable before the thaw (ADR-0024 decision 10).
+  The thaw wait, normally a few milliseconds, is not in it.
+- A boundary starts only at the top of the notify loop, after `handle_notification` has answered the notification it received, ask prompts included.
+  No notification is received but unanswered then, and no prompt is pending.
+- The final capture needs no freeze: it runs after `cgroup.kill` reported `populated 0`, so no process of the tree exists.
+- A capture limit hit, or any entry capture refuses, at a boundary ends the run like any other capture error.
+  The agent cannot make Leash skip a step.
+- Orphans: with Yama `ptrace_scope` 1 the supervisor cannot open `/proc/<pid>/mem` of a process that was reparented away from the run, because `proc_mem_open` asks for ptrace attach access.
+  A mediated syscall from such a process fails closed (`failsafe:memory_read`, `EACCES`).
+  The freeze still stops it, because the cgroup holds it, and its unmediated writes are captured at a frozen moment like any other.
 
 ## 3. Copy backend, store and supported state
 
