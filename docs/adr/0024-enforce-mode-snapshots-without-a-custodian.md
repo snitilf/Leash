@@ -1,7 +1,11 @@
 # ADR-0024: Enforce-mode snapshots without a custodian
 
-- Status: accepted (metadata residual refined by ADR-0025)
+- Status: accepted (metadata residual refined by ADR-0025; decision 13 refined by ADR-0026)
 - Date: 2026-11-24
+- Note (2026-11-27): decision 11's example cannot occur.
+  The kernel refuses SECCOMP_FILTER_FLAG_NEW_LISTENER with EBUSY when the caller's filter chain already has a listener, so an agent under Leash cannot park a thread on its own listener (tests/capture_barrier_linux.rs, an_agent_cannot_install_its_own_notify_listener_under_leashs).
+  The rule stands.
+  The corrected rationale is in docs/design/snapshot.md section 2.
 - Tier: 3 (trades a security invariant of ADR-0022 for a narrower, named one)
 - Partly supersedes: ADR-0022 (mode scope, protected-storage prerequisite, historical-read authorization)
 

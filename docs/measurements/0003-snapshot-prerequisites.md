@@ -377,6 +377,7 @@ Numbers refer to the decisions in ADR-0024.
   Freezing before receiving was safe in 9 of 9 runs, and the notification is delivered after thaw.
   Without the flag the freeze would succeed but cancel the received notification.
   The unmeasured case (a supervisor that never answers) is the one decision 11 closes by aborting the run.
+- Decision 11 (a freeze that does not complete in time aborts the run): its example, an agent parking a thread on its own nested listener, cannot occur, because the kernel refuses `SECCOMP_FILTER_FLAG_NEW_LISTENER` with `EBUSY` when the caller's filter chain already has a listener (observed 2026-11-27 in `tests/capture_barrier_linux.rs`, `an_agent_cannot_install_its_own_notify_listener_under_leashs`).
 - Decision 2 (run cgroup as a child of Leash's own cgroup, no controllers): supported by question 5.
   Freeze and kill worked with no controller and with the parent holding processes.
   Enabling controllers needs a supervisor leaf and an empty parent, and the root cgroup of a container needs evacuating first, so the no-controller choice avoids all three failure modes.
