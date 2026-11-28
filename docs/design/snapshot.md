@@ -152,6 +152,18 @@ Unsupported objects or metadata fail explicitly.
 Raw inode numbers, ctime, access times, open descriptors and process state are excluded.
 A copy must not silently skip an unreadable entry or unsupported metadata.
 
+Supported xattrs are the `user.*` namespace and the two POSIX ACL attributes.
+`system.posix_acl_access` is recorded for files and directories, and `system.posix_acl_default` for directories only.
+Both are read with `fgetxattr` on the opened descriptor and kept as opaque values, hex encoded in the manifest `xattrs` map next to the `user.*` entries.
+A workspace under a directory with a default ACL, such as a `/tmp` that has one, therefore captures: every directory made in it inherits the default ACL, and files inherit an access ACL when the default has named entries.
+Capture and manifest validation both check an ACL value.
+It must carry the version 2 header and whole 8-byte entries with known tags in the order the kernel requires, with the undefined id on the owner, group, mask and other entries and a real id on named ones.
+An access ACL must also agree with the mode: its owner, mask (or group, when there is no mask) and other entries equal the owner, group and other bits.
+A value that fails a check is refused explicitly, never recorded or applied.
+`security.selinux` is still left out, and every other name outside these (`trusted.*`, other `security.*`, other `system.*`) still refuses the capture.
+The manifest schema version stays 1, because an ACL is one more name in an existing map.
+A Leash build from before ACL support refuses such a manifest as having a disallowed xattr name, which fails closed.
+
 ### Protected storage
 
 ADR-0024 replaces the ADR-0022 protected-storage prerequisite for this implementation.
@@ -234,6 +246,13 @@ A parent path is opened in chunks of components, each with the same resolve flag
 A file with a hard link outside the workspace is never changed in place, because that would change the outside name too.
 Rewind replaces it with a new inode and relinks its other workspace names to the new one.
 Ownership and permission problems are found in a preflight pass before the first write.
+An ACL change needs the same ownership as a mode change, so an ACL-only difference on an entry the caller does not own is refused in preflight.
+Rewind restores xattrs, then the owner, then the mode, then the mtime, on the temporary file or the open directory.
+The `user.*` values go first and the ACLs last, because setting an access ACL rewrites the group bits of the mode and can take write access from the owner.
+The final `fchmod` with the captured mode follows, and it leaves the captured ACL unchanged: a chmod on a file with an access ACL rewrites its owner, mask and other entries from the mode, and capture only records ACLs where those already equal the mode.
+It also restores the setuid, setgid and sticky bits that the ACL set or the chown can clear.
+Rewind always lists the xattrs of what it restores, including a file or directory it just created, because a new entry inherits the default ACL of its parent.
+An ACL the target lacks is removed with `fremovexattr`, so a restored entry never keeps an inherited one.
 A killed rewind can leave `.leash-restore-*` temporary names behind.
 The next rewind removes them from the directories it touches, except names the target itself contains.
 It fsyncs each directory it changed before it applies directory metadata.
@@ -260,6 +279,8 @@ Failures are explicit, with recoverable staging and the prior state retained unt
 Rewind reverses filesystem effects only, and says so; it does not reverse effects already emitted off-host.
 
 Diff compares reconstructed visible states.
+A change to a POSIX ACL is reported as a metadata change with the field `acl`, apart from `xattrs`, which covers the `user.*` entries.
+A `chmod` on a file with an access ACL changes the ACL too, so it reports both `mode` and `acl`.
 A run reference without a step names the final committed step, never an orphan manifest, and a run with no `trace.jsonl` has no step known to be committed.
 Whiteouts mean deletion, opaque directories replace hidden lower entries, recoverable rename relations are reported, and hard links are treated as shared objects.
 Copy and overlay must produce equivalent results over their supported state, backed by the same fixtures and behavioral cases.

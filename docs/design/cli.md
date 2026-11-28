@@ -94,7 +94,7 @@ Output is one change per line, sorted by path (a rename by its old path), with t
 | `M  <path>` | regular file content changed (sha256 or size), or symlink target changed |
 | `R  <old> -> <new>` | a regular file removed and one added with the same sha256 and size |
 | `T  <path> (<from> -> <to>)` | entry kind changed; kinds are `file`, `dir`, `symlink` |
-| `m  <path> (<fields>)` | metadata changed; fields in the order `mode`, `uid`, `gid`, `mtime`, `xattrs` |
+| `m  <path> (<fields>)` | metadata changed; fields in the order `mode`, `uid`, `gid`, `mtime`, `xattrs`, `acl` |
 | `L  <path>` | only the hard-link grouping of an unchanged file changed |
 
 A summary line follows, listing the non-zero counts in the order added, removed, modified, renamed, type changed, metadata changed, link changed, for example `3 added, 1 removed, 2 modified, 1 renamed`.
