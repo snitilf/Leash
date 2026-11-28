@@ -33,6 +33,9 @@ pub struct StateRoot {
     links: Vec<PathBuf>,
     /// the processes whose `/proc/<pid>` tree is denied: the supervisor and its broker.
     proc_pids: Vec<u32>,
+    /// `(st_dev, st_ino)` of the root directory, when it exists to be statted. a descriptor
+    /// is judged on this as well as on the path its `/proc` link spells.
+    identity: Option<(u64, u64)>,
 }
 
 impl StateRoot {
@@ -81,7 +84,13 @@ impl StateRoot {
             root,
             links,
             proc_pids: Vec::new(),
+            identity: None,
         })
+    }
+
+    /// is this `(st_dev, st_ino)` the root directory itself?
+    pub fn is_identity(&self, _dev: u64, _ino: u64) -> bool {
+        false
     }
 
     /// name the processes whose `/proc/<pid>` tree is denied (the supervisor and its broker).
@@ -419,5 +428,34 @@ mod tests {
             assert!(!r.denies_proc(Path::new(path)), "{path}");
         }
         assert!(!root().denies_proc(Path::new("/proc/100/mem")));
+    }
+
+    #[test]
+    fn a_root_that_exists_is_known_by_its_device_and_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let base = tempfile::tempdir().unwrap();
+        let state = base.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(state.join("file"), b"x").unwrap();
+        let root = StateRoot::from_resolved(state.canonicalize().unwrap()).unwrap();
+        let (dev, ino) = {
+            let m = std::fs::metadata(&state).unwrap();
+            (m.dev(), m.ino())
+        };
+        assert!(root.is_identity(dev, ino), "the directory is the root");
+        assert!(!root.is_identity(dev, ino + 1_000_000));
+        assert!(!root.is_identity(dev.wrapping_add(1), ino));
+        let inside = std::fs::metadata(state.join("file")).unwrap();
+        assert!(
+            !root.is_identity(inside.dev(), inside.ino()),
+            "a file beneath the root is not the root"
+        );
+    }
+
+    #[test]
+    fn a_root_that_does_not_exist_has_no_identity_to_match() {
+        let root = root();
+        assert!(!root.is_identity(0, 0));
+        assert!(!root.is_identity(1, 1));
     }
 }

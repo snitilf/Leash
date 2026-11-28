@@ -23,7 +23,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsFd, FromRawFd};
-use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -403,6 +403,13 @@ pub(crate) trait Notifier {
     ) -> io::Result<i32>;
     /// duplicate one descriptor from the trapped process.
     fn duplicate_fd(&self, pid: u32, target_fd: RawFd) -> io::Result<OwnedFd>;
+    /// what the trapped process's descriptor is, read from a duplicate of it that is closed
+    /// before this returns. the supervisor may duplicate the agent's descriptors; only the
+    /// agent is denied `pidfd_getfd` (SR-4).
+    fn describe_fd(&self, pid: u32, target_fd: RawFd) -> io::Result<FdFacts> {
+        let duplicate = self.duplicate_fd(pid, target_fd)?;
+        fd_facts(duplicate)
+    }
     /// bounded nul-terminated read from child memory (mem.rs caps).
     fn read_path(&self, pid: u32, addr: u64) -> Result<Vec<u8>, MemReadError>;
     /// bounded fixed-size read from child memory.
@@ -413,6 +420,40 @@ pub(crate) trait Notifier {
     fn dir_prefix(&self, pid: u32, anchor: DirAnchor) -> io::Result<PathBuf>;
     /// whether `target` is the supervised root or a descendant of it.
     fn process_in_tree(&self, root: u32, target: u32) -> io::Result<bool>;
+}
+
+/// what an open descriptor is, as the kernel describes the object and not as its `/proc`
+/// link spells it: the filesystem it is on and its identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FdFacts {
+    /// `f_type` of `fstatfs`: the filesystem magic
+    pub f_type: i64,
+    /// `st_dev` of the object
+    pub dev: u64,
+    /// `st_ino` of the object
+    pub ino: u64,
+}
+
+/// describe an owned descriptor, then close it.
+pub(crate) fn fd_facts(fd: OwnedFd) -> io::Result<FdFacts> {
+    use std::os::unix::fs::MetadataExt;
+    let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is open and statfs is a writable local buffer; fstatfs works on O_PATH.
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), &raw mut statfs) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let metadata = std::fs::File::from(fd).metadata()?;
+    Ok(FdFacts {
+        f_type: statfs.f_type as i64,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+/// the implicit denies that depend on what a descriptor is rather than where its link says
+/// it is: an object on cgroup2, and the state root itself.
+fn fd_identity_deny(_config: &RunConfig<'_>, _facts: &FdFacts) -> Option<Evaluation> {
+    None
 }
 
 /// where a relative path is anchored.
@@ -2712,6 +2753,15 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Write;
 
+    /// an ordinary file on ext4, which no implicit rule is about
+    const ORDINARY_FILE: FdFacts = FdFacts {
+        f_type: 0xEF53,
+        dev: 2049,
+        ino: 7,
+    };
+    /// `CGROUP2_SUPER_MAGIC`
+    const CGROUP2: i64 = 0x6367_7270;
+
     /// a scripted kernel side: fixed child memory, programmable id_valid answers, and a
     /// log of every response sent.
     #[derive(Default)]
@@ -2719,6 +2769,9 @@ mod tests {
         mem: HashMap<u64, Vec<u8>>,
         cwd: &'static str,
         fd_dirs: HashMap<u32, &'static str>,
+        // what a descriptor is (`describe_fd`): a scripted answer or an errno. a descriptor
+        // in `fd_dirs` without one is an ordinary file on ext4
+        fd_facts: HashMap<u32, Result<FdFacts, i32>>,
         // answers consumed per id_valid call; empty means "always valid"
         id_valid_script: RefCell<Vec<bool>>,
         sent: RefCell<Vec<String>>,
@@ -2786,6 +2839,15 @@ mod tests {
         }
         fn duplicate_fd(&self, _pid: u32, _target_fd: RawFd) -> io::Result<OwnedFd> {
             Err(io::Error::from_raw_os_error(libc::EBADF))
+        }
+        fn describe_fd(&self, _pid: u32, target_fd: RawFd) -> io::Result<FdFacts> {
+            let fd = u32::try_from(target_fd).unwrap_or(u32::MAX);
+            match self.fd_facts.get(&fd) {
+                Some(Ok(facts)) => Ok(*facts),
+                Some(Err(errno)) => Err(io::Error::from_raw_os_error(*errno)),
+                None if self.fd_dirs.contains_key(&fd) => Ok(ORDINARY_FILE),
+                None => Err(io::Error::from_raw_os_error(libc::EBADF)),
+            }
         }
         fn read_path(&self, _pid: u32, addr: u64) -> Result<Vec<u8>, MemReadError> {
             match self.mem.get(&addr) {
@@ -4125,6 +4187,169 @@ mod tests {
         });
         assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
         assert_eq!(events(w)[0]["matched_rule"], rule::MEMORY_READ);
+    }
+
+    #[test]
+    fn a_descriptor_whose_link_looks_harmless_is_denied_by_what_it_is() {
+        // the link spells a path nothing denies, as a bind mount alias would; the descriptor
+        // is on cgroup2, which fstatfs says whatever the spelling
+        let fd_calls: [(u32, [u64; 6], &str); 5] = [
+            (nr::FCHMOD, [5, 0o777, 0, 0, 0, 0], "fchmod"),
+            (nr::FCHOWN, [5, 0, 0, 0, 0, 0], "fchown"),
+            (nr::FSETXATTR, [5, 0x1000, 0x2000, 1, 0, 0], "fsetxattr"),
+            (nr::FREMOVEXATTR, [5, 0x1000, 0, 0, 0, 0], "fremovexattr"),
+            (nr::UTIMENSAT, [5, 0, 0, 0, 0, 0], "utimensat"),
+        ];
+        for (sys_nr, args, name) in fd_calls {
+            let kernel = FakeNotifier {
+                fd_dirs: HashMap::from([(5, "/mnt/alias/cgroup.procs")]),
+                fd_facts: HashMap::from([(
+                    5,
+                    Ok(FdFacts {
+                        f_type: CGROUP2,
+                        ..ORDINARY_FILE
+                    }),
+                )]),
+                ..FakeNotifier::default()
+            };
+            let mut w = writer();
+            metadata_run(|config| {
+                super::handle_notification(&kernel, &notif(sys_nr, args), &mut w, config, 1)
+                    .unwrap();
+            });
+            assert_eq!(
+                kernel.sent(),
+                vec![format!("error:7:{}", libc::EACCES)],
+                "{name}"
+            );
+            let ev = &events(w)[0];
+            assert_eq!(ev["decision"], "deny", "{name}");
+            assert_eq!(ev["matched_rule"], "implicit:cgroup", "{name}");
+            assert_eq!(ev["fact"]["path"], "/mnt/alias/cgroup.procs", "{name}");
+        }
+    }
+
+    #[test]
+    fn a_descriptor_on_the_state_root_is_denied_whatever_its_link_says() {
+        let base = tempfile::tempdir().unwrap();
+        let state = base.path().canonicalize().unwrap();
+        let root = crate::supervisor::state_root::StateRoot::from_resolved(state.clone()).unwrap();
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata(&state).unwrap();
+            (m.dev(), m.ino())
+        };
+        let p = policy(
+            "schema_version = 1\n[[fs]]\npath=\"/**\"\nmode=[\"write\"]\naction=\"allow\"\n",
+        );
+        let mounts = crate::supervisor::cgroup_mounts::CgroupMounts::from_resolved(vec![
+            "/sys/fs/cgroup".into(),
+        ])
+        .unwrap();
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, &root)
+            .with_snapshot_integrity(true)
+            .with_cgroup_mounts(&mounts);
+        let kernel = FakeNotifier {
+            fd_dirs: HashMap::from([(5, "/mnt/alias")]),
+            fd_facts: HashMap::from([(
+                5,
+                Ok(FdFacts {
+                    f_type: 0xEF53,
+                    dev,
+                    ino,
+                }),
+            )]),
+            ..FakeNotifier::default()
+        };
+        let mut w = writer();
+        super::handle_notification(
+            &kernel,
+            &notif(nr::FCHMOD, [5, 0o777, 0, 0, 0, 0]),
+            &mut w,
+            &config,
+            1,
+        )
+        .unwrap();
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        let ev = &events(w)[0];
+        assert_eq!(ev["decision"], "deny");
+        assert_eq!(ev["matched_rule"], "implicit:state_root");
+    }
+
+    #[test]
+    fn a_descriptor_that_cannot_be_duplicated_denies_and_records() {
+        // the link reads back but pidfd_getfd does not (the descriptor was closed meanwhile):
+        // nothing the supervisor could not look at is allowed
+        let kernel = FakeNotifier {
+            fd_dirs: HashMap::from([(5, "/work/file")]),
+            fd_facts: HashMap::from([(5, Err(libc::EBADF))]),
+            ..FakeNotifier::default()
+        };
+        let mut w = writer();
+        metadata_run(|config| {
+            super::handle_notification(
+                &kernel,
+                &notif(nr::FCHMOD, [5, 0o777, 0, 0, 0, 0]),
+                &mut w,
+                config,
+                1,
+            )
+            .unwrap();
+        });
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        let ev = &events(w)[0];
+        assert_eq!(ev["decision"], "deny");
+        assert_eq!(ev["matched_rule"], rule::MEMORY_READ);
+    }
+
+    #[test]
+    fn the_identity_deny_follows_the_filesystem_type_and_the_state_root_alone() {
+        let p = policy("schema_version = 1\n");
+        let root = test_root();
+        let snapshot = RunConfig::enforce(4242, Attendance::Unattended, &p, root)
+            .with_snapshot_integrity(true);
+        let cgroup = FdFacts {
+            f_type: CGROUP2,
+            ..ORDINARY_FILE
+        };
+        let eval = fd_identity_deny(&snapshot, &cgroup).expect("cgroup2 is denied");
+        assert_eq!(eval.decision, Decision::Deny);
+        assert_eq!(eval.matched.to_string(), "implicit:cgroup");
+        assert!(fd_identity_deny(&snapshot, &ORDINARY_FILE).is_none());
+        // without snapshot integrity the cgroup rule is not armed
+        let plain = RunConfig::enforce(4242, Attendance::Unattended, &p, root);
+        assert!(fd_identity_deny(&plain, &cgroup).is_none());
+        let record = RunConfig::record_only(4242, Attendance::Unattended);
+        assert!(fd_identity_deny(&record, &cgroup).is_none());
+    }
+
+    #[test]
+    fn a_real_descriptor_is_described_by_its_filesystem_and_identity() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+        let fd = OwnedFd::from(std::fs::File::open(&file).unwrap());
+        let facts = fd_facts(fd).unwrap();
+        assert_eq!((facts.dev, facts.ino), (metadata.dev(), metadata.ino()));
+        assert_ne!(facts.f_type, CGROUP2, "a temporary file is not on cgroup2");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_descriptor_on_the_cgroup2_mount_is_described_as_cgroup2() {
+        let Ok(mounts) = crate::supervisor::cgroup_mounts::CgroupMounts::from_proc_self() else {
+            return;
+        };
+        let Some(mount) = mounts.paths().first() else {
+            return;
+        };
+        let Ok(file) = std::fs::File::open(mount.join("cgroup.controllers")) else {
+            return;
+        };
+        let facts = fd_facts(OwnedFd::from(file)).unwrap();
+        assert_eq!(facts.f_type, CGROUP2);
     }
 
     #[test]
