@@ -21,7 +21,11 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+      # the xattr and ACL tests skip on a filesystem without them; this turns the skip into a
+      # failure so the check job cannot pass without really running them
       - name: test
+        env:
+          LEASH_REQUIRE_XATTR: "1"
         run: cargo test
       - name: msrv build
         run: |

@@ -414,7 +414,18 @@ fn root_refused(fx: &Fixture, target: &Manifest) -> bool {
     }
     let err = apply(&fx.ws_fd(), &fx.store_fd(), target, &plan(target, target)).unwrap_err();
     assert!(matches!(err, RestoreError::RunningAsRoot), "{err}");
+    skipped_as_root();
     true
+}
+
+/// a test that cannot run as root says so, and fails under `LEASH_REQUIRE_XATTR=1` (set in
+/// CI), so a root run cannot pass the xattr and ACL restore tests by skipping them.
+fn skipped_as_root() {
+    assert!(
+        std::env::var("LEASH_REQUIRE_XATTR").as_deref() != Ok("1"),
+        "LEASH_REQUIRE_XATTR=1 but this runs as root, and restore refuses root, so the test would be skipped"
+    );
+    eprintln!("SKIPPED restore coverage: running as root, which restore refuses");
 }
 
 /// like `root_refused` for a test that has not built its target yet: under root it captures
@@ -1840,4 +1851,107 @@ fn an_acl_only_change_on_an_entry_owned_by_someone_else_fails_in_preflight() {
         "{err}"
     );
     assert_eq!(get_xattr(&fx.ws.join("f"), ACCESS), Some(changed));
+}
+
+#[test]
+fn the_change_summary_names_an_acl_change_apart_from_user_xattrs() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("f"), b"file").unwrap();
+    fs::write(fx.ws.join("u"), b"user").unwrap();
+    if !try_set_acl(
+        &fx.ws.join("f"),
+        ACCESS,
+        &ext_acl(6, (NAMED_UID, 4), 4, 4, 0),
+    ) {
+        return;
+    }
+    let user_xattrs = try_set_user_xattr(&fx.ws.join("u"), "user.x", b"1");
+    let base = fx.capture(0);
+    // only the named user of the ACL differs, so the mode is the same
+    assert!(try_set_acl(
+        &fx.ws.join("f"),
+        ACCESS,
+        &ext_acl(6, (OTHER_UID, 4), 4, 4, 0)
+    ));
+    if user_xattrs {
+        assert!(try_set_user_xattr(&fx.ws.join("u"), "user.x", b"2"));
+    }
+    let now = fx.capture(1);
+    let p = plan(&now, &base);
+    let change_of = |path: &str| {
+        p.ops
+            .iter()
+            .find_map(|op| match op {
+                RestoreOp::SetMetadata { path: p, change } if p == path => Some(*change),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no metadata change for {path}"))
+    };
+    let f = change_of("f");
+    assert!(f.acl && !f.xattrs && !f.mode, "{f:?}");
+    if user_xattrs {
+        let u = change_of("u");
+        assert!(u.xattrs && !u.acl, "{u:?}");
+    }
+    let summary = p.summary();
+    let detail = |path: &str| {
+        summary
+            .changes
+            .iter()
+            .find(|c| c.action == ChangeAction::Metadata && c.path == path)
+            .unwrap()
+            .detail
+            .clone()
+    };
+    assert_eq!(detail("f"), "acl");
+    if user_xattrs {
+        assert_eq!(detail("u"), "xattrs");
+    }
+    assert!(summary.to_string().contains("(acl)"), "{summary}");
+}
+
+#[test]
+fn setgid_with_an_access_acl_and_a_default_acl_round_trip() {
+    let fx = Fixture::new();
+    if root_guard(&fx) {
+        return;
+    }
+    let ws = &fx.ws;
+    fs::write(ws.join("f"), b"file").unwrap();
+    if !try_set_acl(&ws.join("f"), ACCESS, &ext_acl(6, (NAMED_UID, 4), 4, 4, 0)) {
+        return;
+    }
+    chmod(&ws.join("f"), 0o2640);
+    create_dir(&ws.join("d"));
+    assert!(try_set_acl(
+        &ws.join("d"),
+        ACCESS,
+        &ext_acl(7, (NAMED_UID, 5), 5, 5, 0)
+    ));
+    assert!(try_set_acl(
+        &ws.join("d"),
+        DEFAULT,
+        &ext_acl(7, (NAMED_UID, 5), 5, 5, 0)
+    ));
+    chmod(&ws.join("d"), 0o3750);
+    set_mtime(&ws.join("d"), 1_500_000_000, 0);
+    let before = [acl_state(&ws.join("f")), acl_state(&ws.join("d"))];
+    assert_eq!(before[0].0, 0o2640);
+    assert_eq!(before[1].0, 0o3750);
+    let base = fx.capture(0);
+
+    assert!(try_set_acl(
+        &ws.join("f"),
+        ACCESS,
+        &ext_acl(6, (OTHER_UID, 6), 6, 6, 4)
+    ));
+    chmod(&ws.join("f"), 0o600);
+    chmod(&ws.join("d"), 0o700);
+    remove_acl(&ws.join("d"), DEFAULT);
+    let now = fx.capture(1);
+    apply(&fx.ws_fd(), &fx.store_fd(), &base, &plan(&now, &base)).unwrap();
+
+    assert_eq!(acl_state(&ws.join("f")), before[0]);
+    assert_eq!(acl_state(&ws.join("d")), before[1]);
+    assert_eq!(fx.capture(2).entries, base.entries);
 }
