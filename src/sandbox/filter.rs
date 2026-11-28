@@ -128,6 +128,12 @@ pub mod nr {
     pub const FCHOWN: u32 = 93;
     pub const FSETXATTR: u32 = 190;
     pub const FREMOVEXATTR: u32 = 199;
+    // section 6: snapshot runs only, path-naming attribute calls newer than libc. numbers
+    // from arch/x86/entry/syscalls/syscall_64.tbl (torvalds/linux): 463 setxattrat and 466
+    // removexattrat (Linux 6.13), 469 file_setattr (Linux 6.17)
+    pub const SETXATTRAT: u32 = 463;
+    pub const REMOVEXATTRAT: u32 = 466;
+    pub const FILE_SETATTR: u32 = 469;
 }
 
 /// the mediated set (syscalls.md sections 3.1-3.5): trapped, decided by policy.
@@ -183,7 +189,19 @@ pub const DENIED_RECORDED: &[u32] = &[
 /// `io_cancel` and `io_destroy` need a context and so fail by themselves with `EINVAL`.
 /// these are routed to the notif return only when `build_filter_with(true)` asks, so a
 /// run without snapshots keeps today's filter and trace byte for byte.
-pub const SNAPSHOT_TRAPPED: &[u32] = &[nr::IO_SETUP, nr::IO_SUBMIT];
+///
+/// the same set holds the attribute calls newer than libc, `setxattrat`, `removexattrat`
+/// and `file_setattr`. each names a path and needs no open, so on a kernel that has them an
+/// agent could set `user.leash.lock` on its run cgroup, and an unlisted number is passed
+/// untabled. nothing in libc calls them yet, so they are answered `ENOSYS` after recording
+/// (`snapshot:xattrat`); a later change can mediate them like their older siblings.
+pub const SNAPSHOT_TRAPPED: &[u32] = &[
+    nr::IO_SETUP,
+    nr::IO_SUBMIT,
+    nr::SETXATTRAT,
+    nr::REMOVEXATTRAT,
+    nr::FILE_SETATTR,
+];
 
 /// metadata calls trapped only in a snapshot run (ADR-0024 decision 4). Landlock has no
 /// right for `chmod`, `chown`, xattrs or timestamps, so on a cgroup2 mount only the
@@ -674,6 +692,11 @@ mod tests {
             (nr::IO_URING_REGISTER, libc::SYS_io_uring_register),
             (nr::IO_SETUP, libc::SYS_io_setup),
             (nr::IO_SUBMIT, libc::SYS_io_submit),
+            // not in libc yet: checked against arch/x86/entry/syscalls/syscall_64.tbl,
+            // `463 setxattrat`, `466 removexattrat`, `469 file_setattr`
+            (nr::SETXATTRAT, 463),
+            (nr::REMOVEXATTRAT, 466),
+            (nr::FILE_SETATTR, 469),
             (nr::LCHOWN, libc::SYS_lchown),
             (nr::UTIME, libc::SYS_utime),
             (nr::UTIMES, libc::SYS_utimes),
