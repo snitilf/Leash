@@ -150,6 +150,10 @@ pub enum SessionError {
     /// the notify loop aborted (notify-loop.md's fail-closed arcs).
     #[error("run loop failed: {0}")]
     Run(#[from] crate::supervisor::run::RunError),
+    /// the run cgroup of a snapshot run could not be set up (ADR-0024 decision 2).
+    #[cfg(target_os = "linux")]
+    #[error("run cgroup: {0}")]
+    RunCgroup(#[from] crate::supervisor::run_cgroup::RunCgroupError),
     /// the confined realization broker could not be established or served.
     #[cfg(target_os = "linux")]
     #[error("broker failed: {0}")]
@@ -166,26 +170,54 @@ pub enum SessionError {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{run_session, run_session_with_writer};
+pub use linux::{SessionHooks, run_session, run_session_with_hooks, run_session_with_writer};
 
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
     use crate::recorder::{
-        EventBody, Mode, RecorderError, RunDir, RunMeta, TRACE_SCHEMA_VERSION, TraceSink,
-        TraceWriter,
+        AskResolution, CgroupKillEvent, CgroupKillReason, EventBody, Mode, RecorderError, RunDir,
+        RunMeta, TRACE_SCHEMA_VERSION, TraceSink, TraceWriter,
     };
     use crate::sandbox::landlock::{self, LandlockHull, PreparedRuleset};
     use crate::supervisor::broker::Broker;
+    use crate::supervisor::cgroup;
     use crate::supervisor::preflight::{self, Outcome};
-    use crate::supervisor::run::run_loop;
-    use crate::supervisor::spawn::{SpawnSpec, spawn_supervised_with};
+    use crate::supervisor::run::run_loop_with_cgroup_kill;
+    use crate::supervisor::run_cgroup::{
+        CgroupParent, PROBE_TIMEOUT, RunCgroup, RunCgroupError, RunLock, cleanup_stale,
+    };
+    use crate::supervisor::spawn::{SpawnSpec, spawn_supervised_in_cgroup, spawn_supervised_with};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::io::Write;
     use std::net::{IpAddr, ToSocketAddrs};
     use std::os::fd::AsRawFd;
-    use std::time::SystemTime;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+
+    /// injectable seams for a session, used by tests to exercise cgroup probe refusal,
+    /// `cgroup.kill` timeout, and attended-ask flows without test-only branches in production
+    /// code.
+    pub struct SessionHooks<'a> {
+        /// proves delegation, `clone3(CLONE_INTO_CGROUP)`, lock xattrs, freeze, thaw and kill
+        /// on the parent cgroup before any run directory exists.
+        pub probe: &'a dyn Fn(&Path) -> std::io::Result<()>,
+        /// kills the run cgroup at run end or abort.
+        pub kill: &'a dyn Fn(&RunCgroup, CgroupKillReason) -> CgroupKillEvent,
+        /// resolves attended asks (defaults to `ask::tty_prompt`).
+        pub prompter: &'a dyn Fn(&[crate::supervisor::ask::PendingAsk], Duration) -> AskResolution,
+    }
+
+    impl Default for SessionHooks<'_> {
+        fn default() -> Self {
+            Self {
+                probe: &|parent| cgroup::probe_delegation(parent, PROBE_TIMEOUT),
+                kill: &RunCgroup::kill_all,
+                prompter: &crate::supervisor::ask::tty_prompt,
+            }
+        }
+    }
 
     struct EnforcementSetup {
         policy: Option<crate::policy::Policy>,
@@ -200,6 +232,16 @@ mod linux {
     /// the notify loop, and the report, in the fixed order of cli.md section 5. every
     /// failure path returns without writing artifacts the run cannot vouch for.
     pub fn run_session(spec: SessionSpec) -> Result<SessionOutcome, SessionError> {
+        run_session_with_hooks(spec, SessionHooks::default())
+    }
+
+    /// `run_session` with injectable cgroup and prompt hooks, the seam tests use to exercise
+    /// probe refusal before run-dir creation, kill timeout fail-closed behavior, and attended
+    /// ask synchronization.
+    pub fn run_session_with_hooks(
+        spec: SessionSpec,
+        hooks: SessionHooks<'_>,
+    ) -> Result<SessionOutcome, SessionError> {
         refuse_snapshot_integrity_outside_enforce(&spec)?;
         // first, before any run directory, broker or child exists (ADR-0024 decision 9)
         set_non_dumpable()?;
@@ -213,6 +255,18 @@ mod linux {
             Outcome::Refuse(message) => return Err(SessionError::Refused(message)),
         };
         let enforcement = prepare_enforcement(&spec, caps.landlock_abi)?;
+        // a snapshot run needs a writable delegated cgroup with working clone3 entry,
+        // lock xattrs, freeze, thaw and kill; refuse before any run directory or broker
+        // exists (cli.md section 1, ADR-0024 decision 2).
+        let (run_id, run_cgroup, located_parent) = if spec.snapshot_integrity {
+            let parent = CgroupParent::locate()?;
+            (hooks.probe)(parent.path()).map_err(|source| RunCgroupError::Probe { source })?;
+            let id = crate::recorder::generate_run_id(SystemTime::now())?;
+            let path = parent.child_path(&id)?;
+            (Some(id), Some(path), Some(parent))
+        } else {
+            (None, None, None)
+        };
 
         let meta = RunMeta {
             schema_version: TRACE_SCHEMA_VERSION,
@@ -227,8 +281,12 @@ mod linux {
             argv: spec.argv.clone(),
             workspace: spec.workspace.clone(),
             start_ts: now_ms()?,
+            run_cgroup,
         };
-        let run_dir = RunDir::create(&spec.state_root, &meta, SystemTime::now())?;
+        let run_dir = match run_id {
+            Some(id) => RunDir::create_with_id(&spec.state_root, &meta, id)?,
+            None => RunDir::create(&spec.state_root, &meta, SystemTime::now())?,
+        };
         let mut writer = run_dir.trace_writer()?;
         run_session_with_writer_and_ruleset(
             &spec,
@@ -238,6 +296,8 @@ mod linux {
             enforcement.policy.as_ref(),
             enforcement.ruleset.as_ref(),
             &enforcement.resolved_hosts,
+            located_parent.as_ref(),
+            &hooks,
         )
     }
 
@@ -359,9 +419,12 @@ mod linux {
             None,
             None,
             &HashMap::new(),
+            None,
+            &SessionHooks::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_session_with_writer_and_ruleset<S: TraceSink>(
         spec: &SessionSpec,
         meta: RunMeta,
@@ -370,6 +433,8 @@ mod linux {
         policy: Option<&crate::policy::Policy>,
         prepared_ruleset: Option<&PreparedRuleset>,
         resolved_hosts: &HashMap<String, Vec<IpAddr>>,
+        located_parent: Option<&CgroupParent>,
+        hooks: &SessionHooks<'_>,
     ) -> Result<SessionOutcome, SessionError> {
         refuse_snapshot_integrity_outside_enforce(spec)?;
         // an enforce run resolves its state root once, here, before any process exists: the
@@ -397,6 +462,7 @@ mod linux {
         // step 4: run_start is appended and synced before the child exists, so any run
         // that produced a child also left durable evidence that it did (cli.md section 5)
         let mode = meta.mode;
+        let recorded_cgroup = meta.run_cgroup.clone();
         writer.append(meta.start_ts, EventBody::RunStart(meta))?;
         writer.sync()?;
 
@@ -419,17 +485,32 @@ mod linux {
             (root, _) => root,
         };
 
-        // steps 5-6: spawn and serve until the tree exits
-        let child = spawn_supervised_with(
-            &SpawnSpec {
-                argv: spec.argv.clone(),
-                stdout: None,
-                mode,
-                landlock_ruleset: prepared_ruleset.map(|ruleset| ruleset.ruleset_fd().as_raw_fd()),
-            },
-            spec.snapshot_integrity,
+        // a snapshot run holds its run lock for the whole run, cleans up the cgroups of
+        // dead runs, then creates its own and binds it to the lock. taken after the broker
+        // forks so the broker never inherits the lock (ADR-0024 decisions 2 and 17).
+        let snapshot_cgroup = start_run_cgroup(
+            spec,
+            run_dir,
+            recorded_cgroup.as_deref(),
+            located_parent,
+            writer,
         )?;
-        let config = match mode {
+
+        // steps 5-6: spawn and serve until the tree exits
+        let spawn_spec = SpawnSpec {
+            argv: spec.argv.clone(),
+            stdout: None,
+            mode,
+            landlock_ruleset: prepared_ruleset.map(|ruleset| ruleset.ruleset_fd().as_raw_fd()),
+        };
+        let (child, _run_lock) = match snapshot_cgroup {
+            Some((lock, cgroup)) => (spawn_supervised_in_cgroup(&spawn_spec, cgroup)?, Some(lock)),
+            None => (
+                spawn_supervised_with(&spawn_spec, spec.snapshot_integrity)?,
+                None,
+            ),
+        };
+        let mut config = match mode {
             Mode::RecordOnly => {
                 crate::supervisor::run::RunConfig::record_only(child.pid as u32, spec.attendance)
             }
@@ -448,7 +529,8 @@ mod linux {
         }
         .with_ask_timeout(spec.ask_timeout)
         .with_snapshot_integrity(spec.snapshot_integrity);
-        let outcome = run_loop(child, config, writer)?;
+        config.prompter = hooks.prompter;
+        let outcome = run_loop_with_cgroup_kill(child, config, writer, hooks.kill)?;
 
         // step 7: an undecodable status stamps nothing (an untruthful exit is worse
         // than none, cli.md section 5)
@@ -491,6 +573,52 @@ mod linux {
             run_path: run_dir.path.clone(),
             exit,
         })
+    }
+
+    /// the run lock and run cgroup of a snapshot run, with stale-cgroup cleanup between
+    /// them; `None` for every other run. the cleanup is recorded in the new run's trace.
+    fn start_run_cgroup<S: TraceSink>(
+        spec: &SessionSpec,
+        run_dir: &RunDir,
+        recorded: Option<&Path>,
+        located_parent: Option<&CgroupParent>,
+        writer: &mut TraceWriter<S>,
+    ) -> Result<Option<(RunLock, RunCgroup)>, SessionError> {
+        if !spec.snapshot_integrity {
+            return Ok(None);
+        }
+        let recorded = recorded.ok_or(RunCgroupError::MissingPath)?;
+        let opened_parent;
+        let parent = match located_parent {
+            Some(parent) => parent,
+            None => {
+                let parent_path = recorded.parent().ok_or(RunCgroupError::MissingPath)?;
+                opened_parent = CgroupParent::open_writable(parent_path)?;
+                opened_parent.probe()?;
+                &opened_parent
+            }
+        };
+        let lock = RunLock::acquire(&run_dir.path)?;
+        match cleanup_stale(parent, &spec.state_root, Some(&run_dir.id)) {
+            Ok(events) => {
+                for event in events {
+                    writer.append(now_ms()?, EventBody::CgroupKill(event))?;
+                }
+            }
+            // a cgroup that cannot be listed cannot hold a stale run Leash could clean; the
+            // new run does not depend on it, so say so and go on
+            Err(e) => eprintln!("leash: could not scan for stale run cgroups: {e}"),
+        }
+        let cgroup = RunCgroup::create(parent, &run_dir.id)?;
+        cgroup.bind_lock(&lock)?;
+        if cgroup.path() != recorded {
+            return Err(RunCgroupError::PathMismatch {
+                created: cgroup.path().to_path_buf(),
+                recorded: recorded.to_path_buf(),
+            }
+            .into());
+        }
+        Ok(Some((lock, cgroup)))
     }
 
     /// wall-clock milliseconds; a clock before the epoch cannot stamp anything sane.

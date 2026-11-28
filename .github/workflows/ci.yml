@@ -35,3 +35,30 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - name: audit
         run: cargo audit
+
+  # the run cgroup tests need a delegated cgroup v2 (ADR-0024 decision 2). the runner is
+  # an unprivileged user on a systemd host, so one sudo step makes a cgroup under the root
+  # cgroup, hands it to the runner user, and moves this step's own shell into it as root.
+  # everything the step then runs, cargo and the tests included, is unprivileged and inside
+  # the delegated cgroup. LEASH_REQUIRE_FREEZER=1 turns "no delegated cgroup" from a skip
+  # into a failure, so this job cannot pass without really running the tests.
+  cgroup:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build cgroup tests
+        run: cargo test --no-run --test run_cgroup_linux --test snapshot_run_filter_linux
+      - name: cgroup tests in a delegated cgroup
+        env:
+          LEASH_REQUIRE_FREEZER: "1"
+        run: |
+          set -euo pipefail
+          cgroup=/sys/fs/cgroup/leash-ci
+          mount | grep ' type cgroup2 ' || true
+          sudo mkdir "$cgroup"
+          sudo chown -R "$(id -u):$(id -g)" "$cgroup"
+          echo $$ | sudo tee "$cgroup/cgroup.procs" > /dev/null
+          echo "cgroup of this step: $(cat /proc/self/cgroup)"
+          cargo test --test run_cgroup_linux --test snapshot_run_filter_linux -- --nocapture

@@ -209,6 +209,7 @@ mod tests {
             argv: vec!["echo".into(), "hello".into()],
             workspace: "/workspace".into(),
             start_ts: seconds * 1000,
+            run_cgroup: None,
         };
         let dir = RunDir::create(
             root,

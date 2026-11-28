@@ -17,6 +17,8 @@ pub mod mem;
 pub mod notify;
 pub mod preflight;
 pub mod run;
+#[cfg(target_os = "linux")]
+pub mod run_cgroup;
 pub mod session;
 #[cfg(target_os = "linux")]
 pub mod spawn;

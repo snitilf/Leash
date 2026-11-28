@@ -31,6 +31,7 @@ fn sample_meta() -> RunMeta {
         argv: vec!["torture".into()],
         workspace: "/nonexistent".into(),
         start_ts: 0,
+        run_cgroup: None,
     }
 }
 

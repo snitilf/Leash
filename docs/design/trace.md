@@ -53,7 +53,7 @@ Every event shares an envelope and adds a type-specific body under `type`:
 |---|---|
 | `seq` | monotonic sequence number, the authoritative order (decision order, ADR-0011) |
 | `ts` | supervisor wall-clock timestamp at the moment of decision |
-| `type` | `run_start`, `syscall`, `step`, or `run_end` |
+| `type` | `run_start`, `syscall`, `step`, `cgroup_kill`, or `run_end` |
 
 A `syscall` event, the common case, adds:
 
@@ -119,6 +119,23 @@ collide with them because they carry a `:` and rule ids are plain names.
 committed **step** boundary with the step index (FR-17, [`snapshot.md`](snapshot.md)). `run_end`
 carries the exit status of the child tree and the final committed step index.
 
+A snapshot run (`snapshot_integrity`, ADR-0024) adds one optional field to `run_start` and `meta.json`, and one event type.
+Both are additive, so `schema_version` does not move, and a reader that ignores them still decodes the trace.
+Non-snapshot runs write neither.
+
+- `run_cgroup` is the absolute path of the run cgroup, `leash-<run-id>` under Leash's own cgroup.
+  Rewind reads it to check that the cgroup is gone (ADR-0024 decision 17).
+- A `cgroup_kill` event is written when Leash kills a run cgroup or encounters a per-entry error during stale cleanup.
+  `reason` is `run_end` (the root exited and leftover processes were killed), `abort` (the run failed closed and the whole tree was killed), or `stale_cleanup` (the cgroup of a dead run was found at the start of this run and removed, or inspecting its lock or cgroup failed).
+  A stale-cleanup error on the run lock or cgroup emits a `stale_cleanup` event with `error` set and no kill performed.
+  Kills performed by the `RunCgroup` `Drop` backstop on unwind or early return are not recorded in the trace.
+  `cgroup` is the target cgroup's name.
+  `processes` is the count listed in `cgroup.procs` just before the kill, and is absent when the list could not be read or no kill was attempted.
+  `error` is present only when checking the lock, opening or killing the cgroup failed, or `populated` did not reach 0 in time.
+  `removal_error` is present only when the kill succeeded and removing the cgroup directory or its descendants failed; at run end that failure is recorded here without discarding `run_end`.
+  At run end the event precedes `run_end`.
+  An abort event is written on a best-effort basis, because the trace itself may be what failed.
+
 ADR-0022 requires snapshot-enabled runs to record their backend and consistency-contract
 version, and to bind each successful step to its durably published snapshot. These additions
 are required design, with schema implementation and validation pending. Existing live-copy
@@ -129,7 +146,6 @@ A failed final capture must be represented as failure, not as a successful final
 ADR-0024 adds these fields, specified by ADR-0024, not yet implemented:
 
 - a `step` event carries the manifest digest of its snapshot and the capture pause;
-- a cgroup-kill record is written when Leash writes `cgroup.kill`, at run end and on every abort path;
 - `run_end` carries the chain head over all step manifest digests, recomputed from the manifests and never read from the trace;
 - a snapshot run records the `clone3` `ENOSYS` denial and the legacy AIO denial as events.
 

@@ -28,7 +28,17 @@ Snapshots exist only in enforce mode, and only when the operator passes `--snaps
 Before spawn, verify a writable delegated cgroup v2 with working `cgroup.freeze` and `cgroup.kill`.
 Also verify Landlock ABI 3 or higher, and that no write-class Landlock grant overlaps the state root or any cgroup2 mount.
 Place the child in the run cgroup before untrusted execution; keep the supervisor outside.
+Leash creates the child directly inside the cgroup with `clone3(CLONE_INTO_CGROUP)` and a descriptor on the pinned run cgroup, so membership is atomic: the child is a member before it runs one instruction, before it installs its filter, and before `execve`.
+No `cgroup.procs` write is involved, no attach descriptor is handed to the child, and a failed entry fails the spawn before any agent code exists.
+The child also closes every inherited descriptor above 2 before `execve`, as it does for all descriptors.
 Descendants inherit membership.
+The setup probe proves `clone3(CLONE_INTO_CGROUP)` survival, lock xattr round-trip, freeze, thaw and kill on a sacrificial cgroup holding a real process, never on the run cgroup.
+On Linux 6.8 a `clone3(CLONE_INTO_CGROUP)` child is immediately SIGKILLed whenever the caller's cgroup kill count differs from the target cgroup's kill count, and a newly created cgroup starts at kill count 0 even under a previously killed parent (measurement 0003 section 8).
+Probing through `clone3(CLONE_INTO_CGROUP)` catches a previously killed parent cgroup before any run directory is created, and never writes `cgroup.kill` on the real run cgroup before spawn.
+A per-run `flock` on `<run_dir>/run.lock`, held for the whole run, marks the run alive, and its `<st_dev>:<st_ino>` identity is stored in the `user.leash.lock` xattr of the run cgroup directory.
+At the start of every snapshot run Leash kills and removes the sibling `leash-<run-id>` cgroups under its current parent whose name validates, whose `run.lock` resolves beneath its state root without symlinks as a regular file, whose lock can be taken, and whose `user.leash.lock` xattr matches that lock inode, and records each in the new trace.
+It never touches a cgroup whose lock is held, whose lock file does not exist under its state root, whose `user.leash.lock` xattr is absent or differs (such as a copied state root with a fresh `run.lock` inode), or whose name is not exactly `leash-` and a generated run id.
+Because stale cleanup scans only Leash's current parent cgroup, when each run is launched in its own per-run `systemd-run --user --scope -p Delegate=yes` scope a crashed run's cgroup tree sits under that earlier scope and is not cleaned by a later run in a fresh scope; systemd scope behavior remains unverified because systemd is absent in the codespace.
 Snapshot-enabled runs refuse before spawn when any prerequisite is unavailable.
 Process enumeration and SIGSTOP are not substitutes for this barrier.
 
@@ -138,9 +148,12 @@ modified while mounted. Capturing a layer still requires the section 2 barrier.
 Rewind and diff follow ADR-0024 rules 17-22.
 
 Rewind requires the run's cgroup to be gone, not a `run_end` event, so a crashed run can be rewound.
-Every `leash run` and `leash rewind` kills and removes stale run cgroups that run metadata names.
-A run cgroup is stale when its run lock can be taken.
+The cgroup-gone check returns a tri-state (`Gone`, `Present`, `Unknown`) by pinning the recorded parent directory on a cgroup2 mount first, or walking up to the nearest existing ancestor when opening the parent returns `ENOENT`, so a vanished transient scope under a cgroup2 mount reports `Gone` while a non-cgroup2, inaccessible, or unresolvable path never fails open as `Gone`.
+Rewind must treat `Unknown` as not gone and must also acquire `<run_dir>/run.lock` before modifying the workspace.
+Every snapshot `leash run` and `leash rewind` kills and removes stale run cgroups under its current parent cgroup that run metadata names; non-snapshot runs do not clean stale cgroups.
+A run cgroup is stale when its run lock can be taken and its `user.leash.lock` xattr matches that lock file's `<st_dev>:<st_ino>`.
 Only a Leash-named child of Leash's own cgroup is killed; a name from metadata is validated first.
+Under per-run `systemd-run --scope` launches, a crashed run's cgroup lives in its own earlier scope, so a later run's parent-cgroup scan does not reach it (unverified, as systemd is absent in the codespace).
 Rewind also requires exclusive workspace ownership, and no live overlay mount or remaining references that could mutate the restored state.
 It targets only steps with a committed step event.
 Without `--step`, it restores step 0, the workspace as it was before the agent started.

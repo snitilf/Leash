@@ -16,6 +16,8 @@ use std::time::Duration;
 use leash::recorder::{Attendance, Mode};
 use leash::supervisor::session::{ExitDisposition, SessionError, SessionSpec, run_session};
 
+mod common;
+
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 fn spawn_lock() -> MutexGuard<'static, ()> {
@@ -91,6 +93,9 @@ const RAW_CLONE3: &str = "import ctypes, errno, os, struct\n\
 
 #[test]
 fn clone3_is_enosys_and_recorded_in_a_snapshot_run() {
+    if !common::delegated_cgroup_or_skip("clone3_is_enosys_and_recorded_in_a_snapshot_run") {
+        return;
+    }
     let script = format!(
         "{RAW_CLONE3}\
          assert rc == -1 and ctypes.get_errno() == errno.ENOSYS, (rc, ctypes.get_errno())\n\
@@ -109,6 +114,9 @@ fn clone3_is_enosys_and_recorded_in_a_snapshot_run() {
 
 #[test]
 fn glibc_process_creation_still_works_in_a_snapshot_run() {
+    if !common::delegated_cgroup_or_skip("glibc_process_creation_still_works_in_a_snapshot_run") {
+        return;
+    }
     let script = "import os, subprocess\n\
         pid = os.fork()\n\
         if pid == 0:\n    os._exit(0)\n\
@@ -128,6 +136,9 @@ fn glibc_process_creation_still_works_in_a_snapshot_run() {
 
 #[test]
 fn threads_fall_back_to_clone_in_a_snapshot_run() {
+    if !common::delegated_cgroup_or_skip("threads_fall_back_to_clone_in_a_snapshot_run") {
+        return;
+    }
     // glibc's pthread_create tries clone3 first and falls back to clone on ENOSYS.
     let script = "import threading\n\
         t = threading.Thread(target=lambda: None)\n\
@@ -172,6 +183,9 @@ fn clone3_is_unchanged_without_snapshot_integrity() {
 
 #[test]
 fn aio_is_denied_and_recorded_in_a_snapshot_run() {
+    if !common::delegated_cgroup_or_skip("aio_is_denied_and_recorded_in_a_snapshot_run") {
+        return;
+    }
     let script = "import ctypes, errno\n\
         libc = ctypes.CDLL(None, use_errno=True)\n\
         ctx = ctypes.c_ulong(0)\n\
@@ -266,6 +280,11 @@ fn supervisor_and_broker_are_non_dumpable_during_a_run() {
     let root = unsafe { libc::geteuid() } == 0;
     for snapshot_integrity in [false, true] {
         let _guard = spawn_lock();
+        if snapshot_integrity
+            && !common::delegated_cgroup_or_skip("supervisor_and_broker_are_non_dumpable")
+        {
+            continue;
+        }
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("children");
         let mut watcher = (!root).then(|| {

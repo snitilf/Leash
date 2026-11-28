@@ -1136,6 +1136,7 @@ fn trace_failure_mid_run_aborts_without_run_end_or_report() {
         argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
         workspace: ws.path().to_path_buf(),
         start_ts: 1,
+        run_cgroup: None,
     };
     let run_dir = RunDir::create(state.path(), &meta, SystemTime::now()).unwrap();
     let spec = SessionSpec {
@@ -1293,6 +1294,7 @@ fn enforce_session_without_a_resolvable_state_root_refuses_before_spawn() {
             argv: argv.clone(),
             workspace: ws.path().to_path_buf(),
             start_ts: 1,
+            run_cgroup: None,
         };
         let run_dir =
             leash::recorder::RunDir::create(state.path(), &meta, std::time::SystemTime::now())
