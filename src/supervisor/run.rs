@@ -134,10 +134,16 @@ pub mod rule {
     pub const PIDFD_GETFD: &str = "sr4:pidfd_getfd";
     /// broker path preparation or realization refused the operand
     pub const REALIZATION: &str = "failsafe:realization";
+    /// a metadata call's own arguments are invalid (an unknown flag, an xattr value over
+    /// the kernel's limit), answered with the kernel's errno before any path is judged
+    pub const UNSUPPORTED_OPERAND: &str = "failsafe:unsupported_operand";
     /// `clone3` answered ENOSYS in a snapshot run, before its struct is read (ADR-0024)
     pub const SNAPSHOT_CLONE3: &str = "snapshot:clone3";
     /// legacy AIO denied in a snapshot run (ADR-0024)
     pub const SNAPSHOT_AIO: &str = "snapshot:aio";
+    /// `setxattrat`, `removexattrat` or `file_setattr` answered ENOSYS in a snapshot run:
+    /// they name a path with no open and no libc wrapper uses them yet (ADR-0025)
+    pub const SNAPSHOT_XATTRAT: &str = "snapshot:xattrat";
     /// a snapshot-only metadata call reached a run that is not a snapshot run, which only a
     /// filter and flag that disagree can do (ADR-0024 decision 4)
     pub const SNAPSHOT_METADATA: &str = "snapshot:metadata";
@@ -465,12 +471,44 @@ fn open_mode(sys_nr: u32, notif: &SeccompNotif) -> u32 {
     }
 }
 
+/// why an operand of a filesystem call could not be turned into a request.
+#[derive(Debug)]
+enum OperandError {
+    /// agent memory could not be read within its cap: case C, denied under
+    /// `failsafe:memory_read`
+    Memory,
+    /// the call's own arguments are invalid, and the kernel would have refused it with this
+    /// errno before looking at any path: the supervisor answers the same errno and records
+    /// it under `failsafe:unsupported_operand`
+    Unsupported(i32),
+}
+
+impl From<MemReadError> for OperandError {
+    fn from(_: MemReadError) -> Self {
+        Self::Memory
+    }
+}
+
+/// `AT_EMPTY_PATH`, pinned to the x86-64 value like the other abi constants here.
+const AT_EMPTY_PATH: i32 = 0x1000;
+
+/// whether this call may name its target by an empty path: `utimensat` and `fchmodat2` with
+/// `AT_EMPTY_PATH` act on the object of their directory descriptor when the path is `""`.
+fn empty_path_allowed(sys_nr: u32, notif: &SeccompNotif) -> bool {
+    matches!(sys_nr, nr::UTIMENSAT | nr::FCHMODAT2)
+        && notif.data.args[3] as i32 & AT_EMPTY_PATH != 0
+}
+
+/// decode the call's own arguments. `empty_path` says the path the agent passed was empty and
+/// `AT_EMPTY_PATH` was set, so the call acts on the object `path` already names (the
+/// descriptor's target) and not on something beneath it.
 fn mutation_invocation<N: Notifier>(
     kernel: &N,
     sys_nr: u32,
     notif: &SeccompNotif,
     path: &std::path::Path,
-) -> Result<MutationInvocation, MemReadError> {
+    empty_path: bool,
+) -> Result<MutationInvocation, OperandError> {
     let invocation = match sys_nr {
         nr::TRUNCATE => MutationInvocation::Truncate {
             length: notif.data.args[1] as i64,
@@ -520,19 +558,33 @@ fn mutation_invocation<N: Notifier>(
             gid: notif.data.args[2] as u32,
             flags: AT_SYMLINK_NOFOLLOW,
         },
-        nr::FCHMODAT2 => match notif.data.args[3] as i32 {
-            0 => MutationInvocation::Chmod {
-                mode: notif.data.args[2] as u32,
-            },
-            AT_SYMLINK_NOFOLLOW => MutationInvocation::ChmodNoFollow {
-                mode: notif.data.args[2] as u32,
-            },
-            _ => return Err(MemReadError::Io(io::Error::from_raw_os_error(libc::EINVAL))),
-        },
-        nr::UTIMENSAT => MutationInvocation::Utimens {
-            times: read_times(kernel, notif, notif.data.args[2], TimeLayout::Timespec)?,
-            flags: notif.data.args[3] as i32,
-        },
+        nr::FCHMODAT2 => {
+            let flags = notif.data.args[3] as i32;
+            if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+                return Err(OperandError::Unsupported(libc::EINVAL));
+            }
+            let mode = notif.data.args[2] as u32;
+            // an empty path names the descriptor's own object, which is not followed
+            if flags & AT_SYMLINK_NOFOLLOW != 0 || empty_path {
+                MutationInvocation::ChmodNoFollow { mode }
+            } else {
+                MutationInvocation::Chmod { mode }
+            }
+        }
+        nr::UTIMENSAT => {
+            let flags = notif.data.args[3] as i32;
+            if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+                return Err(OperandError::Unsupported(libc::EINVAL));
+            }
+            MutationInvocation::Utimens {
+                times: read_times(kernel, notif, notif.data.args[2], TimeLayout::Timespec)?,
+                flags: if empty_path {
+                    AT_SYMLINK_NOFOLLOW
+                } else {
+                    flags & AT_SYMLINK_NOFOLLOW
+                },
+            }
+        }
         nr::UTIMES => MutationInvocation::Utimens {
             times: read_times(kernel, notif, notif.data.args[1], TimeLayout::Timeval)?,
             flags: 0,
@@ -548,7 +600,7 @@ fn mutation_invocation<N: Notifier>(
         nr::SETXATTR | nr::LSETXATTR => {
             let size = usize::try_from(notif.data.args[3]).unwrap_or(usize::MAX);
             if size > XATTR_SIZE_MAX {
-                return Err(MemReadError::Io(io::Error::from_raw_os_error(libc::E2BIG)));
+                return Err(OperandError::Unsupported(libc::E2BIG));
             }
             let name = kernel.read_path(notif.pid, notif.data.args[1])?;
             let value = if size == 0 {
@@ -567,9 +619,7 @@ fn mutation_invocation<N: Notifier>(
             name: kernel.read_path(notif.pid, notif.data.args[1])?,
             follow: sys_nr == nr::REMOVEXATTR,
         },
-        _ => {
-            return Err(MemReadError::Io(io::Error::from_raw_os_error(libc::ENOSYS)));
-        }
+        _ => return Err(OperandError::Unsupported(libc::ENOSYS)),
     };
     Ok(invocation)
 }
@@ -826,10 +876,10 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
     // a trapped snapshot-filter syscall is denied and recorded whatever the flag says, so
     // a filter and flag that disagree can never allow it unrecorded.
     if SNAPSHOT_TRAPPED.contains(&sys_nr) || (config.snapshot_integrity && sys_nr == nr::CLONE3) {
-        let matched_rule = if sys_nr == nr::CLONE3 {
-            rule::SNAPSHOT_CLONE3
-        } else {
-            rule::SNAPSHOT_AIO
+        let matched_rule = match sys_nr {
+            nr::CLONE3 => rule::SNAPSHOT_CLONE3,
+            nr::SETXATTRAT | nr::REMOVEXATTRAT | nr::FILE_SETATTR => rule::SNAPSHOT_XATTRAT,
+            _ => rule::SNAPSHOT_AIO,
         };
         record(
             writer,
@@ -965,18 +1015,35 @@ fn handle_fs<N: Notifier, S: TraceSink>(
             Vec<crate::recorder::FsAccess>,
             FsInvocation,
         ),
-        MemReadError,
+        GatherError,
     > = (|| {
-        let path = read_anchored(kernel, notif, &shape.path)?;
+        let (path, empty_path) = read_anchored_with(
+            kernel,
+            notif,
+            &shape.path,
+            empty_path_allowed(sys_nr, notif),
+        )?;
         let dest = match &shape.dest {
             Some(arg) => Some(read_anchored(kernel, notif, arg)?),
             None => None,
         };
         let (access, invocation) = match shape.access {
-            AccessSpec::Fixed(list) => (
-                list.to_vec(),
-                FsInvocation::Mutation(mutation_invocation(kernel, sys_nr, notif, &path)?),
-            ),
+            AccessSpec::Fixed(list) => {
+                let invocation = match mutation_invocation(kernel, sys_nr, notif, &path, empty_path)
+                {
+                    Ok(invocation) => invocation,
+                    Err(OperandError::Memory) => return Err(GatherError::Memory),
+                    Err(OperandError::Unsupported(errno)) => {
+                        return Err(GatherError::Unsupported {
+                            errno,
+                            path,
+                            dest,
+                            access: list.to_vec(),
+                        });
+                    }
+                };
+                (list.to_vec(), FsInvocation::Mutation(invocation))
+            }
             AccessSpec::OpenFlags { arg } => {
                 // with O_PATH the kernel ignores every other bit (access mode, O_CREAT,
                 // O_TRUNC), so the fact and the realization see only the bits it honors
@@ -993,10 +1060,7 @@ fn handle_fs<N: Notifier, S: TraceSink>(
             AccessSpec::OpenHow { arg } => {
                 let size = usize::try_from(notif.data.args[3]).unwrap_or(0);
                 if size < OPEN_HOW_SIZE {
-                    return Err(MemReadError::Short {
-                        wanted: OPEN_HOW_SIZE,
-                        got: size,
-                    });
+                    return Err(GatherError::Memory);
                 }
                 let read_size = if config.mode == crate::recorder::Mode::Enforce {
                     size.min(crate::supervisor::mem::ABSOLUTE_READ_CAP)
@@ -1065,8 +1129,30 @@ fn handle_fs<N: Notifier, S: TraceSink>(
             respond_continue_or_deny(kernel, notif.id, &decision)?;
             Ok(mutation_handled(decision.response_decision, &access))
         }
+        // the call's own arguments are invalid, so the kernel would have refused it with this
+        // errno before it looked at any path. it is answered as the kernel would, and
+        // recorded under its own rule so it is not mistaken for a failed memory read
+        Err(GatherError::Unsupported {
+            errno,
+            path,
+            dest,
+            access,
+        }) => {
+            record_event(
+                writer,
+                ts,
+                notif,
+                shape.name,
+                Fact::Fs { path, access, dest },
+                &fixed_decision(Decision::Deny, rule::UNSUPPORTED_OPERAND),
+                None,
+                Some(crate::recorder::errno_name(errno)),
+            )?;
+            tolerate_dead(kernel.send_error(notif.id, errno))?;
+            Ok(Handled::Responded)
+        }
         // case C: a fact that cannot be trusted cannot be allowed (I4).
-        Err(_) => {
+        Err(GatherError::Memory) => {
             record(
                 writer,
                 ts,
@@ -1078,6 +1164,25 @@ fn handle_fs<N: Notifier, S: TraceSink>(
             tolerate_dead(kernel.send_error(notif.id, libc::EACCES))?;
             Ok(Handled::Responded)
         }
+    }
+}
+
+/// why gathering the operands of a filesystem call failed.
+enum GatherError {
+    /// agent memory could not be read: case C
+    Memory,
+    /// the call's own arguments are invalid and the kernel would refuse them with `errno`
+    Unsupported {
+        errno: i32,
+        path: PathBuf,
+        dest: Option<PathBuf>,
+        access: Vec<crate::recorder::FsAccess>,
+    },
+}
+
+impl From<MemReadError> for GatherError {
+    fn from(_: MemReadError) -> Self {
+        Self::Memory
     }
 }
 
@@ -1186,11 +1291,24 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
         FsOperand::Path
     };
     let mut asks = Vec::new();
-    let primary_evals =
-        evaluate_required_fs(config, &primary_identity, &primary_access, false, &mut asks);
+    let primary_evals = evaluate_required_fs(
+        config,
+        &primary_identity,
+        primary.on_cgroup2(),
+        &primary_access,
+        false,
+        &mut asks,
+    );
     let secondary_evals = secondary.as_ref().map(|path| {
         let required = secondary_access(&invocation, path.exists());
-        evaluate_required_fs(config, path.identity(), &required, true, &mut asks)
+        evaluate_required_fs(
+            config,
+            path.identity(),
+            path.on_cgroup2(),
+            &required,
+            true,
+            &mut asks,
+        )
     });
     let ask_resolution = settle_asks(config, &asks);
     let primary_decision = finalize_operand(primary_operand, primary_evals, ask_resolution);
@@ -1454,10 +1572,29 @@ fn secondary_access(
     }
 }
 
+/// the implicit cgroup deny decided on what the pinned handle is, not where its path says it
+/// is (ADR-0024 decision 4): an object on a cgroup2 filesystem is denied for every access,
+/// whatever its spelling, so a bind mount of a cgroup directory and a cgroup2 mount made
+/// after the mounts were read are covered. the path rule stays for the ancestors of a mount,
+/// which are on another filesystem and which only it can protect.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup2_identity_deny(config: &RunConfig<'_>, on_cgroup2: bool) -> Option<Evaluation> {
+    (on_cgroup2
+        && config.mode == crate::recorder::Mode::Enforce
+        && config.snapshot_integrity
+        && config.state_root.is_some())
+    .then_some(Evaluation {
+        decision: Decision::Deny,
+        matched: crate::policy::MatchId::ImplicitCgroup,
+        would_deny: None,
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn evaluate_required_fs(
     config: &RunConfig<'_>,
     path: &std::path::Path,
+    on_cgroup2: bool,
     access: &[crate::recorder::FsAccess],
     destination: bool,
     asks: &mut Vec<ask::PendingAsk>,
@@ -1466,6 +1603,9 @@ fn evaluate_required_fs(
     access
         .iter()
         .map(|required| {
+            if let Some(eval) = cgroup2_identity_deny(config, on_cgroup2) {
+                return (*required, eval);
+            }
             let eval = evaluate_operand(
                 config,
                 &Request::Fs {
@@ -2037,10 +2177,24 @@ fn read_anchored<N: Notifier>(
     notif: &SeccompNotif,
     arg: &PathArg,
 ) -> Result<PathBuf, MemReadError> {
+    read_anchored_with(kernel, notif, arg, false).map(|(path, _)| path)
+}
+
+/// read and anchor one path operand. when `allow_empty` is set and the path is empty, the
+/// result is the anchor itself, with no trailing separator, and the flag is true: the call
+/// (`AT_EMPTY_PATH`) acts on the object the descriptor holds. an empty path without
+/// `allow_empty` is the kernel's ENOENT and keeps its old reading.
+fn read_anchored_with<N: Notifier>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    arg: &PathArg,
+    allow_empty: bool,
+) -> Result<(PathBuf, bool), MemReadError> {
     let bytes = kernel.read_path(notif.pid, notif.data.args[arg.path_arg])?;
+    let empty = allow_empty && bytes.is_empty();
     let path = bytes_to_path(bytes);
     if path.is_absolute() || !arg.anchor {
-        return Ok(path);
+        return Ok((path, false));
     }
     let anchor = match arg.dirfd_arg {
         Some(i) if u64::from(notif.data.args[i] as u32) != flags::AT_FDCWD => {
@@ -2049,8 +2203,9 @@ fn read_anchored<N: Notifier>(
         _ => DirAnchor::Cwd,
     };
     match kernel.dir_prefix(notif.pid, anchor) {
-        Ok(prefix) => Ok(prefix.join(path)),
-        Err(_) => Ok(path),
+        Ok(prefix) if empty => Ok((prefix, true)),
+        Ok(prefix) => Ok((prefix.join(path), false)),
+        Err(_) => Ok((path, false)),
     }
 }
 
@@ -3411,6 +3566,34 @@ mod tests {
     }
 
     #[test]
+    fn the_path_attribute_calls_newer_than_libc_are_answered_enosys_and_recorded() {
+        // setxattrat (6.13), removexattrat (6.13) and file_setattr (6.17) name a path and can
+        // set `user.leash.lock` or a file attribute with no open. nothing in libc calls them
+        // yet, so they are answered ENOSYS, and the flag decides nothing: a filter and flag
+        // that disagree still deny and record them
+        let p = policy("schema_version = 1\n");
+        for snapshot_integrity in [true, false] {
+            let config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
+                .with_snapshot_integrity(snapshot_integrity);
+            for (sys_nr, name) in [
+                (nr::SETXATTRAT, "setxattrat"),
+                (nr::REMOVEXATTRAT, "removexattrat"),
+                (nr::FILE_SETATTR, "file_setattr"),
+            ] {
+                let kernel = FakeNotifier::default();
+                let mut w = writer();
+                super::handle_notification(&kernel, &notif(sys_nr, [0; 6]), &mut w, &config, 1)
+                    .unwrap();
+                assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::ENOSYS)]);
+                let ev = &events(w)[0];
+                assert_eq!(ev["syscall"], name);
+                assert_eq!(ev["decision"], "deny");
+                assert_eq!(ev["matched_rule"], rule::SNAPSHOT_XATTRAT);
+            }
+        }
+    }
+
+    #[test]
     fn a_filter_and_flag_that_disagree_are_refused_in_both_directions() {
         assert!(require_matching_filter(true, true).is_ok());
         assert!(require_matching_filter(false, false).is_ok());
@@ -3860,6 +4043,91 @@ mod tests {
     }
 
     #[test]
+    fn an_invalid_operand_is_answered_with_the_kernels_errno_under_its_own_rule() {
+        // each call is refused by the kernel before it looks at a path, so the answer is the
+        // kernel's errno and the record says why, not failsafe:memory_read with EACCES
+        let calls: [(u32, [u64; 6], &str, i32, &str); 3] = [
+            (
+                nr::SETXATTR,
+                [0x1000, 0x2000, 0x3000, 65_537, 0, 0],
+                "setxattr",
+                libc::E2BIG,
+                "E2BIG",
+            ),
+            (
+                nr::FCHMODAT2,
+                [flags::AT_FDCWD, 0x1000, 0o600, 0x2000, 0, 0],
+                "fchmodat2",
+                libc::EINVAL,
+                "EINVAL",
+            ),
+            (
+                nr::UTIMENSAT,
+                [flags::AT_FDCWD, 0x1000, 0, 0x4000, 0, 0],
+                "utimensat",
+                libc::EINVAL,
+                "EINVAL",
+            ),
+        ];
+        for (sys_nr, args, name, errno, errno_name) in calls {
+            let kernel = FakeNotifier::default()
+                .with_cstr(0x1000, "/work/f")
+                .with_cstr(0x2000, "user.k");
+            let mut w = writer();
+            let handled = metadata_run(|config| {
+                super::handle_notification(&kernel, &notif(sys_nr, args), &mut w, config, 1)
+                    .unwrap()
+            });
+            assert_eq!(handled, Handled::Responded, "{name}");
+            assert_eq!(kernel.sent(), vec![format!("error:7:{errno}")], "{name}");
+            let ev = &events(w)[0];
+            assert_eq!(ev["syscall"], name);
+            assert_eq!(ev["decision"], "deny", "{name}");
+            assert_eq!(ev["matched_rule"], rule::UNSUPPORTED_OPERAND, "{name}");
+            assert_eq!(ev["errno"], errno_name, "{name}");
+            assert_eq!(ev["fact"]["path"], "/work/f", "{name}");
+        }
+    }
+
+    #[test]
+    fn an_object_on_a_cgroup2_filesystem_is_denied_by_what_it_is_whatever_its_path() {
+        let p = policy("schema_version = 1\n");
+        let root = test_root();
+        let snapshot = RunConfig::enforce(4242, Attendance::Unattended, &p, root)
+            .with_snapshot_integrity(true);
+        let eval = cgroup2_identity_deny(&snapshot, true).expect("denied");
+        assert_eq!(eval.decision, Decision::Deny);
+        assert_eq!(eval.matched.to_string(), "implicit:cgroup");
+        // another filesystem is left to the path rule and to policy
+        assert!(cgroup2_identity_deny(&snapshot, false).is_none());
+        // a run without snapshot integrity is the operator's business
+        let plain = RunConfig::enforce(4242, Attendance::Unattended, &p, root);
+        assert!(cgroup2_identity_deny(&plain, true).is_none());
+        // and so is record-only, which has no implicit rules
+        let record = RunConfig::record_only(4242, Attendance::Unattended);
+        assert!(cgroup2_identity_deny(&record, true).is_none());
+    }
+
+    #[test]
+    fn an_unreadable_operand_is_still_a_memory_read_failure() {
+        // the xattr name pointer is unmapped, which is case C and stays EACCES
+        let kernel = FakeNotifier::default().with_cstr(0x1000, "/work/f");
+        let mut w = writer();
+        metadata_run(|config| {
+            super::handle_notification(
+                &kernel,
+                &notif(nr::SETXATTR, [0x1000, 0xdead, 0x3000, 1, 0, 0]),
+                &mut w,
+                config,
+                1,
+            )
+            .unwrap();
+        });
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        assert_eq!(events(w)[0]["matched_rule"], rule::MEMORY_READ);
+    }
+
+    #[test]
     fn a_descriptor_that_cannot_be_resolved_denies_the_metadata_call() {
         // fd 9 is not in fd_dirs, so its target cannot be read back
         let kernel = FakeNotifier::default();
@@ -3911,6 +4179,7 @@ mod tests {
             nr::LSETXATTR,
             &notif(nr::LSETXATTR, [0, 0x1000, 0x2000, 5, 1, 0]),
             path,
+            false,
         )
         .unwrap();
         assert!(matches!(
@@ -3923,14 +4192,19 @@ mod tests {
             nr::SETXATTR,
             &notif(nr::SETXATTR, [0, 0x1000, 0x2000, 65_537, 0, 0]),
             path,
+            false,
         );
-        assert!(oversized.is_err(), "a value past XATTR_SIZE_MAX is refused");
+        assert!(
+            matches!(oversized, Err(OperandError::Unsupported(libc::E2BIG))),
+            "a value past XATTR_SIZE_MAX is E2BIG, not a memory failure: {oversized:?}"
+        );
 
         let remove = mutation_invocation(
             &kernel,
             nr::REMOVEXATTR,
             &notif(nr::REMOVEXATTR, [0, 0x1000, 0, 0, 0, 0]),
             path,
+            false,
         )
         .unwrap();
         assert!(matches!(
@@ -3943,6 +4217,7 @@ mod tests {
             nr::UTIMENSAT,
             &notif(nr::UTIMENSAT, [0, 0, 0x3000, 0x100, 0, 0]),
             path,
+            false,
         )
         .unwrap();
         assert!(matches!(
@@ -3957,6 +4232,7 @@ mod tests {
             nr::UTIMES,
             &notif(nr::UTIMES, [0, 0x3000, 0, 0, 0, 0]),
             path,
+            false,
         )
         .unwrap();
         assert!(matches!(
@@ -3971,6 +4247,7 @@ mod tests {
             nr::UTIME,
             &notif(nr::UTIME, [0, 0, 0, 0, 0, 0]),
             path,
+            false,
         )
         .unwrap();
         assert!(matches!(
@@ -3986,6 +4263,7 @@ mod tests {
             nr::LCHOWN,
             &notif(nr::LCHOWN, [0, 7, 8, 0, 0, 0]),
             path,
+            false,
         )
         .unwrap();
         assert!(matches!(
@@ -4001,6 +4279,7 @@ mod tests {
             nr::FCHMODAT2,
             &notif(nr::FCHMODAT2, [0, 0, 0o600, 0, 0, 0]),
             path,
+            false,
         )
         .unwrap();
         assert!(matches!(follow, MutationInvocation::Chmod { mode: 0o600 }));
@@ -4009,19 +4288,88 @@ mod tests {
             nr::FCHMODAT2,
             &notif(nr::FCHMODAT2, [0, 0, 0o600, 0x100, 0, 0]),
             path,
+            false,
         )
         .unwrap();
         assert!(matches!(
             nofollow,
             MutationInvocation::ChmodNoFollow { mode: 0o600 }
         ));
-        let other_flags = mutation_invocation(
+        // AT_EMPTY_PATH only matters when the path is empty: the kernel ignores it otherwise
+        let ignored = mutation_invocation(
             &kernel,
             nr::FCHMODAT2,
             &notif(nr::FCHMODAT2, [0, 0, 0o600, 0x1000, 0, 0]),
             path,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(ignored, MutationInvocation::Chmod { mode: 0o600 }));
+        let empty = mutation_invocation(
+            &kernel,
+            nr::FCHMODAT2,
+            &notif(nr::FCHMODAT2, [0, 0, 0o600, 0x1000, 0, 0]),
+            path,
+            true,
+        )
+        .unwrap();
+        assert!(
+            matches!(empty, MutationInvocation::ChmodNoFollow { mode: 0o600 }),
+            "an empty path names the descriptor's own object: {empty:?}"
         );
-        assert!(other_flags.is_err(), "flags beyond NOFOLLOW are refused");
+        let unknown_flag = mutation_invocation(
+            &kernel,
+            nr::FCHMODAT2,
+            &notif(nr::FCHMODAT2, [0, 0, 0o600, 0x2000, 0, 0]),
+            path,
+            false,
+        );
+        assert!(
+            matches!(unknown_flag, Err(OperandError::Unsupported(libc::EINVAL))),
+            "{unknown_flag:?}"
+        );
+
+        let utimens_ignored = mutation_invocation(
+            &kernel,
+            nr::UTIMENSAT,
+            &notif(nr::UTIMENSAT, [0, 0, 0x3000, 0x1000, 0, 0]),
+            path,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            utimens_ignored,
+            MutationInvocation::Utimens { flags: 0, .. }
+        ));
+        let utimens_empty = mutation_invocation(
+            &kernel,
+            nr::UTIMENSAT,
+            &notif(nr::UTIMENSAT, [0, 0, 0x3000, 0x1000, 0, 0]),
+            path,
+            true,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                utimens_empty,
+                MutationInvocation::Utimens {
+                    flags: AT_SYMLINK_NOFOLLOW,
+                    ..
+                }
+            ),
+            "AT_EMPTY_PATH with an empty path acts on the descriptor's object: {utimens_empty:?}"
+        );
+        let utimens_bad = mutation_invocation(
+            &kernel,
+            nr::UTIMENSAT,
+            &notif(nr::UTIMENSAT, [0, 0, 0x3000, 0x4000, 0, 0]),
+            path,
+            false,
+        );
+        assert!(
+            matches!(utimens_bad, Err(OperandError::Unsupported(libc::EINVAL))),
+            "{utimens_bad:?}"
+        );
     }
 
     #[test]

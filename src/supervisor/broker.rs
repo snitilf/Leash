@@ -58,6 +58,7 @@ pub struct PreparedPath {
     token: u64,
     identity: PathBuf,
     exists: bool,
+    on_cgroup2: bool,
 }
 
 impl PreparedPath {
@@ -74,6 +75,13 @@ impl PreparedPath {
     /// Whether the final entry existed during preparation.
     pub fn exists(&self) -> bool {
         self.exists
+    }
+
+    /// Whether the pinned object, or the directory a missing entry would be created in, is on
+    /// a cgroup2 filesystem. read from the retained handle, so a bind mount or a mount made
+    /// after the run started is told apart by what it is and not by where it is.
+    pub fn on_cgroup2(&self) -> bool {
+        self.on_cgroup2
     }
 }
 
@@ -279,12 +287,14 @@ impl Broker {
                     token,
                     identity,
                     exists,
+                    on_cgroup2,
                 },
                 None,
             ) => Ok(BrokerResultOrPath::Path(PreparedPath {
                 token,
                 identity: PathBuf::from(std::ffi::OsString::from_vec(identity)),
                 exists,
+                on_cgroup2,
             })),
             (Response::Errno { errno }, None) => {
                 Ok(BrokerResultOrPath::Result(BrokerResult::Errno(errno)))
@@ -507,6 +517,7 @@ enum Response {
         token: u64,
         identity: Vec<u8>,
         exists: bool,
+        on_cgroup2: bool,
     },
     Result {
         value: i64,
@@ -721,6 +732,12 @@ impl BrokerState<'_> {
             return self.errno(libc::EXDEV);
         }
 
+        // the filesystem the handle is on: the object itself, or the directory a missing
+        // entry would be created in
+        let on_cgroup2 = target
+            .as_ref()
+            .or(parent.as_ref())
+            .is_some_and(|fd| fd_on_cgroup2(fd.as_fd()));
         let token = self.next_token;
         self.next_token = self.next_token.checked_add(1).unwrap_or(1);
         self.held.insert(
@@ -736,6 +753,7 @@ impl BrokerState<'_> {
                 token,
                 identity: identity.as_os_str().as_bytes().to_vec(),
                 exists,
+                on_cgroup2,
             },
             None,
         )
@@ -1064,6 +1082,18 @@ fn chmod_nofollow_held(path: &HeldPath, mode: u32) -> io::Result<i64> {
     chmod_held(path, mode)
 }
 
+/// the errno for a no-follow xattr call whose target is a symlink. a symlink cannot be reached
+/// through its proc link without being followed, so the call cannot be realized. the kernel
+/// itself refuses the `user.` namespace on anything but a regular file or directory with
+/// `EPERM`, and that is the answer a `user.` name gets; another namespace is `EOPNOTSUPP`.
+fn symlink_xattr_errno(name: &[u8]) -> i32 {
+    if name.starts_with(b"user.") {
+        libc::EPERM
+    } else {
+        libc::EOPNOTSUPP
+    }
+}
+
 /// the xattr name or value as the C string the kernel takes, refusing an interior nul.
 fn xattr_name(name: &[u8]) -> io::Result<CString> {
     CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
@@ -1077,10 +1107,8 @@ fn setxattr_held(
     follow: bool,
 ) -> io::Result<i64> {
     let target = required_target(path)?;
-    // a symlink cannot be reached through its proc link without being followed, and the
-    // namespaces a symlink may carry attributes in are not ones an agent may write
     if !follow && target_is_symlink(target)? {
-        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        return Err(io::Error::from_raw_os_error(symlink_xattr_errno(name)));
     }
     let name = xattr_name(name)?;
     let proc_path = proc_fd_path(target)?;
@@ -1099,7 +1127,7 @@ fn setxattr_held(
 fn removexattr_held(path: &HeldPath, name: &[u8], follow: bool) -> io::Result<i64> {
     let target = required_target(path)?;
     if !follow && target_is_symlink(target)? {
-        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        return Err(io::Error::from_raw_os_error(symlink_xattr_errno(name)));
     }
     let name = xattr_name(name)?;
     let proc_path = proc_fd_path(target)?;
@@ -1270,6 +1298,17 @@ fn owned_fd(fd: RawFd) -> io::Result<OwnedFd> {
         // SAFETY: the successful syscall returned a newly owned descriptor.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
+}
+
+/// whether `fd` is on a cgroup2 filesystem, by `fstatfs`. a descriptor the kernel cannot
+/// describe is not reported as cgroup2: the path rule still covers the mounts known at start.
+fn fd_on_cgroup2(fd: BorrowedFd<'_>) -> bool {
+    let mut stat: libc::statfs = unsafe { zeroed() };
+    // SAFETY: stat is a valid out-buffer and fd is open; fstatfs works on O_PATH descriptors.
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), &raw mut stat) } != 0 {
+        return false;
+    }
+    crate::supervisor::cgroup_mounts::is_cgroup2_magic(stat.f_type as i64)
 }
 
 fn fd_identity(fd: BorrowedFd<'_>) -> io::Result<PathBuf> {

@@ -219,6 +219,8 @@ pub fn errno_name(errno: i32) -> String {
         libc::EINVAL => "EINVAL",
         libc::ENAMETOOLONG => "ENAMETOOLONG",
         libc::EOPNOTSUPP => "EOPNOTSUPP",
+        libc::E2BIG => "E2BIG",
+        libc::ENOSYS => "ENOSYS",
         libc::EEXIST => "EEXIST",
         libc::EISDIR => "EISDIR",
         libc::EMFILE => "EMFILE",

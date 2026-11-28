@@ -22,6 +22,16 @@ use crate::supervisor::state_root::{normalize_lexically, resolve_leniently};
 /// the filesystem type `/proc/self/mountinfo` names for a cgroup v2 hierarchy.
 const CGROUP2_FSTYPE: &str = "cgroup2";
 
+/// the `f_type` `fstatfs` reports for a cgroup v2 filesystem (`CGROUP2_SUPER_MAGIC`, "cgp2").
+/// the path rule above only knows the mounts that existed when the run started; this magic is
+/// what a handle on a later mount, or on a bind mount of a cgroup directory, still says.
+pub const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+
+/// whether an `fstatfs` `f_type` is the cgroup2 filesystem.
+pub fn is_cgroup2_magic(f_type: i64) -> bool {
+    f_type == CGROUP2_SUPER_MAGIC
+}
+
 /// every cgroup2 mount point in the supervisor's mount namespace, as resolved absolute paths.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CgroupMounts {
@@ -303,6 +313,17 @@ mod tests {
     fn exec_is_decided_on_the_lexical_spelling_too() {
         let m = mounts(&["/sys/fs/cgroup"]);
         assert!(m.denies_exec(Path::new("/usr/../sys/fs/cgroup/x")));
+    }
+
+    #[test]
+    fn the_cgroup2_magic_is_the_kernels_and_only_it() {
+        // linux/magic.h: #define CGROUP2_SUPER_MAGIC 0x63677270
+        assert_eq!(CGROUP2_SUPER_MAGIC, 0x6367_7270);
+        assert!(is_cgroup2_magic(0x6367_7270));
+        // cgroup (v1), tmpfs, ext4, proc
+        for other in [0x27_e0eb, 0x0102_1994, 0xEF53, 0x9fa0, 0] {
+            assert!(!is_cgroup2_magic(other), "{other:#x}");
+        }
     }
 
     #[test]
