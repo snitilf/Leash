@@ -130,6 +130,16 @@ impl Session {
         finish(run_session(self.spec(argv))?)
     }
 
+    /// runs a shell script with its stdout and stderr written to a file in the workspace, which
+    /// the returned run carries so a failed assertion can print it.
+    fn shell(&self, script: &str) -> Result<Run, SessionError> {
+        let log = self.ws.path().join(".agent-output");
+        let wrapped = format!("exec >{log} 2>&1; {script}", log = log.display());
+        let mut run = self.run(&["/bin/sh", "-c", &wrapped])?;
+        run.output = std::fs::read_to_string(&log).unwrap_or_default();
+        Ok(run)
+    }
+
     fn python(&self, script: &str) -> Result<Run, SessionError> {
         self.run(&["/usr/bin/python3", "-c", script])
     }
@@ -146,6 +156,8 @@ impl Session {
 struct Run {
     exit: ExitDisposition,
     events: Vec<serde_json::Value>,
+    /// the agent's stdout and stderr, when the run was started with `Session::shell`.
+    output: String,
 }
 
 fn finish(outcome: leash::supervisor::session::SessionOutcome) -> Result<Run, SessionError> {
@@ -157,6 +169,7 @@ fn finish(outcome: leash::supervisor::session::SessionOutcome) -> Result<Run, Se
     Ok(Run {
         exit: outcome.exit,
         events,
+        output: String::new(),
     })
 }
 
@@ -164,9 +177,21 @@ impl Run {
     fn assert_exit_zero(&self) {
         assert!(
             matches!(self.exit, ExitDisposition::Exited(0)),
-            "the agent script asserts its own expectations: {:?}",
-            self.exit
+            "the agent script asserts its own expectations: {:?}\n\
+             agent output:\n{}\n\
+             denies and failed calls in the trace:\n{:#?}",
+            self.exit,
+            self.output,
+            self.failures()
         );
+    }
+
+    /// the events a failure is explained by: every deny and every call answered with an errno.
+    fn failures(&self) -> Vec<&serde_json::Value> {
+        self.events
+            .iter()
+            .filter(|e| e["decision"] == "deny" || !e["errno"].is_null())
+            .collect()
     }
 
     fn run_cgroup(&self) -> PathBuf {
@@ -1018,7 +1043,7 @@ fn tar_extracts_and_cp_copies_a_tree_with_links_and_times_in_a_snapshot_run() {
         tar = archive.display(),
         src = src.display(),
     );
-    let run = session.run(&["/bin/sh", "-c", &script]).unwrap();
+    let run = session.shell(&script).unwrap();
     run.assert_exit_zero();
     assert!(
         run.denies_under(&ws).is_empty(),
