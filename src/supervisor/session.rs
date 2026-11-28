@@ -272,6 +272,12 @@ mod linux {
         /// proves delegation, `clone3(CLONE_INTO_CGROUP)`, lock xattrs, freeze, thaw and kill
         /// on the parent cgroup before any run directory exists.
         pub probe: &'a dyn Fn(&Path) -> std::io::Result<()>,
+        /// creates the run cgroup of a snapshot run from its pre-generated run id, before the
+        /// run directory and the broker exist; tests make it fail.
+        pub create_cgroup: &'a dyn Fn(&CgroupParent, &str) -> Result<RunCgroup, RunCgroupError>,
+        /// binds the run cgroup to the run lock once the run directory exists; tests make it
+        /// fail.
+        pub bind_lock: &'a dyn Fn(&RunCgroup, &RunLock) -> Result<(), RunCgroupError>,
         /// kills the run cgroup at run end or abort.
         pub kill: &'a dyn Fn(&RunCgroup, CgroupKillReason) -> CgroupKillEvent,
         /// resolves attended asks (defaults to `ask::tty_prompt`).
@@ -295,6 +301,8 @@ mod linux {
         fn default() -> Self {
             Self {
                 probe: &|parent| cgroup::probe_delegation(parent, PROBE_TIMEOUT),
+                create_cgroup: &RunCgroup::create,
+                bind_lock: &RunCgroup::bind_lock,
                 kill: &RunCgroup::kill_all,
                 prompter: &crate::supervisor::ask::tty_prompt,
                 capabilities: &preflight::probe,
@@ -369,7 +377,7 @@ mod linux {
         // a snapshot run needs a writable delegated cgroup with working clone3 entry,
         // lock xattrs, freeze, thaw and kill; refuse before any run directory or broker
         // exists (cli.md section 1, ADR-0024 decision 2).
-        let (run_id, run_cgroup, located_parent) = if spec.snapshot_integrity {
+        let (run_id, recorded_cgroup, located_parent) = if spec.snapshot_integrity {
             let parent = CgroupParent::locate()?;
             (hooks.probe)(parent.path()).map_err(|source| RunCgroupError::Probe { source })?;
             let id = crate::recorder::generate_run_id(SystemTime::now())?;
@@ -391,6 +399,30 @@ mod linux {
             Some(WorkspaceLock::acquire(&spec.state_root, &spec.workspace)?)
         } else {
             None
+        };
+
+        // the run cgroup of a snapshot run is created here, from the pre-generated run id and
+        // before the run directory and the broker exist, so every way its setup can fail
+        // leaves no run directory and no broker behind. it is empty, has no run.lock to
+        // match, and `cleanup_stale` skips a cgroup without one, so no other run touches it.
+        // its drop removes it on any early return below; the run lock is taken and bound
+        // once the run directory exists (`bind_run_cgroup`).
+        let run_cgroup = match (located_parent.as_ref(), run_id.as_deref()) {
+            (Some(parent), Some(id)) => {
+                let cgroup = (hooks.create_cgroup)(parent, id)?;
+                let recorded = recorded_cgroup
+                    .as_deref()
+                    .ok_or(RunCgroupError::MissingPath)?;
+                if cgroup.path() != recorded {
+                    return Err(RunCgroupError::PathMismatch {
+                        created: cgroup.path().to_path_buf(),
+                        recorded: recorded.to_path_buf(),
+                    }
+                    .into());
+                }
+                Some(cgroup)
+            }
+            _ => None,
         };
 
         // a snapshot run always uses the copy backend: overlay stays gated (ADR-0009,
@@ -417,7 +449,7 @@ mod linux {
             argv: spec.argv.clone(),
             workspace: spec.workspace.clone(),
             start_ts: now_ms()?,
-            run_cgroup,
+            run_cgroup: recorded_cgroup,
         };
         let run_dir = match run_id {
             Some(id) => RunDir::create_with_id(&spec.state_root, &meta, id)?,
@@ -433,6 +465,7 @@ mod linux {
             enforcement.ruleset.as_ref(),
             &enforcement.resolved_hosts,
             located_parent.as_ref(),
+            run_cgroup,
             cgroup_mounts.as_ref(),
             workspace_lock.as_ref(),
             &hooks,
@@ -644,6 +677,7 @@ mod linux {
             None,
             None,
             None,
+            None,
             &SessionHooks::default(),
         )
     }
@@ -658,6 +692,7 @@ mod linux {
         prepared_ruleset: Option<&PreparedRuleset>,
         resolved_hosts: &HashMap<String, Vec<IpAddr>>,
         located_parent: Option<&CgroupParent>,
+        run_cgroup: Option<RunCgroup>,
         cgroup_mounts: Option<&CgroupMounts>,
         workspace_lock: Option<&WorkspaceLock>,
         hooks: &SessionHooks<'_>,
@@ -669,6 +704,10 @@ mod linux {
             return Err(SessionError::Run(
                 crate::supervisor::run::RunError::SnapshotIntegrityNeedsCgroupMounts,
             ));
+        }
+        // a snapshot run arrives with its run cgroup already created (`run_session`)
+        if spec.snapshot_integrity && (run_cgroup.is_none() || located_parent.is_none()) {
+            return Err(RunCgroupError::MissingPath.into());
         }
         // an enforce run resolves its state root once, here, before any process exists: the
         // implicit deny compares resolved paths against this value (FR-21, ADR-0024). a root
@@ -695,9 +734,25 @@ mod linux {
         // step 4: run_start is appended and synced before the child exists, so any run
         // that produced a child also left durable evidence that it did (cli.md section 5)
         let mode = meta.mode;
-        let recorded_cgroup = meta.run_cgroup.clone();
         writer.append(meta.start_ts, EventBody::RunStart(meta))?;
         writer.sync()?;
+
+        // a snapshot run holds its run lock for the whole run, binds its run cgroup to it
+        // and cleans up the cgroups of dead runs (ADR-0024 decisions 2 and 17). the lock is
+        // close-on-exec and the broker closes every other descriptor as its first act
+        // (broker.rs), so taking it before the broker forks is safe. a failure here is
+        // recorded and removes the cgroup before any broker or child exists.
+        let snapshot_cgroup = match (located_parent, run_cgroup) {
+            (Some(parent), Some(cgroup)) => Some(bind_run_cgroup(
+                &spec.state_root,
+                run_dir,
+                hooks,
+                parent,
+                cgroup,
+                writer,
+            )?),
+            _ => None,
+        };
 
         let broker = match mode {
             Mode::RecordOnly => None,
@@ -717,17 +772,6 @@ mod linux {
             }
             (root, _) => root,
         };
-
-        // a snapshot run holds its run lock for the whole run, cleans up the cgroups of
-        // dead runs, then creates its own and binds it to the lock. taken after the broker
-        // forks so the broker never inherits the lock (ADR-0024 decisions 2 and 17).
-        let snapshot_cgroup = start_run_cgroup(
-            spec,
-            run_dir,
-            recorded_cgroup.as_deref(),
-            located_parent,
-            writer,
-        )?;
 
         // step 0: the workspace as it was before the agent started, captured with the run
         // cgroup in place and before `clone3` creates the agent, so no process of the tree
@@ -859,31 +903,31 @@ mod linux {
         })
     }
 
-    /// the run lock and run cgroup of a snapshot run, with stale-cgroup cleanup between
-    /// them; `None` for every other run. the cleanup is recorded in the new run's trace.
-    fn start_run_cgroup<S: TraceSink>(
-        spec: &SessionSpec,
+    /// take the run lock of a snapshot run, bind the already created run cgroup to it, and
+    /// clean up the cgroups of dead runs, which are recorded in the new run's trace.
+    ///
+    /// a failure to take or bind the lock leaves the run directory and its `run_start`, so
+    /// it is recorded as a `cgroup_kill` abort event naming the error, and the empty run
+    /// cgroup is removed before the error is returned.
+    fn bind_run_cgroup<S: TraceSink>(
+        state_root: &Path,
         run_dir: &RunDir,
-        recorded: Option<&Path>,
-        located_parent: Option<&CgroupParent>,
+        hooks: &SessionHooks<'_>,
+        parent: &CgroupParent,
+        cgroup: RunCgroup,
         writer: &mut TraceWriter<S>,
-    ) -> Result<Option<(RunLock, RunCgroup)>, SessionError> {
-        if !spec.snapshot_integrity {
-            return Ok(None);
-        }
-        let recorded = recorded.ok_or(RunCgroupError::MissingPath)?;
-        let opened_parent;
-        let parent = match located_parent {
-            Some(parent) => parent,
-            None => {
-                let parent_path = recorded.parent().ok_or(RunCgroupError::MissingPath)?;
-                opened_parent = CgroupParent::open_writable(parent_path)?;
-                opened_parent.probe()?;
-                &opened_parent
+    ) -> Result<(RunLock, RunCgroup), SessionError> {
+        let lock = match RunLock::acquire(&run_dir.path).and_then(|lock| {
+            (hooks.bind_lock)(&cgroup, &lock)?;
+            Ok(lock)
+        }) {
+            Ok(lock) => lock,
+            Err(cause) => {
+                abandon_run_cgroup(cgroup, &cause, writer);
+                return Err(cause.into());
             }
         };
-        let lock = RunLock::acquire(&run_dir.path)?;
-        match cleanup_stale(parent, &spec.state_root, Some(&run_dir.id)) {
+        match cleanup_stale(parent, state_root, Some(&run_dir.id)) {
             Ok(events) => {
                 for event in events {
                     writer.append(now_ms()?, EventBody::CgroupKill(event))?;
@@ -893,16 +937,28 @@ mod linux {
             // new run does not depend on it, so say so and go on
             Err(e) => eprintln!("leash: could not scan for stale run cgroups: {e}"),
         }
-        let cgroup = RunCgroup::create(parent, &run_dir.id)?;
-        cgroup.bind_lock(&lock)?;
-        if cgroup.path() != recorded {
-            return Err(RunCgroupError::PathMismatch {
-                created: cgroup.path().to_path_buf(),
-                recorded: recorded.to_path_buf(),
-            }
-            .into());
+        Ok((lock, cgroup))
+    }
+
+    /// remove a run cgroup that no process ever entered and record why in the trace: the
+    /// run cannot go on, and its `run_start` is already durable. the trace write is best
+    /// effort, because the run fails with `cause` either way.
+    fn abandon_run_cgroup<S: TraceSink>(
+        mut cgroup: RunCgroup,
+        cause: &RunCgroupError,
+        writer: &mut TraceWriter<S>,
+    ) {
+        let event = crate::recorder::CgroupKillEvent {
+            reason: CgroupKillReason::Abort,
+            cgroup: cgroup.name().to_string(),
+            processes: Some(0),
+            error: Some(cause.to_string()),
+            removal_error: cgroup.remove().err().map(|e| e.to_string()),
+        };
+        if let Ok(ts) = now_ms() {
+            let _ = writer.append(ts, EventBody::CgroupKill(event));
+            let _ = writer.sync();
         }
-        Ok(Some((lock, cgroup)))
     }
 
     /// wall-clock milliseconds; a clock before the epoch cannot stamp anything sane.

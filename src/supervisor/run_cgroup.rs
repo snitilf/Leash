@@ -3,8 +3,9 @@
 //!
 //! a snapshot run puts the agent's whole process tree in a cgroup named `leash-<run-id>`,
 //! a child of Leash's own cgroup, with no controllers enabled. the supervisor and the
-//! broker stay in their own cgroup. the cgroup is created before spawn, bound to its run
-//! lock through the `user.leash.lock` xattr, entered atomically through
+//! broker stay in their own cgroup. the cgroup is created first, before the run directory and
+//! the broker exist, so a setup failure leaves neither behind; it is bound to its run
+//! lock through the `user.leash.lock` xattr once the run directory exists, entered atomically through
 //! `clone3(CLONE_INTO_CGROUP)` (see `spawn`), and killed and removed depth-first when the
 //! run ends or aborts.
 //!
@@ -101,7 +102,7 @@ pub enum RunCgroupError {
         #[source]
         source: io::Error,
     },
-    /// a snapshot run reached spawn without a recorded run cgroup.
+    /// a snapshot run reached its run lifecycle without a created or recorded run cgroup.
     #[error("a snapshot run needs a run cgroup path in its metadata")]
     MissingPath,
     /// the created cgroup is not the one the run metadata names.
@@ -251,17 +252,6 @@ impl CgroupParent {
             ))
         })?;
         let parent = Self::open(&path).map_err(|e| locate(&path.display().to_string(), e))?;
-        parent.ensure_writable()?;
-        Ok(parent)
-    }
-
-    /// pin the cgroup directory at `path`, which must be on a cgroup2 filesystem, and
-    /// require that it is writable: creating, killing and removing children all need it.
-    pub fn open_writable(path: &Path) -> Result<Self, RunCgroupError> {
-        let parent = Self::open(path).map_err(|source| RunCgroupError::Create {
-            path: path.to_path_buf(),
-            source,
-        })?;
         parent.ensure_writable()?;
         Ok(parent)
     }

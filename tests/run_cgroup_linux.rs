@@ -37,7 +37,8 @@ use leash::sandbox::filter::build_filter;
 use leash::supervisor::cgroup::{self, Cgroup};
 use leash::supervisor::run::{RunConfig, RunError, run_loop};
 use leash::supervisor::run_cgroup::{
-    CgroupParent, RunCgroup, RunCgroupError, RunCgroupState, cleanup_stale, run_cgroup_gone,
+    CgroupParent, RunCgroup, RunCgroupError, RunCgroupState, RunLock, cleanup_stale,
+    run_cgroup_gone,
 };
 use leash::supervisor::session::{
     ExitDisposition, SessionError, SessionHooks, SessionSpec, run_session, run_session_with_hooks,
@@ -1803,11 +1804,148 @@ fn a_populated_leftover_probe_cgroup_is_never_killed_or_removed() {
     let run = session.run(&["/bin/true"]).unwrap();
     run.assert_exit_zero();
 
-    assert!(populated.cgroup.exists(), "the populated cgroup was removed");
+    assert!(
+        populated.cgroup.exists(),
+        "the populated cgroup was removed"
+    );
     assert!(populated.sleeper_alive(), "a process in it was killed");
     assert!(
         run.of_type("cgroup_kill").is_empty(),
         "nothing named leash-probe is cleaned while populated: {:?}",
         run.events
     );
+}
+
+/// the names of the run cgroups (`leash-<run id>`, not the probe's) under `parent`.
+fn run_cgroup_names(parent: &CgroupParent) -> BTreeSet<String> {
+    std::fs::read_dir(parent.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.starts_with("leash-") && !name.starts_with("leash-probe-"))
+        .collect()
+}
+
+fn create_failure() -> RunCgroupError {
+    RunCgroupError::Create {
+        path: PathBuf::from("/injected"),
+        source: io::Error::other("injected failure"),
+    }
+}
+
+#[test]
+fn a_run_cgroup_that_cannot_be_created_refuses_before_any_run_directory() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("create_failure") {
+        return;
+    }
+    let session = Session::new();
+    let parent = CgroupParent::locate().unwrap();
+    let before = run_cgroup_names(&parent);
+    let failing_create = |_: &CgroupParent, _: &str| Err(create_failure());
+    let result = run_session_with_hooks(
+        session.spec(&["/bin/true"], Attendance::Unattended),
+        SessionHooks {
+            create_cgroup: &failing_create,
+            ..SessionHooks::default()
+        },
+    );
+    let error = result.as_ref().expect_err("a create failure must refuse");
+    assert!(
+        matches!(
+            error,
+            SessionError::RunCgroup(RunCgroupError::Create { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(
+        !session.state.path().join("runs").exists(),
+        "the run cgroup comes before the run directory, so none exists"
+    );
+    assert_eq!(run_cgroup_names(&parent), before, "no cgroup is left");
+    assert_eq!(session_exit_code(result), ExitCode::from(125));
+}
+
+#[test]
+fn a_run_directory_failure_removes_the_run_cgroup_created_before_it() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("run_dir_failure") {
+        return;
+    }
+    let session = Session::new();
+    let parent = CgroupParent::locate().unwrap();
+    let before = run_cgroup_names(&parent);
+    // a file where the runs directory belongs makes the run directory impossible to create
+    std::fs::write(session.state.path().join("runs"), "").unwrap();
+    let created = std::cell::Cell::new(0);
+    let counting_create = |parent: &CgroupParent, id: &str| {
+        created.set(created.get() + 1);
+        RunCgroup::create(parent, id)
+    };
+    let result = run_session_with_hooks(
+        session.spec(&["/bin/true"], Attendance::Unattended),
+        SessionHooks {
+            create_cgroup: &counting_create,
+            ..SessionHooks::default()
+        },
+    );
+    assert!(result.is_err(), "no run directory means no run");
+    assert_eq!(created.get(), 1, "the run cgroup came first");
+    assert_eq!(run_cgroup_names(&parent), before, "the cgroup was removed");
+    assert_eq!(session_exit_code(result), ExitCode::from(125));
+}
+
+#[test]
+fn a_lock_that_cannot_be_bound_removes_the_run_cgroup_and_records_the_abort() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("bind_failure") {
+        return;
+    }
+    let session = Session::new();
+    let parent = CgroupParent::locate().unwrap();
+    let before = run_cgroup_names(&parent);
+    let failing_bind = |_: &RunCgroup, _: &RunLock| Err(create_failure());
+    let result = run_session_with_hooks(
+        session.spec(&["/bin/true"], Attendance::Unattended),
+        SessionHooks {
+            bind_lock: &failing_bind,
+            ..SessionHooks::default()
+        },
+    );
+    let error = result.as_ref().expect_err("a bind failure must refuse");
+    assert!(
+        matches!(
+            error,
+            SessionError::RunCgroup(RunCgroupError::Create { .. })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(run_cgroup_names(&parent), before, "the cgroup was removed");
+
+    // the run directory exists, so the failure is recorded: run_start, then the abort of the
+    // empty cgroup naming the error, and no run_end
+    let runs: Vec<_> = std::fs::read_dir(session.state.path().join("runs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let events = trace_events(&runs[0]);
+    let types: Vec<_> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(types, ["run_start", "cgroup_kill"], "{events:?}");
+    assert_eq!(events[1]["reason"], "abort");
+    assert_eq!(events[1]["processes"], 0);
+    assert!(
+        events[1]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("injected failure")),
+        "{:?}",
+        events[1]
+    );
+    assert!(events[1].get("removal_error").is_none(), "{:?}", events[1]);
+    let recorded = PathBuf::from(events[0]["run_cgroup"].as_str().unwrap());
+    let id = recorded.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        run_cgroup_gone(&recorded, id.strip_prefix("leash-").unwrap()).unwrap(),
+        RunCgroupState::Gone
+    );
+    assert_eq!(session_exit_code(result), ExitCode::from(125));
 }
