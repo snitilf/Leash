@@ -36,12 +36,19 @@ const LOCKS_DIR: &CStr = c"locks";
 /// why the workspace lock could not be taken.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceLockError {
-    /// another run or rewind holds the lock.
+    /// the `flock` on the workspace directory is held: another leash run or rewind, or any
+    /// other process that locked the directory.
+    #[error(
+        "the workspace directory is locked by another process ({}); wait for it to finish",
+        .0.display()
+    )]
+    Held(PathBuf),
+    /// the `flock` on the state-root lock file is held.
     #[error(
         "another leash run or rewind owns this workspace ({}); wait for it to finish",
         .0.display()
     )]
-    Held(PathBuf),
+    StateLockHeld(PathBuf),
     /// the lock file could not be set up under the state root.
     #[error("workspace lock {op} failed for {}: {source}", .path.display())]
     Io {
@@ -155,7 +162,7 @@ impl WorkspaceLock {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let e = io::Error::last_os_error();
             return Err(if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                WorkspaceLockError::Held(lock_path.clone())
+                WorkspaceLockError::StateLockHeld(lock_path.clone())
             } else {
                 fail("lock")(e)
             });
@@ -248,9 +255,35 @@ mod tests {
         assert!(matches!(err, WorkspaceLockError::Held(_)), "{err:?}");
         assert!(
             err.to_string()
-                .contains("another leash run or rewind owns this workspace")
+                .contains("the workspace directory is locked by another process")
         );
         drop(first);
+        WorkspaceLock::acquire(state.path(), ws.path()).unwrap();
+    }
+
+    #[test]
+    fn a_held_state_root_lock_file_is_refused_with_its_own_message() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(ws.path()).unwrap();
+        let locks = state.path().join("locks");
+        std::fs::create_dir(&locks).unwrap();
+        let file = File::create(locks.join(lock_file_name(&canonical))).unwrap();
+        // SAFETY: flock takes a live descriptor and scalar flags.
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let err = WorkspaceLock::acquire(state.path(), ws.path()).unwrap_err();
+        assert!(
+            matches!(err, WorkspaceLockError::StateLockHeld(_)),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("another leash run or rewind owns this workspace")
+        );
+        drop(file);
         WorkspaceLock::acquire(state.path(), ws.path()).unwrap();
     }
 
@@ -318,7 +351,7 @@ mod tests {
         assert!(matches!(err, WorkspaceLockError::Held(_)), "{err:?}");
         assert!(
             err.to_string()
-                .contains("another leash run or rewind owns this workspace")
+                .contains("the workspace directory is locked by another process")
         );
         assert!(
             !second_state.path().join("locks").exists(),

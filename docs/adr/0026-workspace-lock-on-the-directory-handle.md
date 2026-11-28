@@ -33,7 +33,7 @@ A path can name a different directory between the two.
 - A leftover process that holds the `flock` on the workspace directory blocks later runs and rewinds on it.
   That fails closed.
   Examples are a stray process that inherited the descriptor, or an operator's `flock(1)` on the directory.
-  The agent's own processes are killed with the run cgroup, so they cannot outlive the run holding it.
+  In a snapshot run the agent's own processes die with the run cgroup, so they cannot outlive the run holding the lock.
 - The lock is advisory.
   A process that does not call `flock` is not excluded, and external writers stay the operator contract of ADR-0022.
 - A filesystem that does not support `flock` on a directory refuses the run with an I/O error, which is fail-closed.

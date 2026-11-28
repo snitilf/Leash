@@ -105,7 +105,7 @@ Implementation notes, with the constants chosen:
   It is keyed by the directory inode, so it does not depend on the state root or on the spelling of the path, and a run with a different `--state-dir` is refused too (ADR-0026).
   The second is on `<state_root>/locks/<sha256 of the canonical workspace path>.lock`, taken `O_NOFOLLOW` through handles beneath the state root.
   The canonical path is read from the directory handle, so no path is resolved twice.
-  A held lock refuses the run before spawn: "another leash run or rewind owns this workspace".
+  A held lock refuses the run before spawn: "the workspace directory is locked by another process" (the state-root lock file refuses with "another leash run or rewind owns this workspace").
   `workspace_lock::WorkspaceLock::acquire` takes both locks and is the helper `leash rewind` reuses.
   A leftover process that holds the directory `flock` blocks later runs, which fails closed.
   The broker does not hold the locks because `broker_child` calls `close_all_except` as its first act (`broker.rs`), not because the descriptors are close-on-exec.

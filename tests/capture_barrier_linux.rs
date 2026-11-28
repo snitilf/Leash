@@ -700,6 +700,10 @@ fn run_negative_control(workload: Workload, name: &str) {
 
 #[test]
 fn negative_control_an_unfrozen_capture_of_a_persistent_fd_writer_shows_drift() {
+    // on this kernel the store's own change check catches the unfrozen capture of an
+    // appending writer first, so this control proves the barrier through `capture_failed`
+    // (`Unfrozen::CaptureFailed`) and not through the head/tail drift invariant. the drift
+    // branch stays for a kernel or store where the change check does not fire
     run_negative_control(Workload::PersistentFd, "persistent_fd_control");
 }
 
@@ -1538,7 +1542,7 @@ fn a_second_run_on_a_locked_workspace_is_refused_before_it_spawns() {
         second
             .unwrap_err()
             .to_string()
-            .contains("another leash run or rewind owns this workspace")
+            .contains("the workspace directory is locked by another process")
     );
     assert!(!harness.ws.join("second-agent-ran").exists());
     assert_eq!(
