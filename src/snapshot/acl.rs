@@ -52,7 +52,9 @@ fn entries(blob: &[u8]) -> Result<Vec<Entry>, &'static str> {
         return Err("length is not a whole number of 8-byte entries");
     }
     Ok(body
-        .chunks_exact(ENTRY)
+        .as_chunks::<ENTRY>()
+        .0
+        .iter()
         .map(|c| Entry {
             tag: u16::from_le_bytes([c[0], c[1]]),
             perm: u16::from_le_bytes([c[2], c[3]]),
@@ -196,7 +198,11 @@ mod tests {
         ]);
         assert_eq!(validate_blob(&with_group), Ok(()));
         // a default ACL may be the bare three entries
-        let bare = blob(&[(USER_OBJ, 7, UNDEF), (GROUP_OBJ, 5, UNDEF), (OTHER, 0, UNDEF)]);
+        let bare = blob(&[
+            (USER_OBJ, 7, UNDEF),
+            (GROUP_OBJ, 5, UNDEF),
+            (OTHER, 0, UNDEF),
+        ]);
         assert_eq!(validate_blob(&bare), Ok(()));
     }
 
@@ -229,7 +235,11 @@ mod tests {
             let b = blob(&[(USER_OBJ, 7, UNDEF), (tag, 0, UNDEF), (OTHER, 0, UNDEF)]);
             assert!(validate_blob(&b).is_err(), "tag {tag:#x}");
         }
-        let b = blob(&[(USER_OBJ, 8, UNDEF), (GROUP_OBJ, 4, UNDEF), (OTHER, 0, UNDEF)]);
+        let b = blob(&[
+            (USER_OBJ, 8, UNDEF),
+            (GROUP_OBJ, 4, UNDEF),
+            (OTHER, 0, UNDEF),
+        ]);
         assert!(validate_blob(&b).is_err());
     }
 
@@ -246,7 +256,11 @@ mod tests {
             (OTHER, 0, UNDEF),
         ]);
         assert!(validate_blob(&two_owners).is_err());
-        let misordered = blob(&[(USER_OBJ, 7, UNDEF), (OTHER, 0, UNDEF), (GROUP_OBJ, 4, UNDEF)]);
+        let misordered = blob(&[
+            (USER_OBJ, 7, UNDEF),
+            (OTHER, 0, UNDEF),
+            (GROUP_OBJ, 4, UNDEF),
+        ]);
         assert!(validate_blob(&misordered).is_err());
         // a named user needs a mask
         let no_mask = blob(&[
@@ -288,7 +302,11 @@ mod tests {
     fn an_id_on_an_unnamed_entry_is_refused() {
         let b = blob(&[(USER_OBJ, 7, 0), (GROUP_OBJ, 4, UNDEF), (OTHER, 0, UNDEF)]);
         assert!(validate_blob(&b).is_err());
-        let b = blob(&[(USER_OBJ, 7, UNDEF), (GROUP_OBJ, 4, UNDEF), (OTHER, 0, 1000)]);
+        let b = blob(&[
+            (USER_OBJ, 7, UNDEF),
+            (GROUP_OBJ, 4, UNDEF),
+            (OTHER, 0, 1000),
+        ]);
         assert!(validate_blob(&b).is_err());
     }
 
@@ -314,7 +332,11 @@ mod tests {
         assert!(check_mode(&extended(), 0o740).is_err());
         assert!(check_mode(&extended(), 0o751).is_err());
         // without a mask the group entry stands in for it
-        let bare = blob(&[(USER_OBJ, 6, UNDEF), (GROUP_OBJ, 4, UNDEF), (OTHER, 0, UNDEF)]);
+        let bare = blob(&[
+            (USER_OBJ, 6, UNDEF),
+            (GROUP_OBJ, 4, UNDEF),
+            (OTHER, 0, UNDEF),
+        ]);
         assert_eq!(check_mode(&bare, 0o640), Ok(()));
         assert!(check_mode(&bare, 0o660).is_err());
     }
