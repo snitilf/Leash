@@ -359,10 +359,14 @@ mod linux {
             (None, None, None)
         };
 
-        // a snapshot run owns its workspace for the whole run (ADR-0024 decision 13). the
-        // lock is taken before any run directory exists, so a refused run leaves nothing
-        // behind, and it is close-on-exec, so neither the broker nor the agent holds it.
-        let _workspace_lock = if spec.snapshot_integrity {
+        // a snapshot run owns its workspace for the whole run (ADR-0024 decision 13,
+        // ADR-0026): an flock on the workspace directory handle and one on a file under the
+        // state root. both are taken before any run directory exists, so a refused run leaves
+        // nothing behind. the broker does not hold them because broker_child calls
+        // close_all_except as its first act (broker.rs), and the agent child closes every
+        // descriptor above 2 before execve, so neither inherits the lock. the directory
+        // handle is reused for every capture of the run.
+        let workspace_lock = if spec.snapshot_integrity {
             std::fs::create_dir_all(&spec.state_root).map_err(SessionError::StateRoot)?;
             Some(WorkspaceLock::acquire(&spec.state_root, &spec.workspace)?)
         } else {
@@ -410,6 +414,7 @@ mod linux {
             &enforcement.resolved_hosts,
             located_parent.as_ref(),
             cgroup_mounts.as_ref(),
+            workspace_lock.as_ref(),
             &hooks,
         )
     }
@@ -633,6 +638,7 @@ mod linux {
         resolved_hosts: &HashMap<String, Vec<IpAddr>>,
         located_parent: Option<&CgroupParent>,
         cgroup_mounts: Option<&CgroupMounts>,
+        workspace_lock: Option<&WorkspaceLock>,
         hooks: &SessionHooks<'_>,
     ) -> Result<SessionOutcome, SessionError> {
         refuse_snapshot_integrity_outside_enforce(spec)?;
@@ -707,8 +713,19 @@ mod linux {
         // exists to write while it is captured (ADR-0024 decision 10). its digest is
         // committed in a step event before the agent exists.
         let capture = if spec.snapshot_integrity {
-            let capture = StoreCapture::open(
-                &spec.workspace,
+            // capture goes through a duplicate of the handle the workspace lock holds, so the
+            // locked directory is the captured directory (ADR-0026)
+            let workspace_dir = workspace_lock
+                .ok_or_else(|| {
+                    SessionError::SnapshotStore(std::io::Error::other(
+                        "a snapshot run needs the workspace lock",
+                    ))
+                })?
+                .workspace_dir()
+                .try_clone()
+                .map_err(SessionError::SnapshotStore)?;
+            let capture = StoreCapture::with_workspace(
+                workspace_dir,
                 &run_dir.path.join("snapshots"),
                 hooks.limits,
             )

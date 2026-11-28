@@ -106,8 +106,16 @@ impl StoreCapture {
     /// open `workspace` and `store_dir` as pinned directory handles. both are opened
     /// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, so a symlink in either place is refused.
     pub fn open(workspace: &Path, store_dir: &Path, limits: Limits) -> io::Result<Self> {
+        Self::with_workspace(open_pinned_dir(workspace)?, store_dir, limits)
+    }
+
+    /// capture through an already open workspace directory handle, and open `store_dir` as a
+    /// pinned handle. the run passes a duplicate of the handle its workspace lock holds, so
+    /// the directory that is locked is the directory that is captured, with no second
+    /// resolution of a path between the two (ADR-0026).
+    pub fn with_workspace(workspace: File, store_dir: &Path, limits: Limits) -> io::Result<Self> {
         Ok(Self {
-            workspace: open_pinned_dir(workspace)?,
+            workspace,
             store: open_pinned_dir(store_dir)?,
             limits,
             committed: RefCell::new(Vec::new()),

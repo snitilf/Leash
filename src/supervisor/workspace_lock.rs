@@ -1,15 +1,25 @@
-//! the workspace lock of a snapshot run or a rewind (ADR-0024 decision 13).
+//! the workspace lock of a snapshot run or a rewind (ADR-0024 decision 13, ADR-0026).
 //!
 //! assumptions: the lock excludes other Leash operations on one workspace, not external
-//! writers, which stay the operator's contract (ADR-0022). it is an exclusive,
-//! non-blocking `flock` on `<state_root>/locks/<sha256 of the canonical workspace path>.lock`,
-//! so two spellings of one directory share a lock and two directories never do. the kernel
-//! drops it when the holder dies, so a crashed run never leaves a stale lock. the state
-//! root is opened once and every component beneath it goes through that handle with
-//! `O_NOFOLLOW`, so a planted symlink under the state root cannot redirect the lock file.
+//! writers, which stay the operator's contract (ADR-0022). it is two exclusive,
+//! non-blocking `flock`s, both dropped by the kernel when the holder dies, so a crashed run
+//! never leaves a stale lock:
 //!
-//! `leash run` takes it before any run directory exists and holds it for the whole run;
-//! `leash rewind` takes the same lock through `WorkspaceLock::acquire`.
+//! 1. an `flock` on the workspace directory itself, through a handle opened once. the lock
+//!    is keyed by the directory inode, so it is independent of the state root and of every
+//!    spelling of the path, and it stops a run that names the same workspace under a
+//!    different `--state-dir`. the same handle is given to capture, so the directory that
+//!    is locked is the directory that is captured and no path is resolved twice.
+//! 2. an `flock` on `<state_root>/locks/<sha256 of the canonical workspace path>.lock`,
+//!    where the canonical path is read from the handle. the state root is opened once and
+//!    every component beneath it goes through that handle with `O_NOFOLLOW`, so a planted
+//!    symlink under the state root cannot redirect the lock file.
+//!
+//! a leftover process that still holds the directory `flock` (an inherited descriptor in a
+//! stray process) blocks later runs and rewinds on that workspace. that fails closed.
+//!
+//! `leash run` takes both locks before any run directory exists and holds them for the
+//! whole run; `leash rewind` takes both through `WorkspaceLock::acquire`.
 
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
@@ -48,6 +58,9 @@ pub enum WorkspaceLockError {
 /// the exclusive lock on one workspace, held until dropped.
 #[derive(Debug)]
 pub struct WorkspaceLock {
+    /// the workspace directory handle that carries the directory `flock`.
+    workspace: File,
+    /// the state-root lock file that carries the second `flock`.
     _file: File,
     path: PathBuf,
 }
@@ -65,12 +78,27 @@ pub fn lock_file_name(canonical_workspace: &Path) -> String {
 }
 
 impl WorkspaceLock {
-    /// take the lock for `workspace` under `state_root`, without blocking. `workspace` is
-    /// canonicalized here so every spelling of one directory maps to one lock.
+    /// take both locks for `workspace` under `state_root`, without blocking.
+    ///
+    /// the workspace is opened once here, following symlinks in its spelling, and the
+    /// directory lock is taken on that handle before anything is created under
+    /// `state_root`. the lock file name comes from the canonical path of the handle, so
+    /// every spelling of one directory maps to one lock and there is no
+    /// canonicalize-then-open window. `workspace_dir` returns the same handle for capture.
     pub fn acquire(state_root: &Path, workspace: &Path) -> Result<Self, WorkspaceLockError> {
-        let canonical = workspace
-            .canonicalize()
-            .map_err(|source| io_error("canonicalize", workspace, source))?;
+        let dir = open_dir(libc::AT_FDCWD, workspace.as_os_str(), false)
+            .map_err(|source| io_error("open workspace", workspace, source))?;
+        // SAFETY: flock takes a live descriptor and scalar flags.
+        if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let e = io::Error::last_os_error();
+            return Err(if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                WorkspaceLockError::Held(workspace.to_path_buf())
+            } else {
+                io_error("lock workspace", workspace, e)
+            });
+        }
+        let canonical = canonical_path_of(&dir, workspace)
+            .map_err(|source| io_error("resolve workspace", workspace, source))?;
         let name = lock_file_name(&canonical);
         let lock_path = state_root.join("locks").join(&name);
         let fail = |op: &'static str| {
@@ -133,15 +161,37 @@ impl WorkspaceLock {
             });
         }
         Ok(Self {
+            workspace: dir,
             _file: file,
             path: lock_path,
         })
+    }
+
+    /// the workspace directory handle that holds the directory lock. a duplicate of it
+    /// keeps the lock for as long as the duplicate lives, so capture can hold it directly.
+    pub fn workspace_dir(&self) -> &File {
+        &self.workspace
     }
 
     /// the lock file's path under the state root.
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// the canonical path of the directory a handle names. on linux it is read from the handle
+/// (`/proc/self/fd`), so it is the directory that was opened, never a second resolution of
+/// the spelling.
+#[cfg(target_os = "linux")]
+fn canonical_path_of(dir: &File, _spelling: &Path) -> io::Result<PathBuf> {
+    std::fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+}
+
+/// off linux there is no `/proc`; this build is a development host only, so the spelling is
+/// canonicalized instead.
+#[cfg(not(target_os = "linux"))]
+fn canonical_path_of(_dir: &File, spelling: &Path) -> io::Result<PathBuf> {
+    spelling.canonicalize()
 }
 
 fn io_error(op: &'static str, path: &Path, source: io::Error) -> WorkspaceLockError {
@@ -253,6 +303,83 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let err =
             WorkspaceLock::acquire(state.path(), Path::new("/nonexistent/leash-ws")).unwrap_err();
+        assert!(matches!(err, WorkspaceLockError::Io { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_second_acquire_with_a_different_state_root_is_refused() {
+        // the state-root lock file is keyed by the state root, so two roots never share one;
+        // the lock on the workspace directory itself is what stops the second run
+        let first_state = tempfile::tempdir().unwrap();
+        let second_state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let first = WorkspaceLock::acquire(first_state.path(), ws.path()).unwrap();
+        let err = WorkspaceLock::acquire(second_state.path(), ws.path()).unwrap_err();
+        assert!(matches!(err, WorkspaceLockError::Held(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("another leash run or rewind owns this workspace")
+        );
+        assert!(
+            !second_state.path().join("locks").exists(),
+            "a refused acquire leaves nothing under the second state root"
+        );
+        drop(first);
+        WorkspaceLock::acquire(second_state.path(), ws.path()).unwrap();
+    }
+
+    #[test]
+    fn another_spelling_and_another_state_root_still_share_the_workspace_lock() {
+        let first_state = tempfile::tempdir().unwrap();
+        let second_state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let link_dir = tempfile::tempdir().unwrap();
+        let link = link_dir.path().join("alias");
+        std::os::unix::fs::symlink(ws.path(), &link).unwrap();
+        let _held = WorkspaceLock::acquire(first_state.path(), ws.path()).unwrap();
+        assert!(matches!(
+            WorkspaceLock::acquire(second_state.path(), &link),
+            Err(WorkspaceLockError::Held(_))
+        ));
+    }
+
+    #[test]
+    fn the_lock_holds_the_workspace_directory_handle_it_will_hand_to_capture() {
+        use std::os::unix::fs::MetadataExt;
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let lock = WorkspaceLock::acquire(state.path(), ws.path()).unwrap();
+        let held = lock.workspace_dir().metadata().unwrap();
+        let named = std::fs::metadata(ws.path()).unwrap();
+        assert!(held.is_dir());
+        assert_eq!((held.dev(), held.ino()), (named.dev(), named.ino()));
+        // close-on-exec, so no process the supervisor execs holds the lock
+        // SAFETY: F_GETFD takes a live descriptor and no argument.
+        let flags = unsafe { libc::fcntl(lock.workspace_dir().as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+    }
+
+    #[test]
+    fn a_duplicate_of_the_handle_keeps_the_lock_after_the_lock_value_drops() {
+        let state = tempfile::tempdir().unwrap();
+        let other_state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let lock = WorkspaceLock::acquire(state.path(), ws.path()).unwrap();
+        let dup = lock.workspace_dir().try_clone().unwrap();
+        drop(lock);
+        assert!(matches!(
+            WorkspaceLock::acquire(other_state.path(), ws.path()),
+            Err(WorkspaceLockError::Held(_))
+        ));
+        drop(dup);
+        WorkspaceLock::acquire(other_state.path(), ws.path()).unwrap();
+    }
+
+    #[test]
+    fn a_workspace_that_is_not_a_directory_is_refused() {
+        let state = tempfile::tempdir().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let err = WorkspaceLock::acquire(state.path(), file.path()).unwrap_err();
         assert!(matches!(err, WorkspaceLockError::Io { .. }), "{err:?}");
     }
 }
