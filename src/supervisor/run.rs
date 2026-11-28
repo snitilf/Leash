@@ -23,7 +23,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsFd, FromRawFd};
-use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -36,14 +36,16 @@ use crate::recorder::{
     SyscallEvent, TraceSink, TraceWriter,
 };
 use crate::sandbox::filter::{
-    AUDIT_ARCH_X86_64, DENIED_RECORDED, SNAPSHOT_TRAPPED, X32_SYSCALL_BIT, nr,
+    AUDIT_ARCH_X86_64, DENIED_RECORDED, SNAPSHOT_METADATA, SNAPSHOT_TRAPPED, X32_SYSCALL_BIT, nr,
 };
 use crate::supervisor::ask;
 #[cfg(target_os = "linux")]
 use crate::supervisor::broker::{
     BrokerResult, BrokerResultOrPath, MutationOperation, NetworkOperation,
 };
-use crate::supervisor::fact::{AccessSpec, FsShape, PathArg, flags, fs_shape, syscall_name};
+use crate::supervisor::fact::{
+    AccessSpec, FsShape, PathArg, fd_metadata_name, flags, fs_shape, syscall_name,
+};
 use crate::supervisor::mem::MemReadError;
 #[cfg(target_os = "linux")]
 use crate::supervisor::notify::SECCOMP_ADDFD_FLAG_SEND;
@@ -55,26 +57,90 @@ const CLONE_ARGS_MIN_SIZE: u64 = 8;
 const CLONE_ARGS_MAX_SIZE: u64 = 88;
 const OPEN_HOW_SIZE: usize = 24;
 
+/// the `RESOLVE_*` bits of `openat2(2)`.
+const RESOLVE_NO_XDEV: u64 = 0x01;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_IN_ROOT: u64 = 0x10;
+const RESOLVE_CACHED: u64 = 0x20;
+/// the bits the kernel accepts at all; any other is `EINVAL`.
+const RESOLVE_VALID: u64 = 0x3f;
+/// the bits Leash honors for the caller: they only restrict how the caller's own spelling of
+/// the path may resolve, so Leash checks the spelling against them and still opens the object
+/// the policy judged. `RESOLVE_IN_ROOT` changes what the spelling means and `RESOLVE_CACHED`
+/// changes whether the call may block, and neither is honored.
+const RESOLVE_HONORED: u64 =
+    RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH;
+
+/// the restrictions an `openat2` caller put on how its path may resolve, and what they apply to.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct ChildResolve {
+    /// the honored `RESOLVE_*` bits; zero when the caller asked for none
+    bits: u64,
+    /// where a relative `given` starts from; `None` when that could not be read
+    anchor: Option<DirAnchor>,
+    /// the path as the caller spelled it, before it was anchored
+    given: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 enum FsInvocation {
     Open {
         flags: u64,
         mode: u32,
         unsupported_errno: Option<i32>,
+        resolve: ChildResolve,
     },
     Mutation(MutationInvocation),
 }
 
 #[derive(Debug, Clone)]
 enum MutationInvocation {
-    Truncate { length: i64 },
-    Rename { flags: u32 },
-    Mkdir { mode: u32 },
-    Unlink { flags: i32 },
-    Link { flags: i32 },
-    Symlink { target: Vec<u8> },
-    Chmod { mode: u32 },
-    Chown { uid: u32, gid: u32, flags: i32 },
+    Truncate {
+        length: i64,
+    },
+    Rename {
+        flags: u32,
+    },
+    Mkdir {
+        mode: u32,
+    },
+    Unlink {
+        flags: i32,
+    },
+    Link {
+        flags: i32,
+    },
+    Symlink {
+        target: Vec<u8>,
+    },
+    Chmod {
+        mode: u32,
+    },
+    Chown {
+        uid: u32,
+        gid: u32,
+        flags: i32,
+    },
+    ChmodNoFollow {
+        mode: u32,
+    },
+    Setxattr {
+        name: Vec<u8>,
+        value: Vec<u8>,
+        flags: i32,
+        follow: bool,
+    },
+    Removexattr {
+        name: Vec<u8>,
+        follow: bool,
+    },
+    Utimens {
+        times: Option<[i64; 4]>,
+        flags: i32,
+    },
 }
 
 /// matched-rule ids for a policy-less run (trace.md section 2).
@@ -97,10 +163,19 @@ pub mod rule {
     pub const PIDFD_GETFD: &str = "sr4:pidfd_getfd";
     /// broker path preparation or realization refused the operand
     pub const REALIZATION: &str = "failsafe:realization";
+    /// a metadata call's own arguments are invalid (an unknown flag, an xattr value over
+    /// the kernel's limit), answered with the kernel's errno before any path is judged
+    pub const UNSUPPORTED_OPERAND: &str = "failsafe:unsupported_operand";
     /// `clone3` answered ENOSYS in a snapshot run, before its struct is read (ADR-0024)
     pub const SNAPSHOT_CLONE3: &str = "snapshot:clone3";
     /// legacy AIO denied in a snapshot run (ADR-0024)
     pub const SNAPSHOT_AIO: &str = "snapshot:aio";
+    /// `setxattrat`, `removexattrat` or `file_setattr` answered ENOSYS in a snapshot run:
+    /// they name a path with no open and no libc wrapper uses them yet (ADR-0025)
+    pub const SNAPSHOT_XATTRAT: &str = "snapshot:xattrat";
+    /// a snapshot-only metadata call reached a run that is not a snapshot run, which only a
+    /// filter and flag that disagree can do (ADR-0024 decision 4)
+    pub const SNAPSHOT_METADATA: &str = "snapshot:metadata";
 }
 
 /// how the run ended.
@@ -129,6 +204,10 @@ pub enum RunError {
     /// snapshot integrity restrictions were requested outside enforce mode.
     #[error("snapshot integrity restrictions require enforce mode")]
     SnapshotIntegrityNeedsEnforce,
+    /// snapshot integrity restrictions were requested without the cgroup2 mounts their
+    /// implicit deny protects (ADR-0024 decision 4).
+    #[error("snapshot integrity restrictions require the cgroup2 mounts of the run")]
+    SnapshotIntegrityNeedsCgroupMounts,
     /// the installed seccomp filter and the run's snapshot flag disagree.
     #[error("snapshot filter mismatch: filter installed {installed}, run requires {required}")]
     SnapshotFilterMismatch {
@@ -192,6 +271,10 @@ pub struct RunConfig<'a> {
     /// policy rule (FR-21, ADR-0024). the enforce constructors require it, so an enforce
     /// run cannot be built without one; record-only runs carry none.
     pub state_root: Option<&'a crate::supervisor::state_root::StateRoot>,
+    /// the cgroup2 mounts of the supervisor's mount namespace, denied as an implicit rule
+    /// before any policy rule in a snapshot-integrity run (ADR-0024 decision 4). required
+    /// when `snapshot_integrity` is set; unused otherwise.
+    pub cgroup_mounts: Option<&'a crate::supervisor::cgroup_mounts::CgroupMounts>,
 }
 
 impl std::fmt::Debug for RunConfig<'_> {
@@ -222,6 +305,7 @@ impl<'a> RunConfig<'a> {
             resolved_hosts: None,
             snapshot_integrity: false,
             state_root: None,
+            cgroup_mounts: None,
         }
     }
 
@@ -245,6 +329,7 @@ impl<'a> RunConfig<'a> {
             resolved_hosts: None,
             snapshot_integrity: false,
             state_root: Some(state_root),
+            cgroup_mounts: None,
         }
     }
 
@@ -270,6 +355,7 @@ impl<'a> RunConfig<'a> {
             resolved_hosts: Some(resolved_hosts),
             snapshot_integrity: false,
             state_root: Some(state_root),
+            cgroup_mounts: None,
         }
     }
 
@@ -285,6 +371,15 @@ impl<'a> RunConfig<'a> {
         self
     }
 
+    /// name the cgroup2 mounts a snapshot-integrity run denies (ADR-0024 decision 4).
+    pub fn with_cgroup_mounts(
+        mut self,
+        mounts: &'a crate::supervisor::cgroup_mounts::CgroupMounts,
+    ) -> Self {
+        self.cgroup_mounts = Some(mounts);
+        self
+    }
+
     /// wire step-boundary capture (FR-11); the session passes the run-directory target.
     pub fn with_capture(mut self, capture: &'a dyn crate::snapshot::BoundaryCapture) -> Self {
         self.capture = Some(capture);
@@ -297,6 +392,9 @@ impl<'a> RunConfig<'a> {
         }
         if self.snapshot_integrity && self.mode != crate::recorder::Mode::Enforce {
             return Err(RunError::SnapshotIntegrityNeedsEnforce);
+        }
+        if self.snapshot_integrity && self.cgroup_mounts.is_none() {
+            return Err(RunError::SnapshotIntegrityNeedsCgroupMounts);
         }
         if self.mode == crate::recorder::Mode::Enforce && self.policy.is_none() {
             return Err(RunError::EnforceWithoutPolicy);
@@ -334,6 +432,13 @@ pub(crate) trait Notifier {
     ) -> io::Result<i32>;
     /// duplicate one descriptor from the trapped process.
     fn duplicate_fd(&self, pid: u32, target_fd: RawFd) -> io::Result<OwnedFd>;
+    /// what the trapped process's descriptor is, read from a duplicate of it that is closed
+    /// before this returns. the supervisor may duplicate the agent's descriptors; only the
+    /// agent is denied `pidfd_getfd` (SR-4).
+    fn describe_fd(&self, pid: u32, target_fd: RawFd) -> io::Result<FdFacts> {
+        let duplicate = self.duplicate_fd(pid, target_fd)?;
+        fd_facts(duplicate)
+    }
     /// bounded nul-terminated read from child memory (mem.rs caps).
     fn read_path(&self, pid: u32, addr: u64) -> Result<Vec<u8>, MemReadError>;
     /// bounded fixed-size read from child memory.
@@ -342,8 +447,66 @@ pub(crate) trait Notifier {
     fn read_u64(&self, pid: u32, addr: u64) -> Result<u64, MemReadError>;
     /// the kernel's answer for a relative path's anchor: readlink of /proc cwd or fd/N.
     fn dir_prefix(&self, pid: u32, anchor: DirAnchor) -> io::Result<PathBuf>;
+    /// the directory object a relative path's anchor is, as an `O_PATH` descriptor.
+    ///
+    /// this opens the magic link `/proc/<pid>/cwd` or `/proc/<pid>/fd/<n>`. the kernel follows
+    /// such a link by jumping to the object the process holds, so no path text is walked, and
+    /// the result is the real directory even when its name has changed or is out of the
+    /// supervisor's reach. the open is safe because it targets the agent's own working directory
+    /// or descriptor and yields only a base to resolve from, never an object a policy decision
+    /// is about. the caller checks `id_valid` after it returns and before it uses the result,
+    /// so a recycled pid is never believed.
+    fn open_anchor(&self, pid: u32, anchor: DirAnchor) -> io::Result<OwnedFd>;
     /// whether `target` is the supervised root or a descendant of it.
     fn process_in_tree(&self, root: u32, target: u32) -> io::Result<bool>;
+}
+
+/// what an open descriptor is, as the kernel describes the object and not as its `/proc`
+/// link spells it: the filesystem it is on and its identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FdFacts {
+    /// `f_type` of `fstatfs`: the filesystem magic
+    pub f_type: i64,
+    /// `st_dev` of the object
+    pub dev: u64,
+    /// `st_ino` of the object
+    pub ino: u64,
+}
+
+/// describe an owned descriptor, then close it.
+pub(crate) fn fd_facts(fd: OwnedFd) -> io::Result<FdFacts> {
+    use std::os::unix::fs::MetadataExt;
+    let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is open and statfs is a writable local buffer; fstatfs works on O_PATH.
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), &raw mut statfs) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let metadata = std::fs::File::from(fd).metadata()?;
+    Ok(FdFacts {
+        f_type: statfs.f_type as i64,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+/// the implicit denies that depend on what a descriptor is rather than where its link says
+/// it is: an object on cgroup2, and the state root itself.
+fn fd_identity_deny(config: &RunConfig<'_>, facts: &FdFacts) -> Option<Evaluation> {
+    if let Some(eval) = cgroup2_identity_deny(
+        config,
+        crate::supervisor::cgroup_mounts::is_cgroup2_magic(facts.f_type),
+    ) {
+        return Some(eval);
+    }
+    (config.mode == crate::recorder::Mode::Enforce
+        && config
+            .state_root
+            .is_some_and(|root| root.is_identity(facts.dev, facts.ino)))
+    .then_some(Evaluation {
+        decision: Decision::Deny,
+        matched: crate::policy::MatchId::ImplicitStateRoot,
+        would_deny: None,
+    })
 }
 
 /// where a relative path is anchored.
@@ -402,11 +565,44 @@ fn open_mode(sys_nr: u32, notif: &SeccompNotif) -> u32 {
     }
 }
 
-fn mutation_invocation(
+/// why an operand of a filesystem call could not be turned into a request.
+#[derive(Debug)]
+enum OperandError {
+    /// agent memory could not be read within its cap: case C, denied under
+    /// `failsafe:memory_read`
+    Memory,
+    /// the call's own arguments are invalid, and the kernel would have refused it with this
+    /// errno before looking at any path: the supervisor answers the same errno and records
+    /// it under `failsafe:unsupported_operand`
+    Unsupported(i32),
+}
+
+impl From<MemReadError> for OperandError {
+    fn from(_: MemReadError) -> Self {
+        Self::Memory
+    }
+}
+
+/// `AT_EMPTY_PATH`, pinned to the x86-64 value like the other abi constants here.
+const AT_EMPTY_PATH: i32 = 0x1000;
+
+/// whether this call may name its target by an empty path: `utimensat` and `fchmodat2` with
+/// `AT_EMPTY_PATH` act on the object of their directory descriptor when the path is `""`.
+fn empty_path_allowed(sys_nr: u32, notif: &SeccompNotif) -> bool {
+    matches!(sys_nr, nr::UTIMENSAT | nr::FCHMODAT2)
+        && notif.data.args[3] as i32 & AT_EMPTY_PATH != 0
+}
+
+/// decode the call's own arguments. `empty_path` says the path the agent passed was empty and
+/// `AT_EMPTY_PATH` was set, so the call acts on the object `path` already names (the
+/// descriptor's target) and not on something beneath it.
+fn mutation_invocation<N: Notifier>(
+    kernel: &N,
     sys_nr: u32,
     notif: &SeccompNotif,
     path: &std::path::Path,
-) -> Result<MutationInvocation, MemReadError> {
+    empty_path: bool,
+) -> Result<MutationInvocation, OperandError> {
     let invocation = match sys_nr {
         nr::TRUNCATE => MutationInvocation::Truncate {
             length: notif.data.args[1] as i64,
@@ -451,11 +647,130 @@ fn mutation_invocation(
             gid: notif.data.args[3] as u32,
             flags: notif.data.args[4] as i32,
         },
-        _ => {
-            return Err(MemReadError::Io(io::Error::from_raw_os_error(libc::ENOSYS)));
+        nr::LCHOWN => MutationInvocation::Chown {
+            uid: notif.data.args[1] as u32,
+            gid: notif.data.args[2] as u32,
+            flags: AT_SYMLINK_NOFOLLOW,
+        },
+        nr::FCHMODAT2 => {
+            let flags = notif.data.args[3] as i32;
+            if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+                return Err(OperandError::Unsupported(libc::EINVAL));
+            }
+            let mode = notif.data.args[2] as u32;
+            // an empty path names the descriptor's own object, which is not followed
+            if flags & AT_SYMLINK_NOFOLLOW != 0 || empty_path {
+                MutationInvocation::ChmodNoFollow { mode }
+            } else {
+                MutationInvocation::Chmod { mode }
+            }
         }
+        nr::UTIMENSAT => {
+            let flags = notif.data.args[3] as i32;
+            if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+                return Err(OperandError::Unsupported(libc::EINVAL));
+            }
+            MutationInvocation::Utimens {
+                times: read_times(kernel, notif, notif.data.args[2], TimeLayout::Timespec)?,
+                flags: if empty_path {
+                    AT_SYMLINK_NOFOLLOW
+                } else {
+                    flags & AT_SYMLINK_NOFOLLOW
+                },
+            }
+        }
+        nr::UTIMES => MutationInvocation::Utimens {
+            times: read_times(kernel, notif, notif.data.args[1], TimeLayout::Timeval)?,
+            flags: 0,
+        },
+        nr::FUTIMESAT => MutationInvocation::Utimens {
+            times: read_times(kernel, notif, notif.data.args[2], TimeLayout::Timeval)?,
+            flags: 0,
+        },
+        nr::UTIME => MutationInvocation::Utimens {
+            times: read_times(kernel, notif, notif.data.args[1], TimeLayout::Utimbuf)?,
+            flags: 0,
+        },
+        nr::SETXATTR | nr::LSETXATTR => {
+            let size = usize::try_from(notif.data.args[3]).unwrap_or(usize::MAX);
+            if size > XATTR_SIZE_MAX {
+                return Err(OperandError::Unsupported(libc::E2BIG));
+            }
+            let name = kernel.read_path(notif.pid, notif.data.args[1])?;
+            let value = if size == 0 {
+                Vec::new()
+            } else {
+                kernel.read_bytes(notif.pid, notif.data.args[2], size)?
+            };
+            MutationInvocation::Setxattr {
+                name,
+                value,
+                flags: notif.data.args[4] as i32,
+                follow: sys_nr == nr::SETXATTR,
+            }
+        }
+        nr::REMOVEXATTR | nr::LREMOVEXATTR => MutationInvocation::Removexattr {
+            name: kernel.read_path(notif.pid, notif.data.args[1])?,
+            follow: sys_nr == nr::REMOVEXATTR,
+        },
+        _ => return Err(OperandError::Unsupported(libc::ENOSYS)),
     };
     Ok(invocation)
+}
+
+/// the largest xattr value the kernel accepts (`XATTR_SIZE_MAX`).
+const XATTR_SIZE_MAX: usize = 65_536;
+
+/// `AT_SYMLINK_NOFOLLOW`, pinned to the x86-64 value like the other abi constants here, since
+/// the macos dev host's libc disagrees (0x20).
+const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+
+/// how a metadata call lays out the two timestamps behind its `times` pointer.
+#[derive(Clone, Copy)]
+enum TimeLayout {
+    /// `struct timespec[2]`: seconds and nanoseconds, nanoseconds may be UTIME_NOW or OMIT
+    Timespec,
+    /// `struct timeval[2]`: seconds and microseconds
+    Timeval,
+    /// `struct utimbuf`: access and modification seconds
+    Utimbuf,
+}
+
+/// read the timestamps a `utime` family call asks for, as `[atime_sec, atime_nsec,
+/// mtime_sec, mtime_nsec]`; a null pointer means "now" and reads nothing. a microsecond
+/// value too large to scale is left out of range, which the kernel refuses with EINVAL.
+fn read_times<N: Notifier>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    addr: u64,
+    layout: TimeLayout,
+) -> Result<Option<[i64; 4]>, MemReadError> {
+    if addr == 0 {
+        return Ok(None);
+    }
+    let take = |bytes: &[u8], at: usize| {
+        i64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]))
+    };
+    Ok(Some(match layout {
+        TimeLayout::Timespec => {
+            let b = kernel.read_bytes(notif.pid, addr, 32)?;
+            [take(&b, 0), take(&b, 8), take(&b, 16), take(&b, 24)]
+        }
+        TimeLayout::Timeval => {
+            let b = kernel.read_bytes(notif.pid, addr, 32)?;
+            let nsec = |usec: i64| usec.checked_mul(1000).unwrap_or(i64::MAX);
+            [
+                take(&b, 0),
+                nsec(take(&b, 8)),
+                take(&b, 16),
+                nsec(take(&b, 24)),
+            ]
+        }
+        TimeLayout::Utimbuf => {
+            let b = kernel.read_bytes(notif.pid, addr, 16)?;
+            [take(&b, 0), 0, take(&b, 8), 0]
+        }
+    }))
 }
 
 fn resolve_decision(config: &RunConfig<'_>, request: &Request<'_>) -> ResolvedDecision {
@@ -476,9 +791,11 @@ fn evaluate_tracked(
     evaluate_operand(config, request, false, asks)
 }
 
-/// the implicit state-root deny, ranked before every policy rule (FR-21, ADR-0024). it
-/// applies only in an enforce run that carries the root; `destination` marks the second
-/// operand of a rename or link, where naming an ancestor of the root replaces it.
+/// the implicit denies, ranked before every policy rule: the state root (FR-21, ADR-0024
+/// decision 3), the cgroup2 mounts of a snapshot-integrity run (decision 4), and the
+/// supervisor's `/proc` tree. they apply only in an enforce run that carries the root;
+/// `destination` marks the second operand of a rename or link, where naming an ancestor of
+/// a protected path replaces it.
 fn implicit_state_root_deny(
     config: &RunConfig<'_>,
     request: &Request<'_>,
@@ -488,22 +805,30 @@ fn implicit_state_root_deny(
         return None;
     }
     let root = config.state_root?;
-    let (state_root, supervisor_proc) = match request {
+    let cgroups = config.cgroup_mounts.filter(|_| config.snapshot_integrity);
+    let (state_root, cgroup, supervisor_proc) = match request {
         Request::Fs { path, access } => {
             let path = std::path::Path::new(path);
             (
                 root.denies_fs(path, access, destination),
+                cgroups.is_some_and(|m| m.denies_fs(path, access, destination)),
                 root.denies_proc(path),
             )
         }
         Request::Exec { binary } => {
             let binary = std::path::Path::new(binary);
-            (root.denies_exec(binary), root.denies_proc(binary))
+            (
+                root.denies_exec(binary),
+                cgroups.is_some_and(|m| m.denies_exec(binary)),
+                root.denies_proc(binary),
+            )
         }
-        Request::Net { .. } => (false, false),
+        Request::Net { .. } => (false, false, false),
     };
     let matched = if state_root {
         crate::policy::MatchId::ImplicitStateRoot
+    } else if cgroup {
+        crate::policy::MatchId::ImplicitCgroup
     } else if supervisor_proc {
         crate::policy::MatchId::ImplicitSupervisorProc
     } else {
@@ -645,10 +970,10 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
     // a trapped snapshot-filter syscall is denied and recorded whatever the flag says, so
     // a filter and flag that disagree can never allow it unrecorded.
     if SNAPSHOT_TRAPPED.contains(&sys_nr) || (config.snapshot_integrity && sys_nr == nr::CLONE3) {
-        let matched_rule = if sys_nr == nr::CLONE3 {
-            rule::SNAPSHOT_CLONE3
-        } else {
-            rule::SNAPSHOT_AIO
+        let matched_rule = match sys_nr {
+            nr::CLONE3 => rule::SNAPSHOT_CLONE3,
+            nr::SETXATTRAT | nr::REMOVEXATTRAT | nr::FILE_SETATTR => rule::SNAPSHOT_XATTRAT,
+            _ => rule::SNAPSHOT_AIO,
         };
         record(
             writer,
@@ -660,6 +985,26 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
         )?;
         tolerate_dead(kernel.send_error(notif.id, libc::ENOSYS))?;
         return Ok(Handled::Responded);
+    }
+
+    // metadata calls trapped only in a snapshot run (ADR-0024 decision 4). a filter and flag
+    // that disagree deny and record, as the AIO calls do, so one can never pass unrecorded.
+    if SNAPSHOT_METADATA.contains(&sys_nr) && !config.snapshot_integrity {
+        record(
+            writer,
+            ts,
+            notif,
+            syscall_name(sys_nr).unwrap_or("unknown"),
+            Fact::Raw {},
+            &fixed_decision(Decision::Deny, rule::SNAPSHOT_METADATA),
+        )?;
+        tolerate_dead(kernel.send_error(notif.id, libc::ENOSYS))?;
+        return Ok(Handled::Responded);
+    }
+    if let Some(name) = fd_metadata_name(sys_nr, notif.data.args[1])
+        && SNAPSHOT_METADATA.contains(&sys_nr)
+    {
+        return handle_fd_metadata(kernel, notif, writer, config, ts, name);
     }
 
     // the filesystem families (syscalls.md sections 3.1-3.2): the recorded slice.
@@ -687,6 +1032,71 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
     Ok(Handled::Responded)
 }
 
+/// a snapshot-run metadata call that names an open descriptor (`fchmod`, `fchown`,
+/// `fsetxattr`, `fremovexattr`, and `futimens` as a null-path `utimensat`). the descriptor's
+/// target is read back from `/proc/<pid>/fd/<n>`, judged as a write to that path like
+/// `chmod`, and the call continues when allowed: the object is the descriptor's, fixed when
+/// the agent opened it, and the only pointer left is a timestamp or value the agent owns.
+/// the descriptor is also duplicated with `pidfd_getfd` (the supervisor may, only the agent is
+/// denied it), described with `fstatfs` and `fstat`, and the duplicate closed at once: an object
+/// on cgroup2, or the state root directory itself, is denied whatever path the link spells.
+/// a descriptor on a cgroup2 file cannot be opened (the open is denied), so this is depth.
+/// a link or a duplicate that cannot be read denies (case C). what remains is the window
+/// between the readlink and the duplicate, in which the agent can `dup2` another object into
+/// the slot (escapes.md).
+fn handle_fd_metadata<N: Notifier, S: TraceSink>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    writer: &mut TraceWriter<S>,
+    config: &RunConfig<'_>,
+    ts: u64,
+    name: &'static str,
+) -> Result<Handled, RunError> {
+    if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+        return Ok(Handled::Dropped);
+    }
+    let fd = notif.data.args[0] as u32;
+    let target = kernel.dir_prefix(notif.pid, DirAnchor::Fd(fd));
+    // the descriptor itself, read from a duplicate that is closed before the call returns
+    let facts = kernel.describe_fd(notif.pid, fd as RawFd);
+    if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+        return Ok(Handled::Dropped);
+    }
+    let (Ok(path), Ok(facts)) = (target, facts) else {
+        record(
+            writer,
+            ts,
+            notif,
+            name,
+            Fact::Raw {},
+            &fixed_decision(Decision::Deny, rule::MEMORY_READ),
+        )?;
+        tolerate_dead(kernel.send_error(notif.id, libc::EACCES))?;
+        return Ok(Handled::Responded);
+    };
+    let access = vec![crate::recorder::FsAccess::Write];
+    let path_text = path.to_string_lossy();
+    // what the descriptor is outranks where its link says it is
+    let decision = match fd_identity_deny(config, &facts) {
+        Some(eval) => finalize_decision(eval, None),
+        None => resolve_decision(
+            config,
+            &Request::Fs {
+                path: &path_text,
+                access: &access,
+            },
+        ),
+    };
+    let fact = Fact::Fs {
+        path: path.clone(),
+        access: access.clone(),
+        dest: None,
+    };
+    record(writer, ts, notif, name, fact, &decision)?;
+    respond_continue_or_deny(kernel, notif.id, &decision)?;
+    Ok(mutation_handled(decision.response_decision, &access))
+}
+
 /// gather, record, and respond for one filesystem-family notification.
 fn handle_fs<N: Notifier, S: TraceSink>(
     kernel: &N,
@@ -710,18 +1120,36 @@ fn handle_fs<N: Notifier, S: TraceSink>(
             Vec<crate::recorder::FsAccess>,
             FsInvocation,
         ),
-        MemReadError,
+        GatherError,
     > = (|| {
-        let path = read_anchored(kernel, notif, &shape.path)?;
+        let anchored = read_anchored_parts(
+            kernel,
+            notif,
+            &shape.path,
+            empty_path_allowed(sys_nr, notif),
+        )?;
+        let (path, empty_path) = (anchored.path.clone(), anchored.empty);
         let dest = match &shape.dest {
             Some(arg) => Some(read_anchored(kernel, notif, arg)?),
             None => None,
         };
         let (access, invocation) = match shape.access {
-            AccessSpec::Fixed(list) => (
-                list.to_vec(),
-                FsInvocation::Mutation(mutation_invocation(sys_nr, notif, &path)?),
-            ),
+            AccessSpec::Fixed(list) => {
+                let invocation = match mutation_invocation(kernel, sys_nr, notif, &path, empty_path)
+                {
+                    Ok(invocation) => invocation,
+                    Err(OperandError::Memory) => return Err(GatherError::Memory),
+                    Err(OperandError::Unsupported(errno)) => {
+                        return Err(GatherError::Unsupported {
+                            errno,
+                            path,
+                            dest,
+                            access: list.to_vec(),
+                        });
+                    }
+                };
+                (list.to_vec(), FsInvocation::Mutation(invocation))
+            }
             AccessSpec::OpenFlags { arg } => {
                 // with O_PATH the kernel ignores every other bit (access mode, O_CREAT,
                 // O_TRUNC), so the fact and the realization see only the bits it honors
@@ -732,16 +1160,14 @@ fn handle_fs<N: Notifier, S: TraceSink>(
                         flags,
                         mode: open_mode(sys_nr, notif),
                         unsupported_errno: None,
+                        resolve: ChildResolve::default(),
                     },
                 )
             }
             AccessSpec::OpenHow { arg } => {
                 let size = usize::try_from(notif.data.args[3]).unwrap_or(0);
                 if size < OPEN_HOW_SIZE {
-                    return Err(MemReadError::Short {
-                        wanted: OPEN_HOW_SIZE,
-                        got: size,
-                    });
+                    return Err(GatherError::Memory);
                 }
                 let read_size = if config.mode == crate::recorder::Mode::Enforce {
                     size.min(crate::supervisor::mem::ABSOLUTE_READ_CAP)
@@ -760,7 +1186,12 @@ fn handle_fs<N: Notifier, S: TraceSink>(
                     // openat2(2) refuses O_PATH with a bit O_PATH does not honor, where the
                     // legacy calls ignore it. nothing is opened, so the raw access stands
                     Some(libc::EINVAL)
-                } else if resolve != 0 {
+                } else if resolve & !RESOLVE_VALID != 0
+                    || resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT)
+                        == RESOLVE_BENEATH | RESOLVE_IN_ROOT
+                {
+                    Some(libc::EINVAL)
+                } else if resolve & (RESOLVE_IN_ROOT | RESOLVE_CACHED) != 0 {
                     Some(libc::EOPNOTSUPP)
                 } else {
                     None
@@ -771,6 +1202,11 @@ fn handle_fs<N: Notifier, S: TraceSink>(
                         flags,
                         mode: u32::try_from(mode).unwrap_or(u32::MAX),
                         unsupported_errno,
+                        resolve: ChildResolve {
+                            bits: resolve & RESOLVE_HONORED,
+                            anchor: anchored.anchor,
+                            given: anchored.given,
+                        },
                     },
                 )
             }
@@ -810,8 +1246,30 @@ fn handle_fs<N: Notifier, S: TraceSink>(
             respond_continue_or_deny(kernel, notif.id, &decision)?;
             Ok(mutation_handled(decision.response_decision, &access))
         }
+        // the call's own arguments are invalid, so the kernel would have refused it with this
+        // errno before it looked at any path. it is answered as the kernel would, and
+        // recorded under its own rule so it is not mistaken for a failed memory read
+        Err(GatherError::Unsupported {
+            errno,
+            path,
+            dest,
+            access,
+        }) => {
+            record_event(
+                writer,
+                ts,
+                notif,
+                shape.name,
+                Fact::Fs { path, access, dest },
+                &fixed_decision(Decision::Deny, rule::UNSUPPORTED_OPERAND),
+                None,
+                Some(crate::recorder::errno_name(errno)),
+            )?;
+            tolerate_dead(kernel.send_error(notif.id, errno))?;
+            Ok(Handled::Responded)
+        }
         // case C: a fact that cannot be trusted cannot be allowed (I4).
-        Err(_) => {
+        Err(GatherError::Memory) => {
             record(
                 writer,
                 ts,
@@ -823,6 +1281,25 @@ fn handle_fs<N: Notifier, S: TraceSink>(
             tolerate_dead(kernel.send_error(notif.id, libc::EACCES))?;
             Ok(Handled::Responded)
         }
+    }
+}
+
+/// why gathering the operands of a filesystem call failed.
+enum GatherError {
+    /// agent memory could not be read: case C
+    Memory,
+    /// the call's own arguments are invalid and the kernel would refuse them with `errno`
+    Unsupported {
+        errno: i32,
+        path: PathBuf,
+        dest: Option<PathBuf>,
+        access: Vec<crate::recorder::FsAccess>,
+    },
+}
+
+impl From<MemReadError> for GatherError {
+    fn from(_: MemReadError) -> Self {
+        Self::Memory
     }
 }
 
@@ -931,11 +1408,24 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
         FsOperand::Path
     };
     let mut asks = Vec::new();
-    let primary_evals =
-        evaluate_required_fs(config, &primary_identity, &primary_access, false, &mut asks);
+    let primary_evals = evaluate_required_fs(
+        config,
+        &primary_identity,
+        primary.on_cgroup2(),
+        &primary_access,
+        false,
+        &mut asks,
+    );
     let secondary_evals = secondary.as_ref().map(|path| {
         let required = secondary_access(&invocation, path.exists());
-        evaluate_required_fs(config, path.identity(), &required, true, &mut asks)
+        evaluate_required_fs(
+            config,
+            path.identity(),
+            path.on_cgroup2(),
+            &required,
+            true,
+            &mut asks,
+        )
     });
     let ask_resolution = settle_asks(config, &asks);
     let primary_decision = finalize_operand(primary_operand, primary_evals, ask_resolution);
@@ -1005,18 +1495,33 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
     // set only when the broker realized an O_PATH open, so an errno the supervisor chose
     // for an unsupported openat2 request is never mistaken for the substitute's refusal
     let mut o_path = false;
+    let mut resolve_refused = false;
     let result = match invocation {
         FsInvocation::Open {
             flags,
             mode,
             unsupported_errno,
+            resolve,
         } => {
             if let Some(errno) = unsupported_errno {
                 broker.borrow_mut().release(primary)?;
                 BrokerResult::Errno(errno)
             } else {
-                o_path = flags & crate::supervisor::fact::flags::O_PATH != 0;
-                broker.borrow_mut().commit_open(primary, flags, mode)?
+                match child_resolve_refusal(kernel, notif, &resolve, flags)? {
+                    ResolveCheck::Dropped => {
+                        broker.borrow_mut().release(primary)?;
+                        return Ok(Handled::Dropped);
+                    }
+                    ResolveCheck::Refused(errno) => {
+                        broker.borrow_mut().release(primary)?;
+                        resolve_refused = true;
+                        BrokerResult::Errno(errno)
+                    }
+                    ResolveCheck::Allowed => {
+                        o_path = flags & crate::supervisor::fact::flags::O_PATH != 0;
+                        broker.borrow_mut().commit_open(primary, flags, mode)?
+                    }
+                }
             }
         }
         FsInvocation::Mutation(operation) => {
@@ -1041,9 +1546,124 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
         result,
         Realization {
             o_path,
+            resolve_refused,
             newfd_flags: close_on_exec,
         },
     )
+}
+
+/// what the caller's own `openat2` `resolve` restrictions say about the path it spelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolveCheck {
+    /// the restrictions allow it, or there are none
+    Allowed,
+    /// the restrictions refuse it with this errno
+    Refused(i32),
+    /// the notification died while it was checked
+    Dropped,
+}
+
+/// the answer an `openat2` caller's own `resolve` restrictions give the path it spelled.
+///
+/// the restrictions only narrow how the caller's spelling may resolve, so the object opened is
+/// still the one the policy judged, pinned by the broker. they are checked by resolving the
+/// spelling once more, without opening anything, with the caller's own bits. a relative
+/// spelling starts from the agent's real directory object, opened as an `O_PATH` descriptor
+/// through its `/proc/<pid>` magic link, and never from the text that link reads back as, which
+/// can name a different directory from the supervisor's root. the notification is checked
+/// valid after that open and before the handle is used. an absolute spelling resolves from
+/// the supervisor's own root, as the kernel resolves it for any caller. only the answers the
+/// restrictions themselves cause are returned, `EXDEV` and `ELOOP`; any other failure is
+/// left to the real open, which answers it. a spelling that cannot be checked at all is
+/// refused `EOPNOTSUPP`, as every `resolve` was before they were honored.
+#[cfg(target_os = "linux")]
+fn child_resolve_refusal<N: Notifier>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    check: &ChildResolve,
+    flags: u64,
+) -> Result<ResolveCheck, RunError> {
+    use std::ffi::CString;
+    if check.bits == 0 {
+        return Ok(ResolveCheck::Allowed);
+    }
+    let base = if check.given.is_absolute() {
+        None
+    } else if let Some(anchor) = check.anchor {
+        match kernel.open_anchor(notif.pid, anchor) {
+            Ok(base) => {
+                if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+                    return Ok(ResolveCheck::Dropped);
+                }
+                Some(base)
+            }
+            // the anchor is no directory: the real open answers that, as the kernel would
+            Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => {
+                return Ok(ResolveCheck::Allowed);
+            }
+            Err(_) => {
+                return if kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+                    Ok(ResolveCheck::Refused(libc::EOPNOTSUPP))
+                } else {
+                    Ok(ResolveCheck::Dropped)
+                };
+            }
+        }
+    } else {
+        return Ok(ResolveCheck::Refused(libc::EOPNOTSUPP));
+    };
+    let base_fd = base.as_ref().map_or(libc::AT_FDCWD, AsRawFd::as_raw_fd);
+    let probe = |spelling: &std::path::Path, extra: i32| -> Result<(), i32> {
+        let Ok(spelling) = CString::new(spelling.as_os_str().as_bytes()) else {
+            return Ok(());
+        };
+        crate::supervisor::broker::openat2(
+            base_fd,
+            &spelling,
+            u64::try_from(libc::O_PATH | libc::O_CLOEXEC | extra).unwrap_or_default(),
+            0,
+            check.bits,
+        )
+        .map(drop)
+        .map_err(|error| error.raw_os_error().unwrap_or(0))
+    };
+    // O_CREAT|O_EXCL does not follow a final symlink: an existing one is EEXIST, not a
+    // symlink to resolve, so the kernel never applies the restrictions to where it leads
+    let create_exclusive = (libc::O_CREAT | libc::O_EXCL) as u64;
+    let no_follow = if flags & create_exclusive == create_exclusive {
+        libc::O_NOFOLLOW
+    } else {
+        0
+    };
+    let honored = i32::try_from(flags & (libc::O_NOFOLLOW | libc::O_DIRECTORY) as u64)
+        .unwrap_or_default()
+        | no_follow;
+    let refusal = |errno: i32| matches!(errno, libc::EXDEV | libc::ELOOP).then_some(errno);
+    let refused = match probe(&check.given, honored) {
+        Ok(()) => None,
+        // a create names something that does not exist yet: its directory is what resolves
+        Err(libc::ENOENT) if flags & libc::O_CREAT as u64 != 0 => match check.given.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => {
+                probe(std::path::Path::new("."), libc::O_DIRECTORY)
+                    .err()
+                    .and_then(refusal)
+            }
+            Some(parent) => probe(parent, libc::O_DIRECTORY).err().and_then(refusal),
+            None => None,
+        },
+        Err(errno) => refusal(errno),
+    };
+    Ok(refused.map_or(ResolveCheck::Allowed, ResolveCheck::Refused))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn child_resolve_refusal<N: Notifier>(
+    _kernel: &N,
+    _notif: &SeccompNotif,
+    _check: &ChildResolve,
+    _flags: u64,
+) -> Result<ResolveCheck, RunError> {
+    Ok(ResolveCheck::Allowed)
 }
 
 /// how an allowed filesystem syscall's broker result is to be delivered.
@@ -1054,6 +1674,9 @@ struct Realization {
     /// kind) or EACCES (the file mode refuses its read-only reopen) is a realization
     /// failure, not an answer the kernel would have given
     o_path: bool,
+    /// the caller's own `openat2` `resolve` restrictions refuse the path it spelled, which
+    /// the allow already recorded did not take into account
+    resolve_refused: bool,
     /// the `newfd_flags` an injected descriptor is installed with
     newfd_flags: u32,
 }
@@ -1086,6 +1709,7 @@ fn deliver_realization<N: Notifier, S: TraceSink>(
         BrokerResult::Errno(errno @ (libc::EOPNOTSUPP | libc::EACCES)) if realization.o_path => {
             Delivery::Refused { errno }
         }
+        BrokerResult::Errno(errno) if realization.resolve_refused => Delivery::Refused { errno },
         result => respond_broker_result(kernel, notif.id, result, realization.newfd_flags)?,
     };
     if let Delivery::Refused { errno } = delivery {
@@ -1130,7 +1754,17 @@ fn path_prepare_modes(invocation: &FsInvocation) -> (bool, bool, bool, bool) {
         | FsInvocation::Mutation(MutationInvocation::Chown { flags: 0, .. }) => {
             (true, false, false, false)
         }
-        FsInvocation::Mutation(MutationInvocation::Chown { .. }) => (false, false, false, false),
+        FsInvocation::Mutation(MutationInvocation::Chown { .. })
+        | FsInvocation::Mutation(MutationInvocation::ChmodNoFollow { .. }) => {
+            (false, false, false, false)
+        }
+        FsInvocation::Mutation(
+            MutationInvocation::Setxattr { follow, .. }
+            | MutationInvocation::Removexattr { follow, .. },
+        ) => (*follow, false, false, false),
+        FsInvocation::Mutation(MutationInvocation::Utimens { flags, .. }) => {
+            (flags & AT_SYMLINK_NOFOLLOW == 0, false, false, false)
+        }
         FsInvocation::Mutation(MutationInvocation::Rename { .. }) => (false, false, false, true),
         FsInvocation::Mutation(MutationInvocation::Mkdir { .. }) => (false, true, false, false),
         FsInvocation::Mutation(MutationInvocation::Unlink { .. }) => (false, false, false, false),
@@ -1160,7 +1794,11 @@ fn primary_access(
         FsInvocation::Mutation(
             MutationInvocation::Truncate { .. }
             | MutationInvocation::Chmod { .. }
-            | MutationInvocation::Chown { .. },
+            | MutationInvocation::Chown { .. }
+            | MutationInvocation::ChmodNoFollow { .. }
+            | MutationInvocation::Setxattr { .. }
+            | MutationInvocation::Removexattr { .. }
+            | MutationInvocation::Utimens { .. },
         ) => vec![Write],
     }
 }
@@ -1185,10 +1823,28 @@ fn secondary_access(
     }
 }
 
+/// the implicit cgroup deny decided on what the pinned handle is, not where its path says it
+/// is (ADR-0024 decision 4): an object on a cgroup2 filesystem is denied for every access,
+/// whatever its spelling, so a bind mount of a cgroup directory and a cgroup2 mount made
+/// after the mounts were read are covered. the path rule stays for the ancestors of a mount,
+/// which are on another filesystem and which only it can protect.
+fn cgroup2_identity_deny(config: &RunConfig<'_>, on_cgroup2: bool) -> Option<Evaluation> {
+    (on_cgroup2
+        && config.mode == crate::recorder::Mode::Enforce
+        && config.snapshot_integrity
+        && config.state_root.is_some())
+    .then_some(Evaluation {
+        decision: Decision::Deny,
+        matched: crate::policy::MatchId::ImplicitCgroup,
+        would_deny: None,
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn evaluate_required_fs(
     config: &RunConfig<'_>,
     path: &std::path::Path,
+    on_cgroup2: bool,
     access: &[crate::recorder::FsAccess],
     destination: bool,
     asks: &mut Vec<ask::PendingAsk>,
@@ -1197,6 +1853,9 @@ fn evaluate_required_fs(
     access
         .iter()
         .map(|required| {
+            if let Some(eval) = cgroup2_identity_deny(config, on_cgroup2) {
+                return (*required, eval);
+            }
             let eval = evaluate_operand(
                 config,
                 &Request::Fs {
@@ -1257,6 +1916,22 @@ fn broker_mutation(invocation: MutationInvocation) -> MutationOperation {
         MutationInvocation::Chown { uid, gid, flags } => {
             MutationOperation::Chown { uid, gid, flags }
         }
+        MutationInvocation::ChmodNoFollow { mode } => MutationOperation::ChmodNoFollow { mode },
+        MutationInvocation::Setxattr {
+            name,
+            value,
+            flags,
+            follow,
+        } => MutationOperation::Setxattr {
+            name,
+            value,
+            flags,
+            follow,
+        },
+        MutationInvocation::Removexattr { name, follow } => {
+            MutationOperation::Removexattr { name, follow }
+        }
+        MutationInvocation::Utimens { times, flags } => MutationOperation::Utimens { times, flags },
     }
 }
 
@@ -1752,10 +2427,52 @@ fn read_anchored<N: Notifier>(
     notif: &SeccompNotif,
     arg: &PathArg,
 ) -> Result<PathBuf, MemReadError> {
+    read_anchored_with(kernel, notif, arg, false).map(|(path, _)| path)
+}
+
+/// read and anchor one path operand. when `allow_empty` is set and the path is empty, the
+/// result is the anchor itself, with no trailing separator, and the flag is true: the call
+/// (`AT_EMPTY_PATH`) acts on the object the descriptor holds. an empty path without
+/// `allow_empty` is the kernel's ENOENT and keeps its old reading.
+fn read_anchored_with<N: Notifier>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    arg: &PathArg,
+    allow_empty: bool,
+) -> Result<(PathBuf, bool), MemReadError> {
+    read_anchored_parts(kernel, notif, arg, allow_empty)
+        .map(|anchored| (anchored.path, anchored.empty))
+}
+
+/// a path operand as anchored, with the parts it was built from.
+struct Anchored {
+    /// the operand the policy judges
+    path: PathBuf,
+    /// the path was empty and `path` is the anchor itself
+    empty: bool,
+    /// where a relative spelling starts from, when its directory could be read
+    anchor: Option<DirAnchor>,
+    /// the spelling the caller gave
+    given: PathBuf,
+}
+
+fn read_anchored_parts<N: Notifier>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    arg: &PathArg,
+    allow_empty: bool,
+) -> Result<Anchored, MemReadError> {
     let bytes = kernel.read_path(notif.pid, notif.data.args[arg.path_arg])?;
-    let path = bytes_to_path(bytes);
-    if path.is_absolute() || !arg.anchor {
-        return Ok(path);
+    let empty = allow_empty && bytes.is_empty();
+    let given = bytes_to_path(bytes);
+    let unanchored = |given: PathBuf| Anchored {
+        path: given.clone(),
+        empty: false,
+        anchor: None,
+        given,
+    };
+    if given.is_absolute() || !arg.anchor {
+        return Ok(unanchored(given));
     }
     let anchor = match arg.dirfd_arg {
         Some(i) if u64::from(notif.data.args[i] as u32) != flags::AT_FDCWD => {
@@ -1764,8 +2481,19 @@ fn read_anchored<N: Notifier>(
         _ => DirAnchor::Cwd,
     };
     match kernel.dir_prefix(notif.pid, anchor) {
-        Ok(prefix) => Ok(prefix.join(path)),
-        Err(_) => Ok(path),
+        Ok(prefix) if empty => Ok(Anchored {
+            path: prefix.clone(),
+            empty: true,
+            anchor: Some(anchor),
+            given,
+        }),
+        Ok(prefix) => Ok(Anchored {
+            path: prefix.join(&given),
+            empty: false,
+            anchor: Some(anchor),
+            given,
+        }),
+        Err(_) => Ok(unanchored(given)),
     }
 }
 
@@ -1927,6 +2655,25 @@ mod linux {
                 DirAnchor::Fd(fd) => format!("/proc/{pid}/fd/{fd}"),
             };
             std::fs::read_link(link)
+        }
+        fn open_anchor(&self, pid: u32, anchor: DirAnchor) -> io::Result<OwnedFd> {
+            let link = match anchor {
+                DirAnchor::Cwd => format!("/proc/{pid}/cwd"),
+                DirAnchor::Fd(fd) => format!("/proc/{pid}/fd/{fd}"),
+            };
+            let link = std::ffi::CString::new(link).map_err(io::Error::other)?;
+            // SAFETY: link is a nul-terminated path and the flags are a fixed valid set.
+            let fd = unsafe {
+                libc::open(
+                    link.as_ptr(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: open returned a new descriptor that nothing else owns.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
         }
         fn process_in_tree(&self, root: u32, target: u32) -> io::Result<bool> {
             process_in_tree(root, target)
@@ -2272,6 +3019,15 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Write;
 
+    /// an ordinary file on ext4, which no implicit rule is about
+    const ORDINARY_FILE: FdFacts = FdFacts {
+        f_type: 0xEF53,
+        dev: 2049,
+        ino: 7,
+    };
+    /// `CGROUP2_SUPER_MAGIC`
+    const CGROUP2: i64 = 0x6367_7270;
+
     /// a scripted kernel side: fixed child memory, programmable id_valid answers, and a
     /// log of every response sent.
     #[derive(Default)]
@@ -2279,11 +3035,17 @@ mod tests {
         mem: HashMap<u64, Vec<u8>>,
         cwd: &'static str,
         fd_dirs: HashMap<u32, &'static str>,
+        // what a descriptor is (`describe_fd`): a scripted answer or an errno. a descriptor
+        // in `fd_dirs` without one is an ordinary file on ext4
+        fd_facts: HashMap<u32, Result<FdFacts, i32>>,
         // answers consumed per id_valid call; empty means "always valid"
         id_valid_script: RefCell<Vec<bool>>,
         sent: RefCell<Vec<String>>,
         send_errno: Option<i32>,  // error every send with this errno
         addfd_errno: Option<i32>, // refuse every ADDFD with this errno
+        // the real directory `open_anchor` hands back, whatever the scripted link text says
+        anchor_dir: Option<PathBuf>,
+        anchor_errno: Option<i32>, // refuse every `open_anchor` with this errno
     }
 
     impl FakeNotifier {
@@ -2347,6 +3109,15 @@ mod tests {
         fn duplicate_fd(&self, _pid: u32, _target_fd: RawFd) -> io::Result<OwnedFd> {
             Err(io::Error::from_raw_os_error(libc::EBADF))
         }
+        fn describe_fd(&self, _pid: u32, target_fd: RawFd) -> io::Result<FdFacts> {
+            let fd = u32::try_from(target_fd).unwrap_or(u32::MAX);
+            match self.fd_facts.get(&fd) {
+                Some(Ok(facts)) => Ok(*facts),
+                Some(Err(errno)) => Err(io::Error::from_raw_os_error(*errno)),
+                None if self.fd_dirs.contains_key(&fd) => Ok(ORDINARY_FILE),
+                None => Err(io::Error::from_raw_os_error(libc::EBADF)),
+            }
+        }
         fn read_path(&self, _pid: u32, addr: u64) -> Result<Vec<u8>, MemReadError> {
             match self.mem.get(&addr) {
                 Some(bytes) => {
@@ -2389,6 +3160,15 @@ mod tests {
                     .get(&fd)
                     .map(PathBuf::from)
                     .ok_or_else(|| io::Error::other("no such fd")),
+            }
+        }
+        fn open_anchor(&self, _pid: u32, _anchor: DirAnchor) -> io::Result<OwnedFd> {
+            if let Some(errno) = self.anchor_errno {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            match &self.anchor_dir {
+                Some(dir) => Ok(OwnedFd::from(std::fs::File::open(dir)?)),
+                None => Err(io::Error::from_raw_os_error(libc::ENOSYS)),
             }
         }
         fn process_in_tree(&self, root: u32, target: u32) -> io::Result<bool> {
@@ -2810,6 +3590,7 @@ mod tests {
             result,
             Realization {
                 o_path,
+                resolve_refused: false,
                 newfd_flags: 0,
             },
         )
@@ -2835,6 +3616,130 @@ mod tests {
         assert_eq!(events[0]["matched_rule"], "failsafe:realization");
         assert_eq!(events[0]["errno"], "EMFILE");
         assert_eq!(events[0]["fact"]["path"], "/ws/file");
+    }
+
+    /// a check of `given` under `bits` from the scripted anchor, for the unit tests of the
+    /// caller's `resolve` restrictions.
+    #[cfg(target_os = "linux")]
+    fn resolve_check(
+        kernel: &FakeNotifier,
+        bits: u64,
+        anchor: Option<DirAnchor>,
+        given: &str,
+        flags: u64,
+    ) -> ResolveCheck {
+        let check = ChildResolve {
+            bits,
+            anchor,
+            given: PathBuf::from(given),
+        };
+        child_resolve_refusal(kernel, &notif(437, [0; 6]), &check, flags).unwrap()
+    }
+
+    /// the check starts from the directory object the agent holds, not from the text the link
+    /// to it reads as: the scripted text names nothing, and the real directory decides.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resolve_check_starts_from_the_real_directory_not_its_link_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/f"), b"f").unwrap();
+        let kernel = FakeNotifier {
+            cwd: "/nonexistent/where/the/text/points",
+            anchor_dir: Some(dir.path().to_path_buf()),
+            ..FakeNotifier::default()
+        };
+        let beneath = RESOLVE_BENEATH;
+        let cwd = Some(DirAnchor::Cwd);
+        assert_eq!(
+            resolve_check(&kernel, beneath, cwd, "sub/f", 0),
+            ResolveCheck::Allowed
+        );
+        assert_eq!(
+            resolve_check(&kernel, beneath, cwd, "sub/../../x", 0),
+            ResolveCheck::Refused(libc::EXDEV)
+        );
+        assert_eq!(
+            resolve_check(&kernel, beneath, cwd, "/etc/passwd", 0),
+            ResolveCheck::Refused(libc::EXDEV)
+        );
+        assert_eq!(
+            resolve_check(&kernel, 0, cwd, "../x", 0),
+            ResolveCheck::Allowed,
+            "no restriction, nothing to check"
+        );
+    }
+
+    /// a relative spelling whose directory cannot be opened is refused `EOPNOTSUPP`, never
+    /// allowed unchecked, and a notification that died meanwhile is dropped instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resolve_check_that_cannot_open_its_directory_is_refused_unless_the_notification_died() {
+        let cwd = Some(DirAnchor::Cwd);
+        let refused = FakeNotifier {
+            anchor_errno: Some(libc::EACCES),
+            ..FakeNotifier::default()
+        };
+        assert_eq!(
+            resolve_check(&refused, RESOLVE_BENEATH, cwd, "f", 0),
+            ResolveCheck::Refused(libc::EOPNOTSUPP)
+        );
+        assert_eq!(
+            resolve_check(&refused, RESOLVE_BENEATH, None, "f", 0),
+            ResolveCheck::Refused(libc::EOPNOTSUPP),
+            "a directory that was never read has nothing to open"
+        );
+        let died = FakeNotifier {
+            anchor_errno: Some(libc::ESRCH),
+            id_valid_script: RefCell::new(vec![false]),
+            ..FakeNotifier::default()
+        };
+        assert_eq!(
+            resolve_check(&died, RESOLVE_BENEATH, cwd, "f", 0),
+            ResolveCheck::Dropped
+        );
+    }
+
+    /// the handle is believed only while the notification is valid: a pid recycled after the
+    /// open must not decide the answer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resolve_check_is_dropped_when_the_notification_dies_after_the_directory_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = FakeNotifier {
+            anchor_dir: Some(dir.path().to_path_buf()),
+            id_valid_script: RefCell::new(vec![false]),
+            ..FakeNotifier::default()
+        };
+        assert_eq!(
+            resolve_check(&kernel, RESOLVE_BENEATH, Some(DirAnchor::Cwd), "../x", 0),
+            ResolveCheck::Dropped
+        );
+    }
+
+    /// `O_CREAT|O_EXCL` does not follow a final symlink, so one that leaves the directory is
+    /// not a refusal the restriction causes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exclusive_create_does_not_follow_a_final_symlink_in_the_resolve_check() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("..", dir.path().join("up")).unwrap();
+        let kernel = FakeNotifier {
+            anchor_dir: Some(dir.path().to_path_buf()),
+            ..FakeNotifier::default()
+        };
+        let cwd = Some(DirAnchor::Cwd);
+        let exclusive = (libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL) as u64;
+        assert_eq!(
+            resolve_check(&kernel, RESOLVE_BENEATH, cwd, "up", exclusive),
+            ResolveCheck::Allowed
+        );
+        let plain = (libc::O_WRONLY | libc::O_CREAT) as u64;
+        assert_eq!(
+            resolve_check(&kernel, RESOLVE_BENEATH, cwd, "up", plain),
+            ResolveCheck::Refused(libc::EXDEV),
+            "without O_EXCL the symlink is followed"
+        );
     }
 
     /// record precedes respond on the second event too: when it cannot be written the run
@@ -3126,6 +4031,34 @@ mod tests {
     }
 
     #[test]
+    fn the_path_attribute_calls_newer_than_libc_are_answered_enosys_and_recorded() {
+        // setxattrat (6.13), removexattrat (6.13) and file_setattr (6.17) name a path and can
+        // set `user.leash.lock` or a file attribute with no open. nothing in libc calls them
+        // yet, so they are answered ENOSYS, and the flag decides nothing: a filter and flag
+        // that disagree still deny and record them
+        let p = policy("schema_version = 1\n");
+        for snapshot_integrity in [true, false] {
+            let config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
+                .with_snapshot_integrity(snapshot_integrity);
+            for (sys_nr, name) in [
+                (nr::SETXATTRAT, "setxattrat"),
+                (nr::REMOVEXATTRAT, "removexattrat"),
+                (nr::FILE_SETATTR, "file_setattr"),
+            ] {
+                let kernel = FakeNotifier::default();
+                let mut w = writer();
+                super::handle_notification(&kernel, &notif(sys_nr, [0; 6]), &mut w, &config, 1)
+                    .unwrap();
+                assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::ENOSYS)]);
+                let ev = &events(w)[0];
+                assert_eq!(ev["syscall"], name);
+                assert_eq!(ev["decision"], "deny");
+                assert_eq!(ev["matched_rule"], rule::SNAPSHOT_XATTRAT);
+            }
+        }
+    }
+
+    #[test]
     fn a_filter_and_flag_that_disagree_are_refused_in_both_directions() {
         assert!(require_matching_filter(true, true).is_ok());
         assert!(require_matching_filter(false, false).is_ok());
@@ -3403,6 +4336,668 @@ mod tests {
         );
         assert_eq!(decision.matched_rule, "implicit:state_root");
         assert_eq!(decision.response_decision, Decision::Deny);
+    }
+
+    #[test]
+    fn the_implicit_cgroup_deny_applies_only_to_a_snapshot_integrity_run() {
+        use crate::recorder::FsAccess::{Create, Delete, Read, Write};
+        let p = policy(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/**\"\nmode=[\"read\",\"write\",\"create\",\"delete\"]\naction=\"allow\"\n\
+             [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+        );
+        let mounts = crate::supervisor::cgroup_mounts::CgroupMounts::from_resolved(vec![
+            "/sys/fs/cgroup".into(),
+        ])
+        .unwrap();
+        let eval = |config: &RunConfig<'_>,
+                    path: &str,
+                    access: &[crate::recorder::FsAccess],
+                    destination: bool| {
+            let mut asks = Vec::new();
+            let eval = evaluate_operand(
+                config,
+                &Request::Fs { path, access },
+                destination,
+                &mut asks,
+            );
+            (eval.decision, eval.matched.to_string())
+        };
+        let snapshot = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
+            .with_snapshot_integrity(true)
+            .with_cgroup_mounts(&mounts);
+        for access in [Read, Write, Create, Delete] {
+            assert_eq!(
+                eval(
+                    &snapshot,
+                    "/sys/fs/cgroup/user.slice/cgroup.procs",
+                    &[access],
+                    false
+                ),
+                (Decision::Deny, "implicit:cgroup".to_string())
+            );
+        }
+        assert_eq!(
+            eval(&snapshot, "/sys/fs", &[Delete], false),
+            (Decision::Deny, "implicit:cgroup".to_string())
+        );
+        assert_eq!(
+            eval(&snapshot, "/sys", &[Create], true),
+            (Decision::Deny, "implicit:cgroup".to_string())
+        );
+        assert_eq!(
+            eval(&snapshot, "/sys/fs", &[Read], false),
+            (Decision::Allow, "fs.1".to_string())
+        );
+        let exec = resolve_decision(
+            &snapshot,
+            &Request::Exec {
+                binary: "/sys/fs/cgroup/x",
+            },
+        );
+        assert_eq!(exec.matched_rule, "implicit:cgroup");
+
+        // the same mounts without the snapshot flag, and a config without mounts, are inert
+        let plain = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
+            .with_cgroup_mounts(&mounts);
+        assert_eq!(
+            eval(&plain, "/sys/fs/cgroup/cgroup.procs", &[Read], false),
+            (Decision::Allow, "fs.1".to_string())
+        );
+        let unmounted = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
+            .with_snapshot_integrity(true);
+        assert_eq!(
+            eval(&unmounted, "/sys/fs/cgroup/cgroup.procs", &[Read], false),
+            (Decision::Allow, "fs.1".to_string())
+        );
+        // validate refuses the snapshot run that was built without its mounts
+        assert!(matches!(
+            unmounted.validate(),
+            Err(RunError::SnapshotIntegrityNeedsCgroupMounts)
+        ));
+    }
+
+    #[test]
+    fn the_state_root_deny_keeps_its_own_id_where_a_path_is_in_both_sets() {
+        let p = policy("schema_version = 1\n");
+        let root =
+            crate::supervisor::state_root::StateRoot::from_resolved("/sys/fs/cgroup/state".into())
+                .unwrap();
+        let mounts = crate::supervisor::cgroup_mounts::CgroupMounts::from_resolved(vec![
+            "/sys/fs/cgroup".into(),
+        ])
+        .unwrap();
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, &root)
+            .with_snapshot_integrity(true)
+            .with_cgroup_mounts(&mounts);
+        let decision = resolve_decision(
+            &config,
+            &Request::Fs {
+                path: "/sys/fs/cgroup/state/runs",
+                access: &[crate::recorder::FsAccess::Read],
+            },
+        );
+        assert_eq!(decision.matched_rule, "implicit:state_root");
+    }
+
+    /// an enforce snapshot config over a policy that grants everything, with the cgroup2
+    /// mount at /sys/fs/cgroup, so any refusal comes from an implicit rule.
+    fn metadata_run<R>(body: impl FnOnce(&RunConfig<'_>) -> R) -> R {
+        let p = policy(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/**\"\nmode=[\"read\",\"write\",\"create\",\"delete\"]\naction=\"allow\"\n",
+        );
+        let mounts = crate::supervisor::cgroup_mounts::CgroupMounts::from_resolved(vec![
+            "/sys/fs/cgroup".into(),
+        ])
+        .unwrap();
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
+            .with_snapshot_integrity(true)
+            .with_cgroup_mounts(&mounts);
+        body(&config)
+    }
+
+    #[test]
+    fn descriptor_metadata_calls_are_judged_on_the_descriptors_target() {
+        let fd_calls: [(u32, [u64; 6], &str); 5] = [
+            (nr::FCHMOD, [5, 0o777, 0, 0, 0, 0], "fchmod"),
+            (nr::FCHOWN, [5, 0, 0, 0, 0, 0], "fchown"),
+            (nr::FSETXATTR, [5, 0x1000, 0x2000, 1, 0, 0], "fsetxattr"),
+            (nr::FREMOVEXATTR, [5, 0x1000, 0, 0, 0, 0], "fremovexattr"),
+            // futimens: utimensat with a null path
+            (nr::UTIMENSAT, [5, 0, 0, 0, 0, 0], "utimensat"),
+        ];
+        for (sys_nr, args, name) in fd_calls {
+            // the target is a control file of the cgroup2 mount: denied by the implicit rule
+            let kernel = FakeNotifier {
+                fd_dirs: HashMap::from([(5, "/sys/fs/cgroup/leash-x/cgroup.procs")]),
+                ..FakeNotifier::default()
+            };
+            let mut w = writer();
+            metadata_run(|config| {
+                super::handle_notification(&kernel, &notif(sys_nr, args), &mut w, config, 1)
+                    .unwrap();
+            });
+            assert_eq!(
+                kernel.sent(),
+                vec![format!("error:7:{}", libc::EACCES)],
+                "{name}"
+            );
+            let ev = &events(w)[0];
+            assert_eq!(ev["syscall"], name);
+            assert_eq!(ev["decision"], "deny", "{name}");
+            assert_eq!(ev["matched_rule"], "implicit:cgroup", "{name}");
+            assert_eq!(ev["fact"]["path"], "/sys/fs/cgroup/leash-x/cgroup.procs");
+
+            // an ordinary file is decided by policy and continues
+            let kernel = FakeNotifier {
+                fd_dirs: HashMap::from([(5, "/work/file")]),
+                ..FakeNotifier::default()
+            };
+            let mut w = writer();
+            let handled = metadata_run(|config| {
+                super::handle_notification(&kernel, &notif(sys_nr, args), &mut w, config, 1)
+                    .unwrap()
+            });
+            assert_eq!(handled, Handled::RespondedMutation, "{name}");
+            assert_eq!(kernel.sent(), vec!["continue:7".to_string()], "{name}");
+            let ev = &events(w)[0];
+            assert_eq!(ev["decision"], "allow", "{name}");
+            assert_eq!(ev["matched_rule"], "fs.1", "{name}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_operand_is_answered_with_the_kernels_errno_under_its_own_rule() {
+        // each call is refused by the kernel before it looks at a path, so the answer is the
+        // kernel's errno and the record says why, not failsafe:memory_read with EACCES
+        let calls: [(u32, [u64; 6], &str, i32, &str); 3] = [
+            (
+                nr::SETXATTR,
+                [0x1000, 0x2000, 0x3000, 65_537, 0, 0],
+                "setxattr",
+                libc::E2BIG,
+                "E2BIG",
+            ),
+            (
+                nr::FCHMODAT2,
+                [flags::AT_FDCWD, 0x1000, 0o600, 0x2000, 0, 0],
+                "fchmodat2",
+                libc::EINVAL,
+                "EINVAL",
+            ),
+            (
+                nr::UTIMENSAT,
+                [flags::AT_FDCWD, 0x1000, 0, 0x4000, 0, 0],
+                "utimensat",
+                libc::EINVAL,
+                "EINVAL",
+            ),
+        ];
+        for (sys_nr, args, name, errno, errno_name) in calls {
+            let kernel = FakeNotifier::default()
+                .with_cstr(0x1000, "/work/f")
+                .with_cstr(0x2000, "user.k");
+            let mut w = writer();
+            let handled = metadata_run(|config| {
+                super::handle_notification(&kernel, &notif(sys_nr, args), &mut w, config, 1)
+                    .unwrap()
+            });
+            assert_eq!(handled, Handled::Responded, "{name}");
+            assert_eq!(kernel.sent(), vec![format!("error:7:{errno}")], "{name}");
+            let ev = &events(w)[0];
+            assert_eq!(ev["syscall"], name);
+            assert_eq!(ev["decision"], "deny", "{name}");
+            assert_eq!(ev["matched_rule"], rule::UNSUPPORTED_OPERAND, "{name}");
+            assert_eq!(ev["errno"], errno_name, "{name}");
+            assert_eq!(ev["fact"]["path"], "/work/f", "{name}");
+        }
+    }
+
+    #[test]
+    fn an_object_on_a_cgroup2_filesystem_is_denied_by_what_it_is_whatever_its_path() {
+        let p = policy("schema_version = 1\n");
+        let root = test_root();
+        let snapshot = RunConfig::enforce(4242, Attendance::Unattended, &p, root)
+            .with_snapshot_integrity(true);
+        let eval = cgroup2_identity_deny(&snapshot, true).expect("denied");
+        assert_eq!(eval.decision, Decision::Deny);
+        assert_eq!(eval.matched.to_string(), "implicit:cgroup");
+        // another filesystem is left to the path rule and to policy
+        assert!(cgroup2_identity_deny(&snapshot, false).is_none());
+        // a run without snapshot integrity is the operator's business
+        let plain = RunConfig::enforce(4242, Attendance::Unattended, &p, root);
+        assert!(cgroup2_identity_deny(&plain, true).is_none());
+        // and so is record-only, which has no implicit rules
+        let record = RunConfig::record_only(4242, Attendance::Unattended);
+        assert!(cgroup2_identity_deny(&record, true).is_none());
+    }
+
+    #[test]
+    fn an_unreadable_operand_is_still_a_memory_read_failure() {
+        // the xattr name pointer is unmapped, which is case C and stays EACCES
+        let kernel = FakeNotifier::default().with_cstr(0x1000, "/work/f");
+        let mut w = writer();
+        metadata_run(|config| {
+            super::handle_notification(
+                &kernel,
+                &notif(nr::SETXATTR, [0x1000, 0xdead, 0x3000, 1, 0, 0]),
+                &mut w,
+                config,
+                1,
+            )
+            .unwrap();
+        });
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        assert_eq!(events(w)[0]["matched_rule"], rule::MEMORY_READ);
+    }
+
+    #[test]
+    fn a_descriptor_whose_link_looks_harmless_is_denied_by_what_it_is() {
+        // the link spells a path nothing denies, as a bind mount alias would; the descriptor
+        // is on cgroup2, which fstatfs says whatever the spelling
+        let fd_calls: [(u32, [u64; 6], &str); 5] = [
+            (nr::FCHMOD, [5, 0o777, 0, 0, 0, 0], "fchmod"),
+            (nr::FCHOWN, [5, 0, 0, 0, 0, 0], "fchown"),
+            (nr::FSETXATTR, [5, 0x1000, 0x2000, 1, 0, 0], "fsetxattr"),
+            (nr::FREMOVEXATTR, [5, 0x1000, 0, 0, 0, 0], "fremovexattr"),
+            (nr::UTIMENSAT, [5, 0, 0, 0, 0, 0], "utimensat"),
+        ];
+        for (sys_nr, args, name) in fd_calls {
+            let kernel = FakeNotifier {
+                fd_dirs: HashMap::from([(5, "/mnt/alias/cgroup.procs")]),
+                fd_facts: HashMap::from([(
+                    5,
+                    Ok(FdFacts {
+                        f_type: CGROUP2,
+                        ..ORDINARY_FILE
+                    }),
+                )]),
+                ..FakeNotifier::default()
+            };
+            let mut w = writer();
+            metadata_run(|config| {
+                super::handle_notification(&kernel, &notif(sys_nr, args), &mut w, config, 1)
+                    .unwrap();
+            });
+            assert_eq!(
+                kernel.sent(),
+                vec![format!("error:7:{}", libc::EACCES)],
+                "{name}"
+            );
+            let ev = &events(w)[0];
+            assert_eq!(ev["decision"], "deny", "{name}");
+            assert_eq!(ev["matched_rule"], "implicit:cgroup", "{name}");
+            assert_eq!(ev["fact"]["path"], "/mnt/alias/cgroup.procs", "{name}");
+        }
+    }
+
+    #[test]
+    fn a_descriptor_on_the_state_root_is_denied_whatever_its_link_says() {
+        let base = tempfile::tempdir().unwrap();
+        let state = base.path().canonicalize().unwrap();
+        let root = crate::supervisor::state_root::StateRoot::from_resolved(state.clone()).unwrap();
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata(&state).unwrap();
+            (m.dev(), m.ino())
+        };
+        let p = policy(
+            "schema_version = 1\n[[fs]]\npath=\"/**\"\nmode=[\"write\"]\naction=\"allow\"\n",
+        );
+        let mounts = crate::supervisor::cgroup_mounts::CgroupMounts::from_resolved(vec![
+            "/sys/fs/cgroup".into(),
+        ])
+        .unwrap();
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, &root)
+            .with_snapshot_integrity(true)
+            .with_cgroup_mounts(&mounts);
+        let kernel = FakeNotifier {
+            fd_dirs: HashMap::from([(5, "/mnt/alias")]),
+            fd_facts: HashMap::from([(
+                5,
+                Ok(FdFacts {
+                    f_type: 0xEF53,
+                    dev,
+                    ino,
+                }),
+            )]),
+            ..FakeNotifier::default()
+        };
+        let mut w = writer();
+        super::handle_notification(
+            &kernel,
+            &notif(nr::FCHMOD, [5, 0o777, 0, 0, 0, 0]),
+            &mut w,
+            &config,
+            1,
+        )
+        .unwrap();
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        let ev = &events(w)[0];
+        assert_eq!(ev["decision"], "deny");
+        assert_eq!(ev["matched_rule"], "implicit:state_root");
+    }
+
+    #[test]
+    fn a_descriptor_that_cannot_be_duplicated_denies_and_records() {
+        // the link reads back but pidfd_getfd does not (the descriptor was closed meanwhile):
+        // nothing the supervisor could not look at is allowed
+        let kernel = FakeNotifier {
+            fd_dirs: HashMap::from([(5, "/work/file")]),
+            fd_facts: HashMap::from([(5, Err(libc::EBADF))]),
+            ..FakeNotifier::default()
+        };
+        let mut w = writer();
+        metadata_run(|config| {
+            super::handle_notification(
+                &kernel,
+                &notif(nr::FCHMOD, [5, 0o777, 0, 0, 0, 0]),
+                &mut w,
+                config,
+                1,
+            )
+            .unwrap();
+        });
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        let ev = &events(w)[0];
+        assert_eq!(ev["decision"], "deny");
+        assert_eq!(ev["matched_rule"], rule::MEMORY_READ);
+    }
+
+    #[test]
+    fn the_identity_deny_follows_the_filesystem_type_and_the_state_root_alone() {
+        let p = policy("schema_version = 1\n");
+        let root = test_root();
+        let snapshot = RunConfig::enforce(4242, Attendance::Unattended, &p, root)
+            .with_snapshot_integrity(true);
+        let cgroup = FdFacts {
+            f_type: CGROUP2,
+            ..ORDINARY_FILE
+        };
+        let eval = fd_identity_deny(&snapshot, &cgroup).expect("cgroup2 is denied");
+        assert_eq!(eval.decision, Decision::Deny);
+        assert_eq!(eval.matched.to_string(), "implicit:cgroup");
+        assert!(fd_identity_deny(&snapshot, &ORDINARY_FILE).is_none());
+        // without snapshot integrity the cgroup rule is not armed
+        let plain = RunConfig::enforce(4242, Attendance::Unattended, &p, root);
+        assert!(fd_identity_deny(&plain, &cgroup).is_none());
+        let record = RunConfig::record_only(4242, Attendance::Unattended);
+        assert!(fd_identity_deny(&record, &cgroup).is_none());
+    }
+
+    #[test]
+    fn a_real_descriptor_is_described_by_its_filesystem_and_identity() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+        let fd = OwnedFd::from(std::fs::File::open(&file).unwrap());
+        let facts = fd_facts(fd).unwrap();
+        assert_eq!((facts.dev, facts.ino), (metadata.dev(), metadata.ino()));
+        assert_ne!(facts.f_type, CGROUP2, "a temporary file is not on cgroup2");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_descriptor_on_the_cgroup2_mount_is_described_as_cgroup2() {
+        let Ok(mounts) = crate::supervisor::cgroup_mounts::CgroupMounts::from_proc_self() else {
+            return;
+        };
+        let Some(mount) = mounts.paths().first() else {
+            return;
+        };
+        let Ok(file) = std::fs::File::open(mount.join("cgroup.controllers")) else {
+            return;
+        };
+        let facts = fd_facts(OwnedFd::from(file)).unwrap();
+        assert_eq!(facts.f_type, CGROUP2);
+    }
+
+    #[test]
+    fn a_descriptor_that_cannot_be_resolved_denies_the_metadata_call() {
+        // fd 9 is not in fd_dirs, so its target cannot be read back
+        let kernel = FakeNotifier::default();
+        let mut w = writer();
+        metadata_run(|config| {
+            super::handle_notification(
+                &kernel,
+                &notif(nr::FCHMOD, [9, 0o777, 0, 0, 0, 0]),
+                &mut w,
+                config,
+                1,
+            )
+            .unwrap();
+        });
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        assert_eq!(events(w)[0]["matched_rule"], rule::MEMORY_READ);
+    }
+
+    #[test]
+    fn snapshot_metadata_calls_are_denied_and_recorded_when_the_flag_is_off() {
+        let p = policy("schema_version = 1\n");
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root());
+        for &sys_nr in SNAPSHOT_METADATA {
+            let kernel = FakeNotifier::default();
+            let mut w = writer();
+            super::handle_notification(&kernel, &notif(sys_nr, [0; 6]), &mut w, &config, 1)
+                .unwrap();
+            assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::ENOSYS)]);
+            let ev = &events(w)[0];
+            assert_eq!(ev["decision"], "deny");
+            assert_eq!(ev["matched_rule"], rule::SNAPSHOT_METADATA);
+        }
+    }
+
+    #[test]
+    fn path_metadata_calls_decode_their_operands_from_child_memory() {
+        let path = std::path::Path::new("/work/f");
+        let mut times = Vec::new();
+        for v in [10_i64, 20, 30, 40] {
+            times.extend_from_slice(&v.to_ne_bytes());
+        }
+        let kernel = FakeNotifier::default()
+            .with_cstr(0x1000, "user.leash.lock")
+            .with_bytes(0x2000, b"value".to_vec())
+            .with_bytes(0x3000, times.clone());
+
+        let set = mutation_invocation(
+            &kernel,
+            nr::LSETXATTR,
+            &notif(nr::LSETXATTR, [0, 0x1000, 0x2000, 5, 1, 0]),
+            path,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            set,
+            MutationInvocation::Setxattr { ref name, ref value, flags: 1, follow: false }
+                if name == b"user.leash.lock" && value == b"value"
+        ));
+        let oversized = mutation_invocation(
+            &kernel,
+            nr::SETXATTR,
+            &notif(nr::SETXATTR, [0, 0x1000, 0x2000, 65_537, 0, 0]),
+            path,
+            false,
+        );
+        assert!(
+            matches!(oversized, Err(OperandError::Unsupported(libc::E2BIG))),
+            "a value past XATTR_SIZE_MAX is E2BIG, not a memory failure: {oversized:?}"
+        );
+
+        let remove = mutation_invocation(
+            &kernel,
+            nr::REMOVEXATTR,
+            &notif(nr::REMOVEXATTR, [0, 0x1000, 0, 0, 0, 0]),
+            path,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            remove,
+            MutationInvocation::Removexattr { ref name, follow: true } if name == b"user.leash.lock"
+        ));
+
+        let timespec = mutation_invocation(
+            &kernel,
+            nr::UTIMENSAT,
+            &notif(nr::UTIMENSAT, [0, 0, 0x3000, 0x100, 0, 0]),
+            path,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            timespec,
+            MutationInvocation::Utimens {
+                times: Some([10, 20, 30, 40]),
+                flags: 0x100
+            }
+        ));
+        let timeval = mutation_invocation(
+            &kernel,
+            nr::UTIMES,
+            &notif(nr::UTIMES, [0, 0x3000, 0, 0, 0, 0]),
+            path,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            timeval,
+            MutationInvocation::Utimens {
+                times: Some([10, 20_000, 30, 40_000]),
+                flags: 0
+            }
+        ));
+        let now = mutation_invocation(
+            &kernel,
+            nr::UTIME,
+            &notif(nr::UTIME, [0, 0, 0, 0, 0, 0]),
+            path,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            now,
+            MutationInvocation::Utimens {
+                times: None,
+                flags: 0
+            }
+        ));
+
+        let lchown = mutation_invocation(
+            &kernel,
+            nr::LCHOWN,
+            &notif(nr::LCHOWN, [0, 7, 8, 0, 0, 0]),
+            path,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            lchown,
+            MutationInvocation::Chown {
+                uid: 7,
+                gid: 8,
+                flags: AT_SYMLINK_NOFOLLOW
+            }
+        ));
+        let follow = mutation_invocation(
+            &kernel,
+            nr::FCHMODAT2,
+            &notif(nr::FCHMODAT2, [0, 0, 0o600, 0, 0, 0]),
+            path,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(follow, MutationInvocation::Chmod { mode: 0o600 }));
+        let nofollow = mutation_invocation(
+            &kernel,
+            nr::FCHMODAT2,
+            &notif(nr::FCHMODAT2, [0, 0, 0o600, 0x100, 0, 0]),
+            path,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            nofollow,
+            MutationInvocation::ChmodNoFollow { mode: 0o600 }
+        ));
+        // AT_EMPTY_PATH only matters when the path is empty: the kernel ignores it otherwise
+        let ignored = mutation_invocation(
+            &kernel,
+            nr::FCHMODAT2,
+            &notif(nr::FCHMODAT2, [0, 0, 0o600, 0x1000, 0, 0]),
+            path,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(ignored, MutationInvocation::Chmod { mode: 0o600 }));
+        let empty = mutation_invocation(
+            &kernel,
+            nr::FCHMODAT2,
+            &notif(nr::FCHMODAT2, [0, 0, 0o600, 0x1000, 0, 0]),
+            path,
+            true,
+        )
+        .unwrap();
+        assert!(
+            matches!(empty, MutationInvocation::ChmodNoFollow { mode: 0o600 }),
+            "an empty path names the descriptor's own object: {empty:?}"
+        );
+        let unknown_flag = mutation_invocation(
+            &kernel,
+            nr::FCHMODAT2,
+            &notif(nr::FCHMODAT2, [0, 0, 0o600, 0x2000, 0, 0]),
+            path,
+            false,
+        );
+        assert!(
+            matches!(unknown_flag, Err(OperandError::Unsupported(libc::EINVAL))),
+            "{unknown_flag:?}"
+        );
+
+        let utimens_ignored = mutation_invocation(
+            &kernel,
+            nr::UTIMENSAT,
+            &notif(nr::UTIMENSAT, [0, 0, 0x3000, 0x1000, 0, 0]),
+            path,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            utimens_ignored,
+            MutationInvocation::Utimens { flags: 0, .. }
+        ));
+        let utimens_empty = mutation_invocation(
+            &kernel,
+            nr::UTIMENSAT,
+            &notif(nr::UTIMENSAT, [0, 0, 0x3000, 0x1000, 0, 0]),
+            path,
+            true,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                utimens_empty,
+                MutationInvocation::Utimens {
+                    flags: AT_SYMLINK_NOFOLLOW,
+                    ..
+                }
+            ),
+            "AT_EMPTY_PATH with an empty path acts on the descriptor's object: {utimens_empty:?}"
+        );
+        let utimens_bad = mutation_invocation(
+            &kernel,
+            nr::UTIMENSAT,
+            &notif(nr::UTIMENSAT, [0, 0, 0x3000, 0x4000, 0, 0]),
+            path,
+            false,
+        );
+        assert!(
+            matches!(utimens_bad, Err(OperandError::Unsupported(libc::EINVAL))),
+            "{utimens_bad:?}"
+        );
     }
 
     #[test]

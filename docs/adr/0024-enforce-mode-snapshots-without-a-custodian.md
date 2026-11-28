@@ -1,6 +1,6 @@
 # ADR-0024: Enforce-mode snapshots without a custodian
 
-- Status: accepted
+- Status: accepted (metadata residual refined by ADR-0025)
 - Date: 2026-11-24
 - Tier: 3 (trades a security invariant of ADR-0022 for a narrower, named one)
 - Partly supersedes: ADR-0022 (mode scope, protected-storage prerequisite, historical-read authorization)

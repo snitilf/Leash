@@ -112,6 +112,28 @@ pub mod nr {
     // section 6: snapshot runs only
     pub const IO_SETUP: u32 = 206;
     pub const IO_SUBMIT: u32 = 209;
+    // section 6: snapshot runs only, metadata calls on a path
+    pub const LCHOWN: u32 = 94;
+    pub const UTIME: u32 = 132;
+    pub const UTIMES: u32 = 235;
+    pub const FUTIMESAT: u32 = 261;
+    pub const UTIMENSAT: u32 = 280;
+    pub const SETXATTR: u32 = 188;
+    pub const LSETXATTR: u32 = 189;
+    pub const REMOVEXATTR: u32 = 197;
+    pub const LREMOVEXATTR: u32 = 198;
+    pub const FCHMODAT2: u32 = 452;
+    // section 6: snapshot runs only, metadata calls on a descriptor
+    pub const FCHMOD: u32 = 91;
+    pub const FCHOWN: u32 = 93;
+    pub const FSETXATTR: u32 = 190;
+    pub const FREMOVEXATTR: u32 = 199;
+    // section 6: snapshot runs only, path-naming attribute calls newer than libc. numbers
+    // from arch/x86/entry/syscalls/syscall_64.tbl (torvalds/linux): 463 setxattrat and 466
+    // removexattrat (Linux 6.13), 469 file_setattr (Linux 6.17)
+    pub const SETXATTRAT: u32 = 463;
+    pub const REMOVEXATTRAT: u32 = 466;
+    pub const FILE_SETATTR: u32 = 469;
 }
 
 /// the mediated set (syscalls.md sections 3.1-3.5): trapped, decided by policy.
@@ -167,7 +189,43 @@ pub const DENIED_RECORDED: &[u32] = &[
 /// `io_cancel` and `io_destroy` need a context and so fail by themselves with `EINVAL`.
 /// these are routed to the notif return only when `build_filter_with(true)` asks, so a
 /// run without snapshots keeps today's filter and trace byte for byte.
-pub const SNAPSHOT_TRAPPED: &[u32] = &[nr::IO_SETUP, nr::IO_SUBMIT];
+///
+/// the same set holds the attribute calls newer than libc, `setxattrat`, `removexattrat`
+/// and `file_setattr`. each names a path and needs no open, so on a kernel that has them an
+/// agent could set `user.leash.lock` on its run cgroup, and an unlisted number is passed
+/// untabled. nothing in libc calls them yet, so they are answered `ENOSYS` after recording
+/// (`snapshot:xattrat`); a later change can mediate them like their older siblings.
+pub const SNAPSHOT_TRAPPED: &[u32] = &[
+    nr::IO_SETUP,
+    nr::IO_SUBMIT,
+    nr::SETXATTRAT,
+    nr::REMOVEXATTRAT,
+    nr::FILE_SETATTR,
+];
+
+/// metadata calls trapped only in a snapshot run (ADR-0024 decision 4). Landlock has no
+/// right for `chmod`, `chown`, xattrs or timestamps, so on a cgroup2 mount only the
+/// supervisor can keep the agent from changing the run cgroup's metadata (the
+/// `user.leash.lock` xattr, the mode of a control file). each is decided on the identity
+/// of the path or descriptor it names, like `chmod`, and is routed to the notif return only
+/// when `build_filter_with(true)` asks, so a run without snapshots keeps today's filter and
+/// trace byte for byte.
+pub const SNAPSHOT_METADATA: &[u32] = &[
+    nr::LCHOWN,
+    nr::UTIME,
+    nr::UTIMES,
+    nr::FUTIMESAT,
+    nr::UTIMENSAT,
+    nr::SETXATTR,
+    nr::LSETXATTR,
+    nr::REMOVEXATTR,
+    nr::LREMOVEXATTR,
+    nr::FCHMODAT2,
+    nr::FCHMOD,
+    nr::FCHOWN,
+    nr::FSETXATTR,
+    nr::FREMOVEXATTR,
+];
 
 /// build the filter program for a run without snapshot integrity restrictions.
 pub fn build_filter() -> Vec<SockFilter> {
@@ -184,15 +242,19 @@ pub fn build_filter() -> Vec<SockFilter> {
 /// pointer. with two tables of ~40 numbers every jump offset stays far below the u8 bound,
 /// which `filter_is_well_formed` pins.
 pub fn build_filter_with(snapshot_integrity: bool) -> Vec<SockFilter> {
-    let snapshot_extra: &[u32] = if snapshot_integrity {
+    let snapshot_extra: Vec<u32> = if snapshot_integrity {
         SNAPSHOT_TRAPPED
+            .iter()
+            .chain(SNAPSHOT_METADATA)
+            .copied()
+            .collect()
     } else {
-        &[]
+        Vec::new()
     };
     let tabled: Vec<u32> = MEDIATED
         .iter()
         .chain(DENIED_RECORDED)
-        .chain(snapshot_extra)
+        .chain(&snapshot_extra)
         .copied()
         .collect();
     // ld arch + jeq, ld nr + jset, one jeq per number, four extra sendto
@@ -205,7 +267,12 @@ pub fn build_filter_with(snapshot_integrity: bool) -> Vec<SockFilter> {
     // the largest jump is from pc 1 to the notif return, an offset of table length + 3;
     // the compile-time check below keeps it inside the u8 jump field as the tables grow.
     const _: () = assert!(
-        MEDIATED.len() + DENIED_RECORDED.len() + SNAPSHOT_TRAPPED.len() + 7 <= u8::MAX as usize
+        MEDIATED.len()
+            + DENIED_RECORDED.len()
+            + SNAPSHOT_TRAPPED.len()
+            + SNAPSHOT_METADATA.len()
+            + 7
+            <= u8::MAX as usize
     );
     let jump_to_notif = |from_pc: usize| -> u8 { (notif_pc - from_pc - 1) as u8 };
     let jump_to_allow = |from_pc: usize| -> u8 { (allow_pc - from_pc - 1) as u8 };
@@ -398,7 +465,64 @@ mod tests {
                 "snapshot filter traps {nr}"
             );
         }
-        assert_eq!(build_filter(), build_filter_with(false));
+    }
+
+    /// the SHA-256 of the default filter's instruction bytes (opcode, jt, jf and k of every
+    /// instruction, little-endian) as `origin/main` built it before snapshot runs trapped
+    /// anything extra. `build_filter()` is `build_filter_with(false)`, so comparing the two
+    /// would prove nothing; this pin fails the moment a number is added to, removed from, or
+    /// reordered in the tables a run without snapshots installs.
+    const DEFAULT_FILTER_SHA256: &str =
+        "120ac1f5e9613ac0ded7596e1a3942241fc522bd4d5ced20c123ba858cd1be5b";
+
+    fn digest_of(prog: &[SockFilter]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        for ins in prog {
+            hash.update(ins.code.to_le_bytes());
+            hash.update([ins.jt, ins.jf]);
+            hash.update(ins.k.to_le_bytes());
+        }
+        hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn the_default_filter_is_byte_identical_to_the_one_before_snapshot_runs() {
+        assert_eq!(build_filter().len(), 47);
+        assert_eq!(digest_of(&build_filter()), DEFAULT_FILTER_SHA256);
+        assert_eq!(digest_of(&build_filter_with(false)), DEFAULT_FILTER_SHA256);
+        assert_ne!(
+            digest_of(&build_filter_with(true)),
+            DEFAULT_FILTER_SHA256,
+            "the snapshot filter is the one that differs"
+        );
+    }
+
+    #[test]
+    fn snapshot_filter_traps_the_metadata_calls_and_the_default_filter_does_not() {
+        for &nr in SNAPSHOT_METADATA {
+            assert_eq!(
+                run_x86_64(&build_filter(), nr),
+                SECCOMP_RET_ALLOW,
+                "default filter passes {nr}"
+            );
+            assert_eq!(
+                run(&build_filter_with(true), nr, AUDIT_ARCH_X86_64, [0; 6]).unwrap(),
+                SECCOMP_RET_USER_NOTIF,
+                "snapshot filter traps {nr}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_snapshot_only_sets_do_not_overlap_the_default_tables() {
+        let default: Vec<u32> = MEDIATED.iter().chain(DENIED_RECORDED).copied().collect();
+        for nr in SNAPSHOT_TRAPPED.iter().chain(SNAPSHOT_METADATA) {
+            assert!(!default.contains(nr), "{nr} is already in a default table");
+        }
+        for nr in SNAPSHOT_METADATA {
+            assert!(!SNAPSHOT_TRAPPED.contains(nr));
+        }
     }
 
     #[test]
@@ -409,8 +533,8 @@ mod tests {
         assert_eq!(build_filter().len(), 4 + tabled + 4 + 2);
         assert_eq!(
             build_filter_with(true).len(),
-            4 + tabled + SNAPSHOT_TRAPPED.len() + 4 + 2,
-            "the snapshot filter adds exactly one jeq per AIO number"
+            4 + tabled + SNAPSHOT_TRAPPED.len() + SNAPSHOT_METADATA.len() + 4 + 2,
+            "the snapshot filter adds exactly one jeq per snapshot-only number"
         );
     }
 
@@ -568,10 +692,32 @@ mod tests {
             (nr::IO_URING_REGISTER, libc::SYS_io_uring_register),
             (nr::IO_SETUP, libc::SYS_io_setup),
             (nr::IO_SUBMIT, libc::SYS_io_submit),
+            // not in libc yet: checked against arch/x86/entry/syscalls/syscall_64.tbl,
+            // `463 setxattrat`, `466 removexattrat`, `469 file_setattr`
+            (nr::SETXATTRAT, 463),
+            (nr::REMOVEXATTRAT, 466),
+            (nr::FILE_SETATTR, 469),
+            (nr::LCHOWN, libc::SYS_lchown),
+            (nr::UTIME, libc::SYS_utime),
+            (nr::UTIMES, libc::SYS_utimes),
+            (nr::FUTIMESAT, libc::SYS_futimesat),
+            (nr::UTIMENSAT, libc::SYS_utimensat),
+            (nr::SETXATTR, libc::SYS_setxattr),
+            (nr::LSETXATTR, libc::SYS_lsetxattr),
+            (nr::REMOVEXATTR, libc::SYS_removexattr),
+            (nr::LREMOVEXATTR, libc::SYS_lremovexattr),
+            (nr::FCHMODAT2, 452),
+            (nr::FCHMOD, libc::SYS_fchmod),
+            (nr::FCHOWN, libc::SYS_fchown),
+            (nr::FSETXATTR, libc::SYS_fsetxattr),
+            (nr::FREMOVEXATTR, libc::SYS_fremovexattr),
         ];
         assert_eq!(
             pairs.len(),
-            MEDIATED.len() + DENIED_RECORDED.len() + SNAPSHOT_TRAPPED.len()
+            MEDIATED.len()
+                + DENIED_RECORDED.len()
+                + SNAPSHOT_TRAPPED.len()
+                + SNAPSHOT_METADATA.len()
         );
         for &(pinned, libc_nr) in pairs {
             assert_eq!(i64::from(pinned), libc_nr);

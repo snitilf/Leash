@@ -66,7 +66,7 @@ A `syscall` event, the common case, adds:
 | `ask_resolution` | present only for an `ask`: `approved`, `denied`, `timed_out`, or `unattended` |
 | `matched_rule` | the id of the policy rule that decided it, or the base rule ([`policy.md`](policy.md)) |
 | `would_deny` | present in record-only when a present policy would have denied (ADR-0010) |
-| `errno` | present only on an enforce-mode realization failure (`failsafe:realization`): the symbolic errno name the child received, e.g. `ENOENT` |
+| `errno` | present only on an enforce-mode realization failure (`failsafe:realization`) or an invalid metadata operand (`failsafe:unsupported_operand`): the symbolic errno name the child received, e.g. `ENOENT` or `E2BIG` |
 | `operand_decisions` | present for enforce-mode two-path filesystem operations; one independent `path`/`dest` decision and matched-rule id per required access mode |
 
 Fact details fixed by the notify loop:
@@ -104,7 +104,7 @@ Fact details fixed by the notify loop:
   It stays a fail-closed `deny`, and the child receives the errno the event names.
   The event records that errno by symbolic name in `errno` (an unnamed value is written `errno_<n>`).
   This is an additive optional field, so `schema_version` does not move; a reader that ignores it still decodes the event.
-  The field exists because the same decision covers different situations: a path that does not exist (`ENOENT`, `ENOTDIR`), which the kernel would have answered the same way for an unconfined process, a refused resolution (`ELOOP` from a magic link, `EXDEV` from an escape beneath the authoritative root), which is a security refusal, and a realization the allow could not complete (`EMFILE`, `ENFILE`, `ENOMEM` or `EIO` from a refused injection, `EOPNOTSUPP` from an `O_PATH` kind the broker does not reopen, `EACCES` from an `O_PATH` substitute the file mode refuses to reopen for reading).
+  The field exists because the same decision covers different situations: a path that does not exist (`ENOENT`, `ENOTDIR`), which the kernel would have answered the same way for an unconfined process, a refused resolution (`ELOOP` from a magic link, `EXDEV` from an escape beneath the authoritative root), which is a security refusal, except that `EXDEV` or `ELOOP` after a recorded allow on an `openat2` is the caller's own `resolve` restriction refusing its spelling, and a realization the allow could not complete (`EMFILE`, `ENFILE`, `ENOMEM` or `EIO` from a refused injection, `EOPNOTSUPP` from an `O_PATH` kind the broker does not reopen, `EACCES` from an `O_PATH` substitute the file mode refuses to reopen for reading).
   The errno is what lets a reader tell them apart without changing what the decision means.
 
 In a run with no policy, `matched_rule` carries a fixed base id naming what decided the event:
@@ -112,6 +112,9 @@ In a run with no policy, `matched_rule` carries a fixed base id naming what deci
 `sr4:io_uring`, `sr4:pidfd_getfd`, and `sr3:foreign_abi` (the denied-and-recorded set), and
 `failsafe:memory_read` (a case-C deny), and `failsafe:realization` (an enforce-mode path preparation failure, or a realization failure recorded as a second event after the allow, either with its `errno`).
 An enforce run with a policy adds `implicit:state_root`, the implicit deny of the state root and of moving, replacing or altering its ancestors, and `implicit:supervisor_proc`, the implicit deny of the supervisor's and broker's `/proc/<pid>/` trees; both rank before every policy rule (FR-21, ADR-0024).
+A snapshot run (`snapshot_integrity`) adds `implicit:cgroup`, the implicit deny of every cgroup2 mount, found by path or by the filesystem type of the pinned handle, and of moving, replacing or altering its ancestors, ranked the same way (ADR-0024 decision 4), `snapshot:aio`, `snapshot:clone3` and `snapshot:xattrat` (a call answered `ENOSYS`, ADR-0024 and ADR-0025), and `snapshot:metadata`, which only a seccomp filter and run flag that disagree can produce.
+`failsafe:unsupported_operand` is a metadata call whose own arguments the kernel would refuse (ADR-0025); it carries the `errno` the child received, such as `E2BIG` or `EINVAL`.
+Its `landlock_residuals` also carry `landlock:snapshot_store_read_overlap` when a read-only grant overlaps the state root or a cgroup2 mount (ADR-0024 decision 5).
 These are trace vocabulary, not policy rules; a loaded policy's rule ids never
 collide with them because they carry a `:` and rule ids are plain names.
 

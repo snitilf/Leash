@@ -14,8 +14,9 @@ use std::io;
 pub const PATH_READ_CAP: usize = 4096;
 /// maximum destination-bearing send payload copied for broker realization (ADR-0020).
 pub const NETWORK_PAYLOAD_CAP: usize = 65_535;
-/// absolute ceiling for a fixed-size child-memory read.
-pub const ABSOLUTE_READ_CAP: usize = NETWORK_PAYLOAD_CAP;
+/// absolute ceiling for one fixed-size child-memory read: the kernel's `XATTR_SIZE_MAX`, the
+/// largest value the supervisor copies. a longer read is refused, never shortened.
+pub const ABSOLUTE_READ_CAP: usize = 65_536;
 /// bytes of `struct open_how` the loop needs: the leading u64 `flags` field.
 pub const OPEN_HOW_FLAGS_SIZE: usize = 8;
 
@@ -30,6 +31,15 @@ pub enum MemReadError {
     /// accept is hostile by definition
     #[error("no nul terminator within the {0}-byte cap")]
     NoNulWithinCap(usize),
+    /// the value is longer than the ceiling on one read. it is refused, never clamped to a
+    /// shorter value the caller would take for the whole
+    #[error("a {wanted}-byte read is over the {cap}-byte ceiling")]
+    OverCap {
+        /// bytes the caller asked for
+        wanted: usize,
+        /// the ceiling on one read
+        cap: usize,
+    },
     /// the read returned fewer bytes than the fixed-size value needs
     #[error("short read: wanted {wanted} bytes, got {got}")]
     Short {
@@ -94,13 +104,19 @@ pub fn read_cstr_capped(
 }
 
 /// read exactly `len` bytes at `addr` through `read_at`. for fixed-size structs
-/// (`open_how` flags); `len` is capped at one page.
+/// (`open_how` flags) and xattr values. a `len` over `ABSOLUTE_READ_CAP` is an error: a clamped
+/// read would hand the caller a shorter value that it takes for the whole.
 pub fn read_exact_capped(
     mut read_at: impl FnMut(u64, &mut [u8]) -> io::Result<usize>,
     addr: u64,
     len: usize,
 ) -> Result<Vec<u8>, MemReadError> {
-    let len = len.min(ABSOLUTE_READ_CAP);
+    if len > ABSOLUTE_READ_CAP {
+        return Err(MemReadError::OverCap {
+            wanted: len,
+            cap: ABSOLUTE_READ_CAP,
+        });
+    }
     let mut buf = vec![0u8; len];
     let mut got = 0;
     while got < len {
@@ -271,5 +287,38 @@ mod tests {
             read_exact_capped(|p, b| mem.read_at(p, b), 0x1000 + 4, 8),
             Err(MemReadError::Io(_) | MemReadError::Short { .. })
         ));
+    }
+
+    #[test]
+    fn a_read_at_the_ceiling_returns_every_byte() {
+        let mem = FakeMem {
+            base: 0x1000,
+            bytes: (0..ABSOLUTE_READ_CAP + 8)
+                .map(|i| (i % 251) as u8)
+                .collect(),
+        };
+        let got = read_exact_capped(|p, b| mem.read_at(p, b), 0x1000, ABSOLUTE_READ_CAP).unwrap();
+        assert_eq!(got.len(), ABSOLUTE_READ_CAP);
+        assert_eq!(got, mem.bytes[..ABSOLUTE_READ_CAP]);
+    }
+
+    #[test]
+    fn a_read_past_the_ceiling_is_an_error_never_a_shorter_value() {
+        let mem = FakeMem {
+            base: 0x1000,
+            bytes: vec![1u8; ABSOLUTE_READ_CAP + 8],
+        };
+        match read_exact_capped(|p, b| mem.read_at(p, b), 0x1000, ABSOLUTE_READ_CAP + 1) {
+            Err(MemReadError::OverCap { wanted, cap }) => {
+                assert_eq!((wanted, cap), (ABSOLUTE_READ_CAP + 1, ABSOLUTE_READ_CAP));
+            }
+            other => panic!("a longer read must not be clamped: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_ceiling_holds_the_largest_xattr_value() {
+        // the kernel's XATTR_SIZE_MAX is 65536; the value is read whole or not at all
+        assert_eq!(ABSOLUTE_READ_CAP, 65_536);
     }
 }

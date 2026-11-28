@@ -33,6 +33,9 @@ pub struct StateRoot {
     links: Vec<PathBuf>,
     /// the processes whose `/proc/<pid>` tree is denied: the supervisor and its broker.
     proc_pids: Vec<u32>,
+    /// `(st_dev, st_ino)` of the root directory, when it exists to be statted. a descriptor
+    /// is judged on this as well as on the path its `/proc` link spells.
+    identity: Option<(u64, u64)>,
 }
 
 impl StateRoot {
@@ -77,11 +80,24 @@ impl StateRoot {
                 ));
             }
         }
+        // a root that cannot be statted (it does not exist yet) has no identity to match
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&root).ok().map(|m| (m.dev(), m.ino()))
+        };
         Ok(Self {
             root,
             links,
             proc_pids: Vec::new(),
+            identity,
         })
+    }
+
+    /// is this `(st_dev, st_ino)` the root directory itself? a descriptor that reaches the
+    /// root by a path nothing matches, such as a bind mount alias, still has this identity.
+    /// only the directory is known by identity: an object beneath it keeps the path rule.
+    pub fn is_identity(&self, dev: u64, ino: u64) -> bool {
+        self.identity == Some((dev, ino))
     }
 
     /// name the processes whose `/proc/<pid>` tree is denied (the supervisor and its broker).
@@ -157,7 +173,7 @@ impl StateRoot {
 }
 
 /// fold `.` and `..` out of an absolute path without touching the filesystem.
-fn normalize_lexically(path: &Path) -> PathBuf {
+pub(crate) fn normalize_lexically(path: &Path) -> PathBuf {
     let mut out = PathBuf::from("/");
     for component in path.components() {
         match component {
@@ -173,7 +189,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 
 /// resolve through symlinks as far as the path exists, then append the rest lexically, so a
 /// not-yet-existing binary under a symlinked directory still resolves.
-fn resolve_leniently(path: &Path) -> PathBuf {
+pub(crate) fn resolve_leniently(path: &Path) -> PathBuf {
     if let Ok(resolved) = path.canonicalize() {
         return resolved;
     }
@@ -419,5 +435,34 @@ mod tests {
             assert!(!r.denies_proc(Path::new(path)), "{path}");
         }
         assert!(!root().denies_proc(Path::new("/proc/100/mem")));
+    }
+
+    #[test]
+    fn a_root_that_exists_is_known_by_its_device_and_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let base = tempfile::tempdir().unwrap();
+        let state = base.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(state.join("file"), b"x").unwrap();
+        let root = StateRoot::from_resolved(state.canonicalize().unwrap()).unwrap();
+        let (dev, ino) = {
+            let m = std::fs::metadata(&state).unwrap();
+            (m.dev(), m.ino())
+        };
+        assert!(root.is_identity(dev, ino), "the directory is the root");
+        assert!(!root.is_identity(dev, ino + 1_000_000));
+        assert!(!root.is_identity(dev.wrapping_add(1), ino));
+        let inside = std::fs::metadata(state.join("file")).unwrap();
+        assert!(
+            !root.is_identity(inside.dev(), inside.ino()),
+            "a file beneath the root is not the root"
+        );
+    }
+
+    #[test]
+    fn a_root_that_does_not_exist_has_no_identity_to_match() {
+        let root = root();
+        assert!(!root.is_identity(0, 0));
+        assert!(!root.is_identity(1, 1));
     }
 }

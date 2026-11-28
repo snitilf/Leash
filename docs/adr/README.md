@@ -56,6 +56,7 @@ Numbering: scan this directory for the highest number, increment by one.
 | [0021](0021-accept-wait-killable-recv-post-send-race.md) | Accept the residual WAIT_KILLABLE_RECV post-SEND race | accepted |
 | [0022](0022-exact-snapshot-capture-barrier.md) | Exact snapshots require exclusive ownership and a capture barrier | accepted; mode scope and protected-storage prerequisite superseded by ADR-0024 |
 | [0023](0023-namespace-root-anchor-resolves-in-root.md) | The namespace-root anchor resolves with RESOLVE_IN_ROOT | accepted |
-| [0024](0024-enforce-mode-snapshots-without-a-custodian.md) | Enforce-mode snapshots without a custodian | accepted |
+| [0024](0024-enforce-mode-snapshots-without-a-custodian.md) | Enforce-mode snapshots without a custodian | accepted (metadata residual refined by ADR-0025) |
+| [0025](0025-metadata-calls-in-snapshot-runs.md) | Metadata calls in snapshot runs | accepted |
 
 These encode the project's load-bearing decisions. They are the committed, authoritative source.

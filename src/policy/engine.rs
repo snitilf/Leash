@@ -96,6 +96,9 @@ pub enum MatchId {
     /// the implicit, first-ranked deny of the supervisor's and broker's `/proc/<pid>` tree
     /// in an enforce run, a sibling of [`MatchId::ImplicitStateRoot`].
     ImplicitSupervisorProc,
+    /// in a snapshot-integrity run, the implicit, first-ranked deny of every cgroup2 mount
+    /// (ADR-0024 decision 4), a sibling of [`MatchId::ImplicitStateRoot`].
+    ImplicitCgroup,
 }
 
 impl fmt::Display for MatchId {
@@ -107,6 +110,7 @@ impl fmt::Display for MatchId {
             MatchId::BaseRecordOnly => f.write_str("base:record_only"),
             MatchId::ImplicitStateRoot => f.write_str("implicit:state_root"),
             MatchId::ImplicitSupervisorProc => f.write_str("implicit:supervisor_proc"),
+            MatchId::ImplicitCgroup => f.write_str("implicit:cgroup"),
         }
     }
 }

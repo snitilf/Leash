@@ -1045,9 +1045,8 @@ fn the_attach_descriptor_and_run_lock_do_not_survive_into_the_agent() {
     run.assert_exit_zero();
 }
 
-/// the agent's own writes to the cgroup control files are denied. today the layer that
-/// denies them is the ordinary enforce policy (no write grant, seccomp and Landlock); the
-/// implicit cgroup2 deny of ADR-0024 decision 4 is a follow-up slice.
+/// the agent's own writes to the cgroup control files are denied. the implicit cgroup2 deny
+/// (ADR-0024 decision 4) decides them before any policy rule, read included.
 #[test]
 fn the_agent_cannot_write_cgroup_procs_or_freeze_under_the_default_policy() {
     let _guard = spawn_lock();
@@ -1082,13 +1081,15 @@ fn the_agent_cannot_write_cgroup_procs_or_freeze_under_the_default_policy() {
         })
         .collect();
     assert_eq!(denied.len(), 6, "{denied:?}");
+    for event in denied {
+        assert_eq!(event["matched_rule"], "implicit:cgroup", "{event:?}");
+    }
 }
 
-/// a policy that grants write on the cgroup2 mount overlaps the control plane, which the
-/// run must refuse before spawn (ADR-0024 decision 5), but that refusal is a follow-up
-/// slice, so today the grant is honored and the agent could move itself out.
+/// a policy that grants write on the cgroup2 mount overlaps the control plane, which the run
+/// refuses before spawn (ADR-0024 decision 5). Landlock cannot subtract a subtree from a
+/// grant, so the agent could otherwise write its own `cgroup.procs`.
 #[test]
-#[ignore = "ADR-0024 decisions 4 and 5: the cgroup2 implicit deny and the overlap refusal are a follow-up slice"]
 fn a_policy_grant_that_overlaps_the_cgroup_control_plane_is_refused() {
     let _guard = spawn_lock();
     if !common::delegated_cgroup_or_skip("overlap_refused") {
@@ -1098,10 +1099,20 @@ fn a_policy_grant_that_overlaps_the_cgroup_control_plane_is_refused() {
     session.write_policy(&format!(
         "{POLICY}[[fs]]\npath=\"/sys/fs/cgroup/**\"\nmode=[\"read\", \"write\"]\naction=\"allow\"\n"
     ));
-    let result = session.run(&["/bin/true"]);
+    let error = session
+        .run(&["/bin/true"])
+        .err()
+        .expect("a write grant over a cgroup2 mount is refused before spawn");
     assert!(
-        result.is_err(),
-        "a write grant over a cgroup2 mount is refused before spawn"
+        matches!(error, SessionError::SnapshotGrantOverlap(_)),
+        "{error}"
+    );
+    let text = error.to_string();
+    assert!(text.contains("cgroup2 mount"), "{text}");
+    assert!(text.contains("write"), "{text}");
+    assert!(
+        !session.state.path().join("runs").exists(),
+        "refused before any run directory exists"
     );
 }
 

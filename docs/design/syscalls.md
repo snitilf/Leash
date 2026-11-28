@@ -120,7 +120,7 @@ for write). It is above the kernel floor (ABI 3 is Linux 6.2, floor is ABI 2), s
 ABI lacks it the seccomp layer mediates `truncate` and the missing backstop is stamped as a residual,
 per the degrade table in [`architecture.md`](architecture.md) section 5.1 (ADR-0012, ADR-0013).
 
-`ftruncate`, `fchmod`, `fchown` act on an fd already decided at open and are pass-through, as are
+`ftruncate`, `fchmod`, `fchown` act on an fd already decided at open and are pass-through (in a snapshot run `fchmod` and `fchown` are decided on the descriptor's target, see the end of section 3.3), as are
 `chdir` and `fchdir`, which change the process's cwd and mutate nothing (traversal is governed by
 Landlock reachability regardless). Their metadata-mutating path cousins `chmod`, `chown`, `fchmodat`,
 `fchownat` are mediated and decided as a **write** to the target path against the existing `fs`
@@ -160,6 +160,41 @@ The denial is recorded with the rule id `snapshot:clone3`.
 `ENOSYS` matches the `io_uring` denial and tells a caller the facility is absent, which is how libaio and glibc already handle a kernel without AIO.
 The freezer stops tasks, not in-flight I/O, so no AIO context may exist.
 `io_getevents`, `io_pgetevents`, `io_cancel` and `io_destroy` need a context and fail with `EINVAL` on their own.
+
+A snapshot run also traps the metadata calls Landlock has no right for (ADR-0024 decision 4), and only that run: the filter of a run without snapshots is byte for byte unchanged.
+The path forms are `setxattr`, `lsetxattr`, `removexattr`, `lremovexattr`, `utimensat`, `utimes`, `utime`, `futimesat`, `fchmodat2` and `lchown`.
+They go through the same path as `chmod`: the broker resolves the path on a retained handle, the access is a write to the resolved identity, the implicit denies (`implicit:state_root`, `implicit:cgroup`) rank before policy, and an allow is realized by the broker, never by `CONTINUE`.
+The legacy time calls become one `utimensat` on the handle.
+`fchmodat2` with `AT_SYMLINK_NOFOLLOW` on a symlink is refused `EOPNOTSUPP`, as the kernel does.
+`lsetxattr` and `lremovexattr` on a symlink cannot be realized, because a symlink cannot be reached through its proc link without being followed: a `user.` name gets `EPERM`, which is the kernel's own answer for that namespace, and another namespace gets `EOPNOTSUPP`.
+`utimensat` and `fchmodat2` with `AT_EMPTY_PATH` and an empty path act on the object of their directory descriptor, as the kernel does, and are realized by the broker on that object's path, never continued, because the empty string is in agent memory.
+A call whose own arguments the kernel refuses before it looks at a path (an unknown flag, an xattr value over 65536 bytes) is answered with that errno and recorded as `failsafe:unsupported_operand`, not as a failed memory read.
+An xattr value of exactly 65536 bytes is read whole and stored whole.
+A read of agent memory longer than its ceiling of 65536 bytes is an error, never a shorter value taken for the whole.
+The value crosses the broker socket as hex, two characters a byte, because a decimal spelling of 64 KiB of high bytes is larger than the socket accepts in one packet.
+`utimensat` (including `touch -h` and `AT_EMPTY_PATH`) and `lchown` on the workspace root act on the pinned root handle, because a root has no parent directory and name to act through.
+A root that were a symlink would be refused rather than followed, though an anchor is canonical and never one.
+`mkdir` of the workspace root answers `EEXIST`, as the kernel does, which `tar -x -C <workspace>` relies on for `.`.
+The path-naming calls newer than any C library, `setxattrat` (463), `removexattrat` (466, Linux 6.13) and `file_setattr` (469, Linux 6.17), are trapped in a snapshot run and answered `ENOSYS`, recorded as `snapshot:xattrat`.
+Nothing calls them yet, so refusing them costs nothing, and without a table entry the filter would pass them and an agent could set `user.leash.lock` on its run cgroup with no open.
+The numbers are those of `arch/x86/entry/syscalls/syscall_64.tbl`, pinned in the filter tests.
+Mediation can replace the `ENOSYS` later, and a kernel older than the call answers `ENOSYS` anyway, so the trace event is what shows the call was intercepted.
+The descriptor forms are `fchmod`, `fchown`, `fsetxattr`, `fremovexattr` and `utimensat` or `futimesat` with a null path (`futimens`).
+Their target is read back from `/proc/<pid>/fd/<n>`, judged as a write to that path, and an allow continues.
+The descriptor is also duplicated with `pidfd_getfd` and described with `fstatfs` and `fstat`, and the duplicate is closed before the decision is made.
+The supervisor may use `pidfd_getfd`; SR-4 denies it only to the agent.
+A descriptor on a cgroup2 filesystem (`CGROUP2_SUPER_MAGIC`) is denied as `implicit:cgroup` in a snapshot run, and a descriptor whose `(st_dev, st_ino)` is the state root directory is denied as `implicit:state_root`, whatever path the link spells.
+So a descriptor reached through a bind mount alias, or one whose link reads back as something nothing denies, is still judged by what it is.
+Only the state root directory itself is known by identity; an object beneath it is judged by its path.
+That is not a pointer re-read: the object is the descriptor's, fixed when the agent opened it.
+It is a time-of-check gap all the same: a sibling thread can `dup2` another descriptor onto `<n>` between the `/proc` readlink and the duplicate, or between the duplicate and the `CONTINUE`, so the judged object and the acted-on object can differ.
+The path and the filesystem type are both checked, so the swap has to land on an object that passes both; the race itself remains.
+What bounds it is that no descriptor on a state-root or cgroup2 file can be opened from inside the tree, because the open is denied, so the only descriptors a sibling can swap in are on files the agent may already write.
+It is not true that such a descriptor cannot be obtained at all.
+`open_tree` yields an `O_PATH` descriptor, which these calls refuse with `EBADF` (unverified on Linux 6.13 and later), and an out-of-tree helper reached through an allowed channel can pass a descriptor over a socket (ADR-0024, the helper residual).
+A descriptor on an anonymous target reads back as `pipe:[N]`, `socket:[N]` or `/memfd:name (deleted)`, is judged as that path, and is usually denied by policy; that is a compatibility cost.
+A target or a duplicate that cannot be read (the descriptor was closed meanwhile) is denied as `failsafe:memory_read`.
+The filter and the run flag are checked at the start of the loop, and a trapped metadata call that reaches a run without the flag is denied and recorded as `snapshot:metadata`.
 A run without snapshots keeps the filter and the trace unchanged: the AIO numbers are not in its filter.
 
 ### 3.4 Cross-process control
@@ -292,7 +327,21 @@ denied.
 For a child `openat2`, v1 accepts the base `open_how` layout plus zero-filled extension bytes.
 Nonzero extension bytes return `E2BIG`.
 `O_PATH` with any flag outside `O_DIRECTORY`, `O_NOFOLLOW`, and `O_CLOEXEC` (an access mode, `O_CREAT`, `O_TRUNC`) returns `EINVAL`, as the kernel's `openat2` does, and nothing is opened or created; when several apply, `E2BIG` takes precedence, then `EINVAL`, then `EOPNOTSUPP`.
-Nonzero caller `resolve` flags return `EOPNOTSUPP` until their exact interaction with the broker's mandatory resolution flags is specified and tested.
+The caller's `resolve` flags `RESOLVE_NO_XDEV`, `RESOLVE_NO_MAGICLINKS`, `RESOLVE_NO_SYMLINKS`, and `RESOLVE_BENEATH` only narrow how the caller's own spelling of the path may resolve, so they add no authority and do not change the object the policy judged.
+After the policy allows the open, the supervisor resolves the spelling once more without opening anything, from the directory the spelling starts from and with the caller's bits, and answers the `EXDEV` or `ELOOP` the kernel would give.
+That directory is the real object the agent holds, opened as an `O_PATH` descriptor through `/proc/<pid>/cwd` or `/proc/<pid>/fd/<n>`, and never the directory its link reads back as text.
+Opening that magic link is safe here because it names the agent's own working directory or descriptor, the kernel jumps to the object without walking any path text, and the result is only a base to resolve from.
+The supervisor checks that the notification is still valid after that open and before it uses the result, and drops the call if it is not.
+An absolute spelling resolves from the supervisor's own root, as the kernel resolves it for every caller.
+With `O_CREAT|O_EXCL` the check does not follow a final symlink, as the kernel does not, so an existing one is left to the real open, which answers `EEXIST`.
+The refusal is recorded as a second event under `failsafe:realization` with the errno, like any other failure after a recorded allow.
+Any other outcome of that check is left to the real open, which answers it.
+A spelling that cannot be checked, because its directory cannot be opened, returns `EOPNOTSUPP`.
+The check and the open are separate resolutions of the spelling, so the caller's guarantee is best-effort under a concurrent swap of a path component, and the object the policy judged is still the one that is opened.
+The check runs in the supervisor, outside the broker's deadline, so a hung mount on the path could stall the loop; that is tracked in a follow-up issue.
+Modern `tar` opens each directory it extracts into with `RESOLVE_BENEATH`, so refusing these flags broke extraction on hosts whose `tar` does that.
+`RESOLVE_IN_ROOT` and `RESOLVE_CACHED` return `EOPNOTSUPP`, because the first changes what the spelling means and the second changes whether the call may block, and neither is checked by the same second resolution.
+A bit outside the six the kernel defines, and `RESOLVE_BENEATH` with `RESOLVE_IN_ROOT`, return `EINVAL`, as the kernel does.
 
 ## 5. The denied-and-recorded set
 

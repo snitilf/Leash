@@ -598,11 +598,9 @@ pub fn run() -> ExitCode {
             .ask_timeout
             .map(std::time::Duration::from_secs)
             .unwrap_or(crate::supervisor::run::DEFAULT_ASK_TIMEOUT),
-        // keep snapshot_integrity off at the CLI until the --snapshots slice lands ADR-0024
-        // decisions 4 and 5 (implicit cgroup2 mount deny, including denying fchmodat2 and
-        // setxattr/removexattr on cgroup2 mounts, and Landlock overlap refusal) and
-        // un-ignores a_policy_grant_that_overlaps_the_cgroup_control_plane_is_refused in
-        // tests/run_cgroup_linux.rs.
+        // ADR-0024 decisions 4 to 6 are in place in the session (the implicit cgroup2 deny and
+        // the metadata calls it needs, the Landlock overlap refusal, the ABI 3 floor). the
+        // `--snapshots` flag that turns this on is added by the capture slice, so it stays off here.
         snapshot_integrity: false,
     })
 }

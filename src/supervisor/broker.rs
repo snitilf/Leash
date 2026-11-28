@@ -21,6 +21,42 @@ use serde::{Deserialize, Serialize};
 use crate::sandbox::landlock::{PreparedRuleset, RootAnchor};
 
 const MAX_PACKET: usize = 1_048_576;
+
+/// two hex digits per byte on the wire, for the fields that can reach 64 KiB. json spells a
+/// `Vec<u8>` as decimal numbers, up to four characters a byte, and a packet over the
+/// socket's send buffer (about 208 KiB) is refused with `EMSGSIZE`, which would end the run
+/// over one large value. hex is two characters a byte whatever the byte.
+mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut text = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            text.push(char::from(DIGITS[usize::from(byte >> 4)]));
+            text.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+        }
+        serializer.serialize_str(&text)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let digit = |c: u8| match c {
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            _ => Err(D::Error::custom("not a lowercase hex digit")),
+        };
+        let raw = text.as_bytes();
+        if raw.len() % 2 != 0 {
+            return Err(D::Error::custom("odd number of hex digits"));
+        }
+        raw.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| Ok(digit(pair[0])? << 4 | digit(pair[1])?))
+            .collect()
+    }
+}
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
@@ -58,6 +94,7 @@ pub struct PreparedPath {
     token: u64,
     identity: PathBuf,
     exists: bool,
+    on_cgroup2: bool,
 }
 
 impl PreparedPath {
@@ -74,6 +111,13 @@ impl PreparedPath {
     /// Whether the final entry existed during preparation.
     pub fn exists(&self) -> bool {
         self.exists
+    }
+
+    /// Whether the pinned object, or the directory a missing entry would be created in, is on
+    /// a cgroup2 filesystem. read from the retained handle, so a bind mount or a mount made
+    /// after the run started is told apart by what it is and not by where it is.
+    pub fn on_cgroup2(&self) -> bool {
+        self.on_cgroup2
     }
 }
 
@@ -144,6 +188,40 @@ pub enum MutationOperation {
         /// Requested gid, including `u32::MAX` for unchanged.
         gid: u32,
         /// `fchownat` flags.
+        flags: i32,
+    },
+    /// `fchmodat2(2)` with `AT_SYMLINK_NOFOLLOW`: refused with `EOPNOTSUPP` when the final
+    /// component is a symlink, as the kernel does.
+    ChmodNoFollow {
+        /// Requested mode.
+        mode: u32,
+    },
+    /// `setxattr(2)` or `lsetxattr(2)` against the pinned target (snapshot runs).
+    Setxattr {
+        /// Attribute name, without the terminating nul.
+        name: Vec<u8>,
+        /// Attribute value.
+        #[serde(with = "hex_bytes")]
+        value: Vec<u8>,
+        /// `XATTR_CREATE` or `XATTR_REPLACE`, or zero.
+        flags: i32,
+        /// whether the final symlink was followed when the path was prepared
+        follow: bool,
+    },
+    /// `removexattr(2)` or `lremovexattr(2)` against the pinned target (snapshot runs).
+    Removexattr {
+        /// Attribute name, without the terminating nul.
+        name: Vec<u8>,
+        /// whether the final symlink was followed when the path was prepared
+        follow: bool,
+    },
+    /// `utimensat(2)` against the pinned target (snapshot runs). The legacy `utime`,
+    /// `utimes` and `futimesat` calls are converted to this form by the supervisor.
+    Utimens {
+        /// access seconds, access nanoseconds, modify seconds, modify nanoseconds; `None`
+        /// means "now" for both, as a null `times` pointer does
+        times: Option<[i64; 4]>,
+        /// `0` or `AT_SYMLINK_NOFOLLOW`
         flags: i32,
     },
 }
@@ -246,12 +324,14 @@ impl Broker {
                     token,
                     identity,
                     exists,
+                    on_cgroup2,
                 },
                 None,
             ) => Ok(BrokerResultOrPath::Path(PreparedPath {
                 token,
                 identity: PathBuf::from(std::ffi::OsString::from_vec(identity)),
                 exists,
+                on_cgroup2,
             })),
             (Response::Errno { errno }, None) => {
                 Ok(BrokerResultOrPath::Result(BrokerResult::Errno(errno)))
@@ -458,6 +538,7 @@ enum Request {
     Network {
         operation: NetworkOperation,
         address: Vec<u8>,
+        #[serde(with = "hex_bytes")]
         payload: Vec<u8>,
         flags: i32,
     },
@@ -474,6 +555,7 @@ enum Response {
         token: u64,
         identity: Vec<u8>,
         exists: bool,
+        on_cgroup2: bool,
     },
     Result {
         value: i64,
@@ -688,6 +770,12 @@ impl BrokerState<'_> {
             return self.errno(libc::EXDEV);
         }
 
+        // the filesystem the handle is on: the object itself, or the directory a missing
+        // entry would be created in
+        let on_cgroup2 = target
+            .as_ref()
+            .or(parent.as_ref())
+            .is_some_and(|fd| fd_on_cgroup2(fd.as_fd()));
         let token = self.next_token;
         self.next_token = self.next_token.checked_add(1).unwrap_or(1);
         self.held.insert(
@@ -703,6 +791,7 @@ impl BrokerState<'_> {
                 token,
                 identity: identity.as_os_str().as_bytes().to_vec(),
                 exists,
+                on_cgroup2,
             },
             None,
         )
@@ -831,6 +920,17 @@ impl BrokerState<'_> {
             MutationOperation::Symlink { target } => symlink_held(&primary, &target),
             MutationOperation::Chmod { mode } => chmod_held(&primary, mode),
             MutationOperation::Chown { uid, gid, flags } => chown_held(&primary, uid, gid, flags),
+            MutationOperation::ChmodNoFollow { mode } => chmod_nofollow_held(&primary, mode),
+            MutationOperation::Setxattr {
+                name,
+                value,
+                flags,
+                follow,
+            } => setxattr_held(&primary, &name, &value, flags, follow),
+            MutationOperation::Removexattr { name, follow } => {
+                removexattr_held(&primary, &name, follow)
+            }
+            MutationOperation::Utimens { times, flags } => utimens_held(&primary, times, flags),
         };
         match result {
             Ok(value) => self.respond(&Response::Result { value }, None),
@@ -934,6 +1034,11 @@ fn rename_held(source: &HeldPath, destination: &HeldPath, flags: u32) -> io::Res
 }
 
 fn mkdir_held(path: &HeldPath, mode: u32) -> io::Result<i64> {
+    // an anchor root has no parent or name, and it exists: the kernel answers a mkdir of any
+    // existing path `EEXIST`, which is what `tar -x -C <root>` expects of `.`
+    if path.parent.is_none() && path.target.is_some() {
+        return Err(io::Error::from_raw_os_error(libc::EEXIST));
+    }
     let (parent, name) = required_parent_name(path)?;
     // SAFETY: name is retained and parent is a live directory descriptor.
     rc_zero(unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) })
@@ -984,7 +1089,7 @@ fn chown_held(path: &HeldPath, uid: u32, gid: u32, flags: i32) -> io::Result<i64
     if flags & !libc::AT_SYMLINK_NOFOLLOW != 0 {
         return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
     }
-    if flags == libc::AT_SYMLINK_NOFOLLOW {
+    if flags == libc::AT_SYMLINK_NOFOLLOW && !acts_on_pinned_target(path)? {
         let (parent, name) = required_parent_name(path)?;
         // SAFETY: name is retained and parent is a live directory descriptor.
         return rc_zero(unsafe {
@@ -1001,6 +1106,133 @@ fn chown_held(path: &HeldPath, uid: u32, gid: u32, flags: i32) -> io::Result<i64
     let proc_path = proc_fd_path(target)?;
     // SAFETY: proc_path resolves to the retained target descriptor.
     rc_zero(unsafe { libc::chown(proc_path.as_ptr(), uid, gid) })
+}
+
+/// `S_ISLNK` of the pinned target, so a no-follow call can refuse a symlink it cannot act on.
+fn target_is_symlink(target: BorrowedFd<'_>) -> io::Result<bool> {
+    let mut stat: libc::stat = unsafe { zeroed() };
+    // SAFETY: target is a live descriptor and stat points to writable local storage.
+    if unsafe { libc::fstat(target.as_raw_fd(), &raw mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat.st_mode & libc::S_IFMT == libc::S_IFLNK)
+}
+
+/// whether a no-follow call acts on the pinned target through its proc link, as the following
+/// form does, instead of through the parent and name.
+/// a target that is not a symlink is the same object either way, and the pinned handle is the
+/// object the policy decision was made on. an anchor root has no parent or name (it is a
+/// canonical directory, never a symlink), so the handle is the only way to reach it. a symlink
+/// cannot be reached through its proc link without being followed: it is acted on by name, and
+/// an anchor root that were one is refused rather than followed.
+fn acts_on_pinned_target(path: &HeldPath) -> io::Result<bool> {
+    let Some(target) = path.target.as_ref() else {
+        return Ok(false);
+    };
+    if !target_is_symlink(target.as_fd())? {
+        return Ok(true);
+    }
+    if path.parent.is_none() {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    Ok(false)
+}
+
+fn chmod_nofollow_held(path: &HeldPath, mode: u32) -> io::Result<i64> {
+    if target_is_symlink(required_target(path)?)? {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    chmod_held(path, mode)
+}
+
+/// the errno for a no-follow xattr call whose target is a symlink. a symlink cannot be reached
+/// through its proc link without being followed, so the call cannot be realized. the kernel
+/// itself refuses the `user.` namespace on anything but a regular file or directory with
+/// `EPERM`, and that is the answer a `user.` name gets; another namespace is `EOPNOTSUPP`.
+fn symlink_xattr_errno(name: &[u8]) -> i32 {
+    if name.starts_with(b"user.") {
+        libc::EPERM
+    } else {
+        libc::EOPNOTSUPP
+    }
+}
+
+/// the xattr name or value as the C string the kernel takes, refusing an interior nul.
+fn xattr_name(name: &[u8]) -> io::Result<CString> {
+    CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+fn setxattr_held(
+    path: &HeldPath,
+    name: &[u8],
+    value: &[u8],
+    flags: i32,
+    follow: bool,
+) -> io::Result<i64> {
+    let target = required_target(path)?;
+    if !follow && target_is_symlink(target)? {
+        return Err(io::Error::from_raw_os_error(symlink_xattr_errno(name)));
+    }
+    let name = xattr_name(name)?;
+    let proc_path = proc_fd_path(target)?;
+    // SAFETY: proc_path and name are C strings, value is a live slice of the given length.
+    rc_zero(unsafe {
+        libc::setxattr(
+            proc_path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            flags,
+        )
+    })
+}
+
+fn removexattr_held(path: &HeldPath, name: &[u8], follow: bool) -> io::Result<i64> {
+    let target = required_target(path)?;
+    if !follow && target_is_symlink(target)? {
+        return Err(io::Error::from_raw_os_error(symlink_xattr_errno(name)));
+    }
+    let name = xattr_name(name)?;
+    let proc_path = proc_fd_path(target)?;
+    // SAFETY: proc_path and name are C strings.
+    rc_zero(unsafe { libc::removexattr(proc_path.as_ptr(), name.as_ptr()) })
+}
+
+fn utimens_held(path: &HeldPath, times: Option<[i64; 4]>, flags: i32) -> io::Result<i64> {
+    if flags & !libc::AT_SYMLINK_NOFOLLOW != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let spec = times.map(|t| {
+        [
+            libc::timespec {
+                tv_sec: t[0],
+                tv_nsec: t[1],
+            },
+            libc::timespec {
+                tv_sec: t[2],
+                tv_nsec: t[3],
+            },
+        ]
+    });
+    let spec_ptr = spec.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
+    if flags == libc::AT_SYMLINK_NOFOLLOW && !acts_on_pinned_target(path)? {
+        let (parent, name) = required_parent_name(path)?;
+        // SAFETY: name is retained, parent is a live directory descriptor, and spec_ptr is
+        // null or points at two live timespecs.
+        return rc_zero(unsafe {
+            libc::utimensat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                spec_ptr,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        });
+    }
+    let target = required_target(path)?;
+    let proc_path = proc_fd_path(target)?;
+    // SAFETY: proc_path resolves to the retained target descriptor and spec_ptr is null or
+    // points at two live timespecs.
+    rc_zero(unsafe { libc::utimensat(libc::AT_FDCWD, proc_path.as_ptr(), spec_ptr, 0) })
 }
 
 fn required_target(path: &HeldPath) -> io::Result<BorrowedFd<'_>> {
@@ -1098,7 +1330,13 @@ fn prepare_parent(
     Ok((parent_fd, basename))
 }
 
-fn openat2(dirfd: RawFd, path: &CStr, flags: u64, mode: u64, resolve: u64) -> io::Result<OwnedFd> {
+pub(crate) fn openat2(
+    dirfd: RawFd,
+    path: &CStr,
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+) -> io::Result<OwnedFd> {
     let how = OpenHow {
         flags,
         mode,
@@ -1129,6 +1367,17 @@ fn owned_fd(fd: RawFd) -> io::Result<OwnedFd> {
         // SAFETY: the successful syscall returned a newly owned descriptor.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
+}
+
+/// whether `fd` is on a cgroup2 filesystem, by `fstatfs`. a descriptor the kernel cannot
+/// describe is not reported as cgroup2: the path rule still covers the mounts known at start.
+fn fd_on_cgroup2(fd: BorrowedFd<'_>) -> bool {
+    let mut stat: libc::statfs = unsafe { zeroed() };
+    // SAFETY: stat is a valid out-buffer and fd is open; fstatfs works on O_PATH descriptors.
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), &raw mut stat) } != 0 {
+        return false;
+    }
+    crate::supervisor::cgroup_mounts::is_cgroup2_magic(stat.f_type as i64)
 }
 
 fn fd_identity(fd: BorrowedFd<'_>) -> io::Result<PathBuf> {
@@ -1273,6 +1522,7 @@ fn poll_readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1298,5 +1548,63 @@ mod tests {
             anchor_resolve_flags(true, true),
             RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS
         );
+    }
+
+    /// the worst bytes for a text encoding that spells each byte as a decimal number.
+    fn heaviest(len: usize) -> Vec<u8> {
+        vec![0xff; len]
+    }
+
+    #[test]
+    fn a_maximum_xattr_value_crosses_the_broker_socket_whole() {
+        let (near, far) = seqpacket_pair().unwrap();
+        let value = heaviest(65_536);
+        send_packet(
+            near.as_raw_fd(),
+            &Request::CommitMutation {
+                primary: 1,
+                secondary: None,
+                operation: MutationOperation::Setxattr {
+                    name: b"user.big".to_vec(),
+                    value: value.clone(),
+                    flags: 0,
+                    follow: true,
+                },
+            },
+            None,
+        )
+        .expect("a 64 KiB value fits one broker packet");
+        let (request, _): (Request, _) = recv_packet(far.as_raw_fd()).unwrap();
+        match request {
+            Request::CommitMutation {
+                operation: MutationOperation::Setxattr { value: got, .. },
+                ..
+            } => assert!(got == value, "the value arrives unchanged"),
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_maximum_network_payload_crosses_the_broker_socket_whole() {
+        let (near, far) = seqpacket_pair().unwrap();
+        let payload = heaviest(65_535);
+        send_packet(
+            near.as_raw_fd(),
+            &Request::Network {
+                operation: NetworkOperation::SendTo,
+                address: vec![0xff; 128],
+                payload: payload.clone(),
+                flags: 0,
+            },
+            None,
+        )
+        .expect("a 64 KiB payload fits one broker packet");
+        let (request, _): (Request, _) = recv_packet(far.as_raw_fd()).unwrap();
+        match request {
+            Request::Network { payload: got, .. } => {
+                assert!(got == payload, "the payload arrives unchanged");
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
     }
 }
