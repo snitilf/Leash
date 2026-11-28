@@ -641,6 +641,7 @@ mod linux {
             &HashMap::new(),
             None,
             None,
+            None,
             &SessionHooks::default(),
         )
     }
