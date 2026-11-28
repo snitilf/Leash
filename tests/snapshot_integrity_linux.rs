@@ -199,7 +199,7 @@ fn agent_prelude() -> String {
         "import errno, os\n\
          mount = {mount:?}\n\
          parent = {parent:?}\n\
-         me = open('/proc/self/cgroup').read().split('0::')[1].strip()\n\
+         me = open('/proc/%d/cgroup' % os.getpid()).read().split('0::')[1].strip()\n\
          own = (mount + '/' + me.lstrip('/')).rstrip('/')\n\
          def denied(fn, what):\n\
          \x20   try:\n\
