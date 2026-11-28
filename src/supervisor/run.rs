@@ -2625,7 +2625,9 @@ pub use linux::{run_loop, run_loop_with_cgroup_kill};
 mod linux {
     use super::*;
     use crate::recorder::CapturePhase;
-    use crate::supervisor::barrier::{BarrierOps, commit_step, fail_boundary};
+    use crate::supervisor::barrier::{
+        BarrierOps, commit_step, fail_boundary, record_capture_failed,
+    };
     use crate::supervisor::mem::proc::ChildMem;
     use crate::supervisor::notify::NotifyFd;
     use crate::supervisor::run_cgroup::RunCgroup;
@@ -2964,7 +2966,18 @@ mod linux {
                 commit_step(writer, now_ms(), capture, step, &published, Duration::ZERO).map_err(
                     |e| fail_boundary(writer, now_ms(), step, CapturePhase::StepEvent, e),
                 )?;
-                let head = capture.chain_head().map_err(RunError::ChainHead)?;
+                // the final step is committed by now, so this failure is recorded as its own
+                // phase and never uncommits the step (trace.md section 2)
+                let head = capture.chain_head().map_err(|e| {
+                    record_capture_failed(
+                        writer,
+                        now_ms(),
+                        step,
+                        CapturePhase::ChainHead,
+                        &e.to_string(),
+                    );
+                    RunError::ChainHead(e)
+                })?;
                 (step, Some(head))
             }
             _ => (0, None),

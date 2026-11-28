@@ -209,8 +209,29 @@ pub fn step_event(step: u64, published: &Published, pause: Duration) -> EventBod
     }
 }
 
+/// write a `capture_failed` event and sync it, when the recorder still works. a failure to
+/// record the failure is ignored: the run is already failing.
+pub fn record_capture_failed<S: TraceSink>(
+    writer: &mut TraceWriter<S>,
+    ts: u64,
+    step: u64,
+    phase: CapturePhase,
+    error: &str,
+) {
+    let _ = writer
+        .append(
+            ts,
+            EventBody::CaptureFailed(CaptureFailedEvent {
+                step,
+                phase,
+                error: error.to_string(),
+            }),
+        )
+        .and_then(|_| writer.sync());
+}
+
 /// record that a boundary failed, when the recorder still works, and build the error that
-/// aborts the run. a failure to record the failure is ignored: the run is already failing.
+/// aborts the run.
 pub fn fail_boundary<S: TraceSink>(
     writer: &mut TraceWriter<S>,
     ts: u64,
@@ -219,16 +240,7 @@ pub fn fail_boundary<S: TraceSink>(
     error: impl std::fmt::Display,
 ) -> RunError {
     let message = error.to_string();
-    let _ = writer
-        .append(
-            ts,
-            EventBody::CaptureFailed(CaptureFailedEvent {
-                step,
-                phase,
-                error: message.clone(),
-            }),
-        )
-        .and_then(|_| writer.sync());
+    record_capture_failed(writer, ts, step, phase, &message);
     RunError::Barrier {
         step,
         phase,

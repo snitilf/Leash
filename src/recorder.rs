@@ -193,6 +193,9 @@ pub enum CapturePhase {
     StepEvent,
     /// `cgroup.freeze=0` was written but `frozen=0` was not confirmed in time
     Thaw,
+    /// the final step was committed, and the chain head over the committed digests could not
+    /// be computed, so the run has no `run_end`. the step itself stays committed.
+    ChainHead,
 }
 
 /// a failed capture boundary (trace.md section 2). written on a best-effort basis,
@@ -1140,6 +1143,20 @@ mod tests {
             sink.bytes.len(),
             "sync happens after the step event's bytes reached the sink"
         );
+    }
+
+    #[test]
+    fn every_capture_phase_has_a_stable_snake_case_name() {
+        for (phase, name) in [
+            (CapturePhase::Freeze, "freeze"),
+            (CapturePhase::Capture, "capture"),
+            (CapturePhase::FrozenCheck, "frozen_check"),
+            (CapturePhase::StepEvent, "step_event"),
+            (CapturePhase::Thaw, "thaw"),
+            (CapturePhase::ChainHead, "chain_head"),
+        ] {
+            assert_eq!(serde_json::to_value(phase).unwrap(), name);
+        }
     }
 
     #[test]
