@@ -43,7 +43,7 @@ normative set:
 |---|---|
 | no subcommand | `leash` invoked with no arguments, or a bare option before any subcommand other than `--help`/`-h` and `--version`/`-V` |
 | top-level option with extra arguments | `--help`, `-h`, `--version`, or `-V` followed by any further argument |
-| unknown subcommand or flag | a subcommand that is not `run`, `runs` or `diff` (and not a reserved name below), or a flag `run` does not accept |
+| unknown subcommand or flag | a subcommand that is not `run`, `runs`, `diff` or `rewind`, or a flag the subcommand does not accept |
 | `run` without `--` | `run` invoked with no `--` separator |
 | empty command after `--` | `--` present but nothing follows it |
 | a flag given twice | `--unattended`, `--state-dir`, `--policy`, or `--ask-timeout` repeated |
@@ -68,9 +68,6 @@ and is currently unavailable: it exits with an error without deleting data until
 can safely bind to the selected directories under concurrent changes. No retention operation
 runs automatically. The state directory accepts the same space and equals forms as `run`; unknown flags,
 missing values, duplicate flags, and unexpected positional arguments are usage errors.
-
-The reserved subcommand `rewind` parses but is not implemented in this slice. It
-exits 2 with a stable message naming the time-travel milestone (FR-12).
 
 ### `diff` (implemented, FR-13)
 
@@ -113,15 +110,95 @@ Rules the output follows:
 - A file with changed content does not report `mtime`; its mode, uid, gid and xattr changes still appear as `m`.
 - Directory mtimes change whenever an entry is added or removed, so they appear as `m` lines.
 
-### Snapshots and rewind (specified by ADR-0024, not yet implemented)
+### `rewind` (implemented, FR-12)
 
-The flag and the `rewind` subcommand below are specified and not yet implemented.
-Until they are, `rewind` remains a reserved subcommand, and `run` does not accept `--snapshots`.
-`diff` is implemented; see the `diff` section above.
+```
+leash rewind <run-id> [--step N] [--expect <digest>] [--no-undo] [--workspace <dir>] [--state-dir <dir>]
+leash rewind <run-id> --undo <n> [--no-undo] [--workspace <dir>] [--state-dir <dir>]
+```
+
+`rewind` restores the workspace of a finished snapshot run to step `N`, or to step 0 (the workspace as it was before the agent started) when `--step` is omitted.
+It is non-interactive: the operator invoked it, so it asks nothing.
+It prints the change summary before the first write, and the safety snapshot is the way back.
+The rules it enforces are ADR-0024 decisions 17 to 22; the mechanics are in [`snapshot.md`](snapshot.md) section 5.
+
+Flags:
+
+- `--step N` is a plain decimal number.
+- `--expect <digest>` is 64 hexadecimal digits, upper or lower case, kept outside the store by the operator.
+  It must equal the chain head recomputed from the store, or the manifest digest of the target step.
+- `--no-undo` skips the safety snapshot.
+- `--workspace <dir>` names the workspace when the working directory is not it.
+  A relative path resolves against the working directory.
+- `--state-dir <dir>` is as for `run`, and must lie outside the workspace.
+- `--undo <n>` restores safety snapshot `n` of the run instead of a step.
+  It cannot be combined with `--step` or `--expect`, because a safety snapshot is outside the chain.
+
+The usage errors, all exit 2, are: no run id, a run id that is not a plain directory name, a flag given twice, an unknown flag, a missing flag value, `--step` or `--undo` that is not a non-negative whole number, `--expect` that is not 64 hexadecimal digits, `--undo` with `--step` or `--expect`, and an extra positional argument.
+
+The order of checks, each before any write to the workspace:
+
+1. The run is a directory under `<state-root>/runs`, opened component by component with `O_NOFOLLOW`; `meta.json` is a regular file of at most 64 KiB.
+   An unknown run, a run with no `snapshots` directory, and a run whose metadata records no run cgroup (not a snapshot run) are refused.
+2. The workspace, the working directory or `--workspace` canonicalized, equals the workspace in `meta.json`.
+3. The run is over.
+   `run.lock` is taken without blocking; a held lock means the run is live.
+   The recorded run cgroup must be `Gone`; `Present` and `Unknown` are refused and the message names the cgroup.
+   A present cgroup of a dead run is first offered to the stale cleanup (ADR-0024 decision 17), which kills and removes it only when its lock xattr matches this run's lock inode.
+   A missing `run_end` is fine, so a crashed run can be rewound.
+4. The workspace lock is taken without blocking, and held to the end; a held lock refuses.
+5. The target step has a committed `step` event in `trace.jsonl` and a manifest in the store.
+   The trace is untrusted input, read through a handle and capped at 256 MiB.
+   A final line without a newline that does not parse (a crash mid-write) is ignored; any other malformed line refuses.
+   The `run_start` event must agree with `meta.json`.
+   A manifest with no committed `step` event is an orphan of an aborted capture and is not a target.
+6. The chain is recomputed from the manifests in the store.
+   The recomputed digest of the target must equal the digest in the trace's step event, and `--expect`, when given, must equal the chain head or that digest.
+7. Every store object the plan writes is verified, so a corrupt object refuses the rewind before the workspace changes.
+
+Exit codes:
+
+| Outcome | Exit code |
+|---|---|
+| rewound, or the workspace already matched | 0 |
+| usage error; unknown run; run without snapshots or not a snapshot run; unknown step, or a step with no committed event; workspace differs from the run's; state directory inside the workspace; unknown `--undo` number | 2 |
+| live run (lock held); cgroup `Present` or `Unknown`; workspace lock held; trace, store or digest mismatch; `--expect` mismatch; safety snapshot impossible; running as root; apply failed | 125 |
+
+Output goes to stdout except warnings and errors, which go to stderr and start with `leash: `.
+A successful rewind prints these lines, in order (angle brackets are values):
+
+```
+chain head: <64 hex>
+step <N> digest: <64 hex>
+safety snapshot: <state-root>/runs/<run-id>/rewind/undo-<n> (undo <n>)
+to undo this rewind: leash rewind <run-id> --undo <n> --workspace <dir> --state-dir <dir>
+<change summary>
+rewound the workspace to step <N>: <r> removed, <d> directories created, <w> files written, <l> hard links, <s> symlinks, <m> metadata fixes
+rewind reverses filesystem effects only; anything the agent sent off this machine is not undone
+```
+
+- The first two lines are printed once the integrity checks pass; a refusal prints both values it compared in the error instead.
+- The undo command is shell-quoted, so it can be pasted as printed.
+- The change summary is the restore engine's: a counts line, then one `  <action> <path>` line per change, sorted by path, with a path that holds a control character printed quoted and escaped.
+- When the plan is empty, the output is `workspace already matches step <N>`, then the effects line, and nothing is written; no safety snapshot is kept.
+- With `--undo <n>`, the first two lines are absent, the result line reads `restored the workspace from undo snapshot <n>: ...`, and a new safety snapshot is still taken first.
+- With `--no-undo`, the safety snapshot and undo lines are absent, and stderr says `leash: warning: --no-undo: no safety snapshot is taken, so this rewind cannot be undone`, followed by one warning per workspace entry that capture would refuse (`leash: warning: <path> cannot be captured (<reason>); the plan replaces or removes it`).
+- The effects line is the last line of every successful rewind, an empty plan included.
+
+The safety snapshot (ADR-0024 decision 21) is a complete store of its own at `<run-dir>/rewind/undo-<n>/`, outside `snapshots/`, so it is never part of the chain, never a step, and never reachable by `--step`.
+The number is the lowest free one.
+If it cannot be taken, because capture refuses an entry (a socket, a mode-000 file) or a cap is hit, rewind exits 125 naming `--no-undo`.
+An unused safety snapshot is removed again: after a refusal, or when the plan is empty.
+When the apply fails, the error names the safety snapshot and prints the `--undo` command that restores it.
+On macOS, `rewind` exits 125 with a message that it requires linux.
+
+### Snapshots (specified by ADR-0024, not yet implemented)
+
+The `run --snapshots` flag below is specified and not yet implemented; `run` does not accept it.
+`diff` and `rewind` are implemented; see their sections above.
 
 ```
 leash run --snapshots [--unattended] [--state-dir <dir>] --policy <path> [--ask-timeout <seconds>] -- <command...>
-leash rewind <run-id> [--step N] [--expect <digest>] [--no-undo] [--workspace <dir>] [--state-dir <dir>]
 ```
 
 `--snapshots` is available in enforce mode only.
@@ -134,15 +211,6 @@ It refuses before spawn, as a supervisor failure with the message on stderr and 
 
 The session already applies all three refusals and the implicit `implicit:cgroup` deny when its `snapshot_integrity` field is set.
 What is still missing is the `--snapshots` flag that sets it, which the capture slice adds.
-
-`rewind` restores the workspace to step `N` of the run, or to step 0 (the workspace as it was before the agent started) when `--step` is omitted.
-It exits 2 for an unknown run or an unknown step.
-It first snapshots the current workspace so the rewind can be undone.
-When that snapshot cannot be taken, rewind refuses and names `--no-undo`, which skips it.
-It prints a change summary before it applies anything, and says that it reverses filesystem effects only.
-`--expect <digest>` refuses a store that does not match the chain head or manifest digest the operator kept outside the store.
-`--workspace <dir>` names the workspace when the working directory is not it; rewind refuses when the workspace differs from the run metadata.
-The rewind rules are in [`snapshot.md`](snapshot.md) section 5.
 
 ## 2. Mode selection
 
@@ -229,8 +297,10 @@ failed".
 |---|---|
 | child exited with status N | N |
 | child killed by signal S | 128 plus S |
-| usage error, or a reserved subcommand | 2 |
+| usage error | 2 |
 | supervisor failure | 125 |
+
+`runs`, `diff` and `rewind` have no child, so they exit only 0, 2 or 125 (the `diff` and `rewind` sections give their cases).
 
 A supervisor failure is any of: a preflight refusal, a spawn or setup failure, a run-loop abort
 (trace-write failure), an undecodable wait status, or a report-write failure. 125 is the code

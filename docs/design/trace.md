@@ -24,6 +24,7 @@ $XDG_STATE_HOME/leash/runs/<run-id>/
   trace.jsonl       the ordered, append-only event stream
   report.txt        the human-readable session report, written at run end
   snapshots/        per-step snapshot state (see snapshot.md)
+  rewind/           safety snapshots taken by `leash rewind`, `undo-<n>/`, outside the chain
 ```
 
 The state directory lies outside the **workspace**, and in **enforce** mode the child is denied
