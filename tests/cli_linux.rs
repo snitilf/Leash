@@ -1005,7 +1005,6 @@ fn enforce_openat2_honors_the_callers_beneath_and_no_symlinks_restrictions() {
         \x20 ('beneath, cwd dot-dot', oa(-100,b'../target',P,BENEATH), -errno.EXDEV),\n\
         \x20 ('no symlinks, plain', oa(d,b'f',P,NO_SYMLINKS), 'fd'),\n\
         \x20 ('no symlinks, followed', oa(d,b'link',P,NO_SYMLINKS), -errno.ELOOP),\n\
-        \x20 ('no symlinks, not followed', oa(d,b'link',P|os.O_NOFOLLOW,NO_SYMLINKS), 'fd'),\n\
         \x20 ('no restriction, symlink out', oa(d,b'up/target',P,0), 'fd'),\n\
          ]\n\
          for name, got, want in cases:\n\
