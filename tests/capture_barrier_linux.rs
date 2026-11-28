@@ -66,6 +66,9 @@ CTL = {ctl}\n\
 def wait(n):\n\
 \x20   while not os.path.exists(CTL + '/' + n):\n\
 \x20       time.sleep(0.005)\n\
+def wait_ws(n):\n\
+\x20   while not os.path.exists(WS + '/' + n):\n\
+\x20       time.sleep(0.005)\n\
 def put(name, data=''):\n\
 \x20   with open(WS + '/' + name, 'w') as f:\n\
 \x20       f.write(data)\n";
@@ -575,8 +578,13 @@ fn a_shared_mmap_writer_is_never_captured_torn() {
 /// live file sizes just after a freeze, again 30 ms later, and the cgroup's member count.
 type FrozenSample = (Vec<u64>, Vec<u64>, usize);
 
-const WRITER_PROC: &str = "def writer_proc(name):\n\
+/// a process that opens `name` once (one mediated event) and then appends 64-byte records
+/// every millisecond through that descriptor, touching nothing the supervisor mediates. when
+/// `ready` is given it announces itself with a file first.
+const WRITER_PROC: &str = "def writer_proc(name, ready=None):\n\
 \x20   fd = os.open(WS + '/' + name, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)\n\
+\x20   if ready:\n\
+\x20       put(ready)\n\
 \x20   n = 0\n\
 \x20   while True:\n\
 \x20       os.write(fd, struct.pack('<Q', n) * 8)\n\
@@ -663,10 +671,11 @@ fn descendants_and_an_orphan_are_frozen_at_a_boundary_and_killed_at_root_exit() 
                  \x20   og = os.fork()\n\
                  \x20   if og == 0:\n\
                  \x20       put('orphan.pid', str(os.getpid()))\n\
-                 \x20       writer_proc('w_orphan')\n\
+                 \x20       writer_proc('w_orphan', 'orphan.ready')\n\
+                 \x20   wait_ws('orphan.ready')\n\
                  \x20   os._exit(0)\n\
-                 while not all(os.path.exists(WS + '/' + f) for f in ('child.pid', 'grand.pid', 'orphan.pid')):\n\
-                 \x20   time.sleep(0.005)\n\
+                 for f in ('child.pid', 'grand.pid', 'orphan.ready'):\n\
+                 \x20   wait_ws(f)\n\
                  time.sleep(0.2)\n\
                  put('m0')\n\
                  wait('go1')\n\
