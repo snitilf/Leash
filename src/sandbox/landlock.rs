@@ -165,12 +165,46 @@ impl OverlapRelation {
     }
 }
 
+/// the identity of a file on a host: its device and inode, as `stat` reports them. two paths
+/// with the same identity are the same object, which is how a bind mount or other alias is
+/// told apart from an unrelated path that merely looks different.
+pub type FileId = (u64, u64);
+
+/// the identity of `path`, following symlinks, or `None` when it cannot be read.
+#[cfg(unix)]
+pub fn path_identity(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// one filesystem grant as Landlock really applies it: at the anchor it opened, which is the
+/// deepest existing ancestor of a root that does not exist, with the rights that survive
+/// masking by the anchor's file type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchoredGrant {
+    /// the grant's hierarchy root as the policy spelled it
+    pub grant_root: PathBuf,
+    /// the canonical path the rights are really added to
+    pub anchor: PathBuf,
+    /// whether the grant root is missing, so `anchor` is an ancestor of it
+    pub anchored_elsewhere: bool,
+    /// the rights added at the anchor
+    pub rights: u64,
+    /// the anchor's identity, when it could be read
+    pub identity: Option<FileId>,
+}
+
 /// one grant that overlaps a protected path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreOverlap {
     /// the grant's hierarchy root as the policy spelled it
     pub grant_root: PathBuf,
-    /// every right the grant holds
+    /// the canonical path the rights are really added to
+    pub anchor: PathBuf,
+    /// whether the grant root is missing, so `anchor` is an ancestor of it
+    pub anchored_elsewhere: bool,
+    /// every right the grant holds at the anchor
     pub rights: u64,
     /// the protected path it overlaps
     pub store: ProtectedStore,
@@ -194,30 +228,45 @@ pub struct StoreOverlaps {
     pub read_only: Vec<StoreOverlap>,
 }
 
-/// find every grant of `hull` that overlaps one of `stores`, as an ancestor or a descendant
-/// (ADR-0024 decision 5). `canonical` resolves a grant root the way the kernel will when the
-/// grant is anchored; the comparison is by path component, never by string prefix.
+/// find every grant that overlaps one of `stores`, as an ancestor or a descendant (ADR-0024
+/// decision 5). the grants are the anchors Landlock really opened, so a grant on a missing
+/// path counts at the ancestor that carries its rights. an overlap is found by path
+/// component, never by string prefix, and again by identity: `identity_of` reads the
+/// (device, inode) of a path, and a grant whose anchor is the same object as the protected
+/// path or one of its ancestors, or whose anchor has the protected path among its ancestors,
+/// overlaps even when the two are spelled differently (a bind mount alias). a grant with no
+/// rights left after masking adds no Landlock rule and overlaps nothing.
 pub fn snapshot_store_overlaps(
-    hull: &LandlockHull,
+    grants: &[AnchoredGrant],
     stores: &[ProtectedStore],
-    canonical: &dyn Fn(&Path) -> PathBuf,
+    identity_of: &dyn Fn(&Path) -> Option<FileId>,
 ) -> StoreOverlaps {
     let mut found = StoreOverlaps::default();
-    for grant in &hull.fs {
-        let root = canonical(&grant.root);
+    for grant in grants.iter().filter(|g| g.rights != 0) {
+        let anchor_chain: Vec<FileId> = grant.anchor.ancestors().filter_map(identity_of).collect();
         for store in stores {
-            let relation = if root == store.path {
+            let store_chain: Vec<FileId> = store.path.ancestors().filter_map(identity_of).collect();
+            let store_id = identity_of(&store.path);
+            let relation = if grant.anchor == store.path
+                || (grant.identity.is_some() && grant.identity == store_id)
+            {
                 OverlapRelation::Same
-            } else if store.path.starts_with(&root) {
+            } else if store.path.starts_with(&grant.anchor)
+                || grant.identity.is_some_and(|id| store_chain.contains(&id))
+            {
                 OverlapRelation::GrantCoversStore
-            } else if root.starts_with(&store.path) {
+            } else if grant.anchor.starts_with(&store.path)
+                || store_id.is_some_and(|id| anchor_chain.contains(&id))
+            {
                 OverlapRelation::GrantInsideStore
             } else {
                 continue;
             };
             let overlap = StoreOverlap {
-                grant_root: grant.root.clone(),
-                rights: grant.allowed_access,
+                grant_root: grant.grant_root.clone(),
+                anchor: grant.anchor.clone(),
+                anchored_elsewhere: grant.anchored_elsewhere,
+                rights: grant.rights,
                 store: store.clone(),
                 relation,
             };
@@ -497,6 +546,17 @@ mod linux {
         /// Descriptor inherited by the confined broker.
         pub fn as_fd(&self) -> BorrowedFd<'_> {
             self.fd.as_fd()
+        }
+
+        /// Device and inode of the object the anchor descriptor holds.
+        pub fn identity(&self) -> Option<super::FileId> {
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: stat is a valid out-buffer and the descriptor is open; fstat works on
+            // O_PATH descriptors.
+            if unsafe { libc::fstat(self.fd.as_raw_fd(), &mut stat) } < 0 {
+                return None;
+            }
+            Some((stat.st_dev as u64, stat.st_ino as u64))
         }
     }
 
@@ -829,9 +889,29 @@ mod tests {
         ]
     }
 
+    /// the grants of a hull as Landlock would anchor them, each at `canon` of its root, with
+    /// the rights the hull gives it and no identity.
+    fn anchored(hull: &LandlockHull, canon: &dyn Fn(&Path) -> PathBuf) -> Vec<AnchoredGrant> {
+        hull.fs
+            .iter()
+            .map(|grant| AnchoredGrant {
+                grant_root: grant.root.clone(),
+                anchor: canon(&grant.root),
+                anchored_elsewhere: false,
+                rights: grant.allowed_access,
+                identity: None,
+            })
+            .collect()
+    }
+
+    fn no_identity(_: &Path) -> Option<FileId> {
+        None
+    }
+
     fn overlaps(text: &str) -> StoreOverlaps {
         let (_, hull) = hull_of(text, 4);
-        snapshot_store_overlaps(&hull, &stores(), &|p| p.to_path_buf())
+        let grants = anchored(&hull, &|p| p.to_path_buf());
+        snapshot_store_overlaps(&grants, &stores(), &no_identity)
     }
 
     #[test]
@@ -935,9 +1015,10 @@ mod tests {
                 p.to_path_buf()
             }
         };
-        let found = snapshot_store_overlaps(&hull, &stores(), &canon);
+        let found = snapshot_store_overlaps(&anchored(&hull, &canon), &stores(), &no_identity);
         assert_eq!(found.mutating.len(), 1, "{found:?}");
         assert_eq!(found.mutating[0].grant_root, Path::new("/link"));
+        assert_eq!(found.mutating[0].anchor, Path::new("/sys/fs"));
         assert_eq!(found.mutating[0].store.kind, StoreKind::CgroupMount);
     }
 
@@ -948,12 +1029,116 @@ mod tests {
             kind: StoreKind::StateRoot,
             path: "/home/op/project/state".into(),
         }];
-        let found = snapshot_store_overlaps(&hull, &inside_workspace, &|p| p.to_path_buf());
+        let grants = anchored(&hull, &|p| p.to_path_buf());
+        let found = snapshot_store_overlaps(&grants, &inside_workspace, &no_identity);
         assert_eq!(found.mutating.len(), 1);
         assert_eq!(
             found.mutating[0].relation,
             OverlapRelation::GrantCoversStore
         );
+    }
+
+    fn grant_at(root: &str, anchor: &str, missing: bool, rights: u64) -> AnchoredGrant {
+        AnchoredGrant {
+            grant_root: root.into(),
+            anchor: anchor.into(),
+            anchored_elsewhere: missing,
+            rights,
+            identity: None,
+        }
+    }
+
+    #[test]
+    fn a_grant_on_a_missing_path_counts_at_the_ancestor_that_carries_its_rights() {
+        // `/home/op/.local/state/mytool/**` with no `mytool` is anchored at `.../state`
+        let state = grant_at(
+            "/home/op/.local/state/mytool",
+            "/home/op/.local/state",
+            true,
+            FS_WRITE_RIGHTS,
+        );
+        let found = snapshot_store_overlaps(&[state], &stores(), &no_identity);
+        assert_eq!(found.mutating.len(), 1, "{found:?}");
+        assert_eq!(
+            found.mutating[0].relation,
+            OverlapRelation::GrantCoversStore
+        );
+        assert!(found.mutating[0].anchored_elsewhere);
+        assert_eq!(found.mutating[0].anchor, Path::new("/home/op/.local/state"));
+
+        // `/scratch/**` with no `/scratch` is anchored at `/`
+        let top = grant_at("/scratch", "/", true, FS_WRITE_RIGHTS);
+        let found = snapshot_store_overlaps(&[top], &stores(), &no_identity);
+        assert_eq!(found.mutating.len(), 2, "both protected paths: {found:?}");
+
+        // the same missing path anchored somewhere unrelated overlaps nothing
+        let elsewhere = grant_at("/srv/x/new", "/srv/x", true, FS_WRITE_RIGHTS);
+        let found = snapshot_store_overlaps(&[elsewhere], &stores(), &no_identity);
+        assert_eq!(found, StoreOverlaps::default());
+    }
+
+    #[test]
+    fn a_grant_with_no_rights_left_after_masking_overlaps_nothing() {
+        // an anchor whose rights the file type masked away adds no Landlock rule
+        let masked = grant_at("/home/op", "/home/op", false, 0);
+        let found = snapshot_store_overlaps(&[masked], &stores(), &no_identity);
+        assert_eq!(found, StoreOverlaps::default());
+    }
+
+    /// a fake identity table: `/alias/...` is a bind mount of the state root's parent.
+    fn alias_identity(path: &Path) -> Option<FileId> {
+        let table: [(&str, FileId); 6] = [
+            ("/", (1, 2)),
+            ("/home/op/.local/state", (7, 100)),
+            ("/home/op/.local/state/leash", (7, 101)),
+            ("/alias", (7, 100)),
+            ("/alias/leash", (7, 101)),
+            ("/other", (8, 100)),
+        ];
+        table
+            .iter()
+            .find(|(p, _)| Path::new(p) == path)
+            .map(|(_, id)| *id)
+    }
+
+    #[test]
+    fn a_bind_mount_alias_of_an_ancestor_of_the_state_root_overlaps_by_identity() {
+        let mut grant = grant_at("/alias", "/alias", false, FS_WRITE_RIGHTS);
+        grant.identity = alias_identity(Path::new("/alias"));
+        let found = snapshot_store_overlaps(&[grant], &stores(), &alias_identity);
+        assert_eq!(found.mutating.len(), 1, "{found:?}");
+        assert_eq!(found.mutating[0].store.kind, StoreKind::StateRoot);
+        assert_eq!(
+            found.mutating[0].relation,
+            OverlapRelation::GrantCoversStore
+        );
+    }
+
+    #[test]
+    fn a_grant_beneath_a_bind_mount_alias_of_the_state_root_overlaps_by_identity() {
+        let mut grant = grant_at("/alias/leash/runs", "/alias/leash", false, FS_WRITE_RIGHTS);
+        grant.identity = alias_identity(Path::new("/alias/leash"));
+        let found = snapshot_store_overlaps(&[grant], &stores(), &alias_identity);
+        assert_eq!(found.mutating.len(), 1, "{found:?}");
+        assert_eq!(found.mutating[0].relation, OverlapRelation::Same);
+
+        // an alias whose anchor is deeper than the aliased directory is beneath it
+        let mut deeper = grant_at("/alias/leash/x", "/alias/leash/x", false, FS_WRITE_RIGHTS);
+        deeper.identity = None;
+        let found = snapshot_store_overlaps(&[deeper], &stores(), &alias_identity);
+        assert_eq!(found.mutating.len(), 1, "{found:?}");
+        assert_eq!(
+            found.mutating[0].relation,
+            OverlapRelation::GrantInsideStore
+        );
+    }
+
+    #[test]
+    fn the_same_inode_number_on_another_device_is_not_an_overlap() {
+        let mut grant = grant_at("/other", "/other", false, FS_WRITE_RIGHTS);
+        grant.identity = alias_identity(Path::new("/other"));
+        let found = snapshot_store_overlaps(&[grant], &stores(), &alias_identity);
+        assert_eq!(found, StoreOverlaps::default());
     }
 
     #[test]

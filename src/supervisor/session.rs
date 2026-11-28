@@ -96,7 +96,7 @@ pub struct SessionSpec {
 /// root or a cgroup2 mount (ADR-0024 decision 5).
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "snapshot integrity refused: {origin} grants {rights} beneath \"{grant}\", which {relation} {what} \"{protected}\"; a Landlock grant cannot subtract a subtree, so the agent could change snapshot state or its own cgroup. Narrow the rule so it does not cover that path, or remove those rights from it (ADR-0024 decision 5)",
+    "snapshot integrity refused: {origin} grants {rights} beneath \"{grant}\"{anchoring}, which {relation} {what} \"{protected}\"; a Landlock grant cannot subtract a subtree, so the agent could change snapshot state or its own cgroup. Narrow the rule so it does not cover that path, or remove those rights from it (ADR-0024 decision 5)",
     grant = grant.display(),
     protected = protected.display()
 )]
@@ -107,7 +107,10 @@ pub struct GrantOverlapRefusal {
     pub rights: String,
     /// the grant's hierarchy root as the policy spelled it
     pub grant: PathBuf,
-    /// how the grant relates to the protected path
+    /// empty, or why the rights sit elsewhere than the spelled root: a missing root is
+    /// anchored by Landlock at its deepest existing ancestor
+    pub anchoring: String,
+    /// how the grant, or its anchor, relates to the protected path
     pub relation: &'static str,
     /// `state root` or `cgroup2 mount`
     pub what: &'static str,
@@ -420,10 +423,20 @@ mod linux {
         )?;
         let resolved_hosts = resolve_policy_hosts(&loaded.policy)?;
         let mut hull: LandlockHull = landlock::derive_hull(&loaded.policy, landlock_abi);
-        if let Some(mounts) = cgroup_mounts {
-            check_snapshot_overlaps(spec, &loaded.policy, &mut hull, mounts, landlock_abi)?;
-        }
+        // the ruleset is prepared first because the overlap check must judge the anchors
+        // Landlock really opened: a grant on a missing path is anchored at its deepest
+        // existing ancestor, and the rights land there
         let ruleset = landlock::prepare_ruleset(&hull)?;
+        if let Some(mounts) = cgroup_mounts {
+            check_snapshot_overlaps(
+                spec,
+                &loaded.policy,
+                &mut hull,
+                &ruleset,
+                mounts,
+                landlock_abi,
+            )?;
+        }
 
         Ok(EnforcementSetup {
             policy: Some(loaded.policy),
@@ -437,12 +450,15 @@ mod linux {
 
     /// refuse a policy whose Landlock grants could change the state root or a cgroup2 mount,
     /// and stamp the read-only overlaps that are allowed (ADR-0024 decision 5). a grant
-    /// overlaps as an ancestor or a descendant, compared by component on resolved paths. the
-    /// state root may not exist yet, so it is resolved as far as it does.
+    /// overlaps as an ancestor or a descendant, compared by component on the canonical anchors
+    /// of the prepared ruleset and again by (device, inode) along the ancestor chains, so a
+    /// bind mount alias of the state root is caught too. the state root may not exist yet, so
+    /// it is resolved as far as it does.
     fn check_snapshot_overlaps(
         spec: &SessionSpec,
         policy: &crate::policy::Policy,
         hull: &mut LandlockHull,
+        ruleset: &PreparedRuleset,
         mounts: &CgroupMounts,
         abi: u32,
     ) -> Result<(), SessionError> {
@@ -454,15 +470,21 @@ mod linux {
             kind: StoreKind::CgroupMount,
             path: path.clone(),
         }));
-        let canonical = |root: &Path| {
-            let absolute = if root.is_absolute() {
-                root.to_path_buf()
-            } else {
-                std::env::current_dir().map_or_else(|_| root.to_path_buf(), |cwd| cwd.join(root))
-            };
-            crate::supervisor::state_root::resolve_leniently(&absolute)
-        };
-        let overlaps = landlock::snapshot_store_overlaps(hull, &stores, &canonical);
+        // anchors are opened one per grant, in order
+        let grants: Vec<landlock::AnchoredGrant> = hull
+            .fs
+            .iter()
+            .zip(ruleset.anchors())
+            .map(|(grant, anchor)| landlock::AnchoredGrant {
+                grant_root: grant.root.clone(),
+                anchor: anchor.root().to_path_buf(),
+                anchored_elsewhere: !grant.root.exists(),
+                rights: anchor.allowed_access(),
+                identity: anchor.identity(),
+            })
+            .collect();
+        let overlaps =
+            landlock::snapshot_store_overlaps(&grants, &stores, &landlock::path_identity);
         if let Some(first) = overlaps.mutating.first() {
             let origins = landlock::mutating_grant_origins(policy, &first.grant_root, abi);
             let origin = match origins.as_slice() {
@@ -475,6 +497,14 @@ mod linux {
                     origin,
                     rights: landlock::mutating_right_names(first.mutating_rights()).join(", "),
                     grant: first.grant_root.clone(),
+                    anchoring: if first.anchored_elsewhere {
+                        format!(
+                            ", which does not exist, so Landlock anchors it at \"{}\"",
+                            first.anchor.display()
+                        )
+                    } else {
+                        String::new()
+                    },
                     relation: first.relation.describe(),
                     what: first.store.kind.describe(),
                     protected: first.store.path.clone(),
