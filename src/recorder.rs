@@ -440,6 +440,11 @@ impl<S: TraceSink> FailNthSync<S> {
             syncs: 0,
         }
     }
+
+    /// give the wrapped sink back.
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
 }
 
 impl<S: TraceSink> Write for FailNthSync<S> {
@@ -465,27 +470,96 @@ impl<S: TraceSink> TraceSink for FailNthSync<S> {
     }
 }
 
+/// a sink whose Nth `write` call (counting from 1) writes half of its buffer and then
+/// fails, and passes everything else through. it is the seam tests use to leave a torn,
+/// newline-less line in the trace the way a full or failing disk does. `sync` always
+/// passes through.
+pub struct FailNthWrite<S: TraceSink> {
+    inner: S,
+    fail_at: u64,
+    writes: u64,
+}
+
+impl<S: TraceSink> FailNthWrite<S> {
+    /// wrap `inner` so its `fail_at`th `write` fails after a partial write. `fail_at` 0
+    /// never fails.
+    pub fn new(inner: S, fail_at: u64) -> Self {
+        Self {
+            inner,
+            fail_at,
+            writes: 0,
+        }
+    }
+
+    /// give the wrapped sink back.
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+impl<S: TraceSink> Write for FailNthWrite<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writes += 1;
+        if self.writes == self.fail_at {
+            self.inner.write_all(&buf[..buf.len() / 2])?;
+            return Err(io::Error::other(format!(
+                "injected failure of write {}",
+                self.writes
+            )));
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<S: TraceSink> TraceSink for FailNthWrite<S> {
+    fn sync(&mut self) -> io::Result<()> {
+        self.inner.sync()
+    }
+}
+
 /// the single writer of `trace.jsonl` (I2). append-only, decision order, one json object
 /// per line. a write failure is returned, never swallowed: the caller denies the pending
 /// action and aborts the run (notify-loop.md case E).
 pub struct TraceWriter<S: TraceSink> {
     sink: S,
     next_seq: u64,
+    /// set when a write failed: the sink may now end in a torn line, so every later append
+    /// is refused rather than glued onto it
+    torn: bool,
 }
 
 impl<S: TraceSink> TraceWriter<S> {
     /// wrap a sink; the first event gets seq 0.
     pub fn new(sink: S) -> Self {
-        Self { sink, next_seq: 0 }
+        Self {
+            sink,
+            next_seq: 0,
+            torn: false,
+        }
     }
 
     /// append one event, assigning the next sequence number. returns the seq on success.
-    /// on any error the event did not land and the writer must not be used again.
+    /// a serialization error leaves the writer usable. a write error may leave a torn line in
+    /// the sink, so the writer refuses every later append: an event glued onto a torn line
+    /// would make the whole trace unparseable. a failed `sync` does not tear anything and
+    /// does not stop later appends.
     pub fn append(&mut self, ts: u64, body: EventBody) -> Result<u64, RecorderError> {
+        if self.torn {
+            return Err(RecorderError::Write(io::Error::other(
+                "the trace may end in a torn line after a failed write",
+            )));
+        }
         let seq = self.next_seq;
         let mut line = serde_json::to_vec(&Event { seq, ts, body })?;
         line.push(b'\n');
-        self.sink.write_all(&line).map_err(RecorderError::Write)?;
+        if let Err(e) = self.sink.write_all(&line) {
+            self.torn = true;
+            return Err(RecorderError::Write(e));
+        }
         self.next_seq = seq + 1;
         Ok(seq)
     }
@@ -1183,6 +1257,32 @@ mod tests {
             String::from_utf8(sink.inner.bytes).unwrap().lines().count(),
             3
         );
+    }
+
+    #[test]
+    fn a_failed_write_leaves_a_torn_line_and_refuses_every_later_append() {
+        let mut writer = TraceWriter::new(FailNthWrite::new(FakeSink::default(), 2));
+        writer.append(1, step_body(0)).unwrap();
+        let err = writer.append(2, step_body(1)).unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure of write 2"),
+            "{err}"
+        );
+        let refused = writer.append(3, step_body(2)).unwrap_err();
+        assert!(matches!(refused, RecorderError::Write(_)), "{refused}");
+        // the sink holds the first line and half of the second, and nothing was glued on
+        let bytes = writer.into_inner().inner.bytes;
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(!text.ends_with('\n'), "{text}");
+    }
+
+    #[test]
+    fn a_failed_sync_does_not_stop_later_appends() {
+        let mut writer = TraceWriter::new(FailNthSync::new(FakeSink::default(), 1));
+        writer.append(1, step_body(0)).unwrap();
+        writer.sync().unwrap_err();
+        writer.append(2, step_body(1)).unwrap();
     }
 
     #[test]

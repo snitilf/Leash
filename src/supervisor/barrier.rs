@@ -275,7 +275,7 @@ pub fn commit_step<S: TraceSink>(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::recorder::TraceWriter;
+    use crate::recorder::{FailNthSync, FailNthWrite, TraceWriter};
 
     struct Sink(Vec<u8>);
     impl Write for Sink {
@@ -403,5 +403,50 @@ mod tests {
         assert_eq!(event["type"], "capture_failed");
         assert_eq!(event["phase"], "freeze");
         assert_eq!(event["error"], "never froze");
+    }
+
+    #[test]
+    fn a_failed_step_event_write_is_not_followed_by_a_capture_failed_event() {
+        let (ws, store) = ws_and_store();
+        let capture = StoreCapture::open(ws.path(), store.path(), Limits::default()).unwrap();
+        let published = capture.capture(0).unwrap();
+        // the first write is the step event: half of it lands, then the write fails
+        let mut writer = TraceWriter::new(FailNthWrite::new(Sink(Vec::new()), 1));
+        let error = commit_step(&mut writer, 5, &capture, 0, &published, Duration::ZERO)
+            .map_err(|e| fail_boundary(&mut writer, 6, 0, CapturePhase::StepEvent, e))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RunError::Barrier {
+                phase: CapturePhase::StepEvent,
+                ..
+            }
+        ));
+        // nothing was glued onto the torn line: no capture_failed, and no newline
+        let bytes = writer.into_inner().into_inner().0;
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("capture_failed"), "{text}");
+        assert!(!text.ends_with('\n'), "{text}");
+    }
+
+    #[test]
+    fn a_failed_step_event_sync_is_still_followed_by_a_capture_failed_event() {
+        let (ws, store) = ws_and_store();
+        let capture = StoreCapture::open(ws.path(), store.path(), Limits::default()).unwrap();
+        let published = capture.capture(0).unwrap();
+        let mut writer = TraceWriter::new(FailNthSync::new(Sink(Vec::new()), 1));
+        let error = commit_step(&mut writer, 5, &capture, 0, &published, Duration::ZERO)
+            .map_err(|e| fail_boundary(&mut writer, 6, 0, CapturePhase::StepEvent, e))
+            .unwrap_err();
+        assert!(matches!(error, RunError::Barrier { .. }));
+        let text = String::from_utf8(writer.into_inner().into_inner().0).unwrap();
+        let types: Vec<String> = text
+            .lines()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v["type"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(types, ["step", "capture_failed"], "{text}");
     }
 }

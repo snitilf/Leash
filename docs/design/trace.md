@@ -168,6 +168,8 @@ A snapshot run also writes these (ADR-0024 decisions 10, 14 and 16), all additiv
   `phase` is `freeze` (`frozen=1` not confirmed in time), `capture` (the store could not capture or publish, or a limit was hit), `frozen_check` (the cgroup was no longer frozen after the capture, checked before the manifest is published), `step_event` (the step event could not be written or made durable), `thaw` (`frozen=0` not confirmed in time) or `chain_head` (the final step was committed, and the chain head over the committed digests could not be computed).
   A failed boundary has no committed step, except `thaw` and `chain_head`: after a `thaw` failure the step event was already durable, so the step is committed, and a `chain_head` failure follows a committed final step.
   A `step_event` failure can leave an event in the file that was never made durable.
+  After a failed trace write, which may have left a torn line, no `capture_failed` is written, because it would be glued onto the torn line and make the trace unparseable.
+  After a failed sync the event is whole in the file, so `capture_failed` is written.
   `capture_failed` with phase `step_event` for step N, after the event for step N, un-commits step N.
   The only orphan is a `step_event` failure: the manifest was published, and no durable step event names it.
   A `frozen_check` failure leaves no manifest, because the check runs before the manifest is published, and a `thaw` failure leaves a committed step.
