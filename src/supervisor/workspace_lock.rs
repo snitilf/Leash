@@ -70,6 +70,8 @@ pub struct WorkspaceLock {
     /// the state-root lock file that carries the second `flock`.
     _file: File,
     path: PathBuf,
+    /// the canonical path of the directory the handle names, read from the handle.
+    canonical: PathBuf,
 }
 
 /// the lock file name for a canonical workspace path: the lowercase hex sha256 of the
@@ -171,6 +173,7 @@ impl WorkspaceLock {
             workspace: dir,
             _file: file,
             path: lock_path,
+            canonical,
         })
     }
 
@@ -178,6 +181,13 @@ impl WorkspaceLock {
     /// keeps the lock for as long as the duplicate lives, so capture can hold it directly.
     pub fn workspace_dir(&self) -> &File {
         &self.workspace
+    }
+
+    /// the canonical path of the locked directory, read from the handle (`/proc/self/fd`),
+    /// not resolved from the spelling again. a caller that checked a path before opening it
+    /// compares that path with this one to catch a component swapped in between.
+    pub fn canonical_workspace(&self) -> &Path {
+        &self.canonical
     }
 
     /// the lock file's path under the state root.

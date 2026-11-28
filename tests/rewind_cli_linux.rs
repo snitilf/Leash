@@ -23,8 +23,10 @@ use std::process::{Command, Output};
 use std::time::SystemTime;
 
 use leash::recorder::{Attendance, Mode, RunMeta, SnapshotMechanism, TRACE_SCHEMA_VERSION};
-use leash::snapshot::restore::recompute_chain;
-use leash::snapshot::store::{Limits, capture, load_manifest};
+use leash::rewind::{RewindError, RewindHooks, RewindRequest, RewindTarget, run_rewind_with_hooks};
+use leash::runs::META_READ_CAP;
+use leash::snapshot::restore::{RestoreContext, recompute_chain};
+use leash::snapshot::store::{Limits, TRACE_READ_CAP, capture, load_manifest};
 use leash::supervisor::run_cgroup::{
     CgroupParent, RunCgroup, RunCgroupState, RunLock, run_cgroup_gone,
 };
@@ -153,6 +155,12 @@ struct Fixture {
 impl Fixture {
     /// `cgroup` picks the recorded run cgroup from the run id; `None` uses a gone one.
     fn new(cgroup: Option<&dyn Fn(&str) -> PathBuf>) -> Option<Self> {
+        Self::with(cgroup, false)
+    }
+
+    /// `nested` puts the workspace two levels below the temporary directory, so a test can
+    /// swap an ancestor of it.
+    fn with(cgroup: Option<&dyn Fn(&str) -> PathBuf>, nested: bool) -> Option<Self> {
         let id = leash::recorder::generate_run_id(SystemTime::now()).unwrap();
         let cgroup = match cgroup {
             Some(pick) => pick(&id),
@@ -160,8 +168,14 @@ impl Fixture {
         };
         let state = tempfile::tempdir().unwrap();
         let ws_dir = tempfile::tempdir().unwrap();
-        let ws = ws_dir.path().canonicalize().unwrap();
+        let mut ws = ws_dir.path().canonicalize().unwrap();
         strip_default_acl(&ws);
+        if nested {
+            ws = ws.join("outer");
+            create_dir(&ws);
+            ws = ws.join("ws");
+            create_dir(&ws);
+        }
         let run_dir = state.path().join("runs").join(&id);
         fs::create_dir_all(run_dir.join("snapshots")).unwrap();
         let meta = RunMeta {
@@ -204,6 +218,18 @@ impl Fixture {
 
     fn gone() -> Option<Self> {
         Self::new(None)
+    }
+
+    /// replace the digest the trace's step event for `step` carries.
+    fn rebind_step_digest(&mut self, step: u64, digest: &str) {
+        let needle = format!("\"step\":{step},");
+        for line in &mut self.trace {
+            if line.contains("\"type\":\"step\"") && line.contains(&needle) {
+                let old = line.split("\"manifest_digest\":\"").nth(1).unwrap()[..64].to_string();
+                *line = line.replace(&old, digest);
+            }
+        }
+        self.flush_trace();
     }
 
     fn flush_trace(&self) {
@@ -999,6 +1025,497 @@ fn a_trace_that_disagrees_with_the_run_metadata_is_refused() {
     let out = f.rewind(&[]);
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
     assert!(stderr(&out).contains("disagrees"), "{}", stderr(&out));
+}
+
+// ---- forgery honesty and the safety snapshot digest ----
+
+const NO_EXPECT_NOTE: &str = "leash: note: no --expect given; the store is checked only against the trace beside it, so a forged store and trace are not detected; pass the chain head printed at run end";
+
+/// the value of the `<prefix>` line of rewind's output.
+fn line_value(out: &Output, prefix: &str) -> String {
+    stdout(out)
+        .lines()
+        .find_map(|l| l.strip_prefix(prefix).map(str::to_owned))
+        .unwrap_or_else(|| panic!("no {prefix:?} line in: {}", stdout(out)))
+}
+
+/// run a printed command the way the shell would, with `leash` on the path.
+fn run_printed(command: &str) -> Output {
+    let bin_dir = tempfile::tempdir().unwrap();
+    symlink(leash_bin(), bin_dir.path().join("leash")).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin_dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let elsewhere = tempfile::tempdir().unwrap();
+    Command::new("sh")
+        .args(["-c", command])
+        .env("PATH", path)
+        .current_dir(elsewhere.path())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn without_expect_the_forgery_note_is_printed_and_with_expect_it_is_not() {
+    let Some(mut f) = Fixture::gone() else { return };
+    populate(&f);
+    f.commit_step(0);
+    agent_edits(&f);
+    f.commit_step(1);
+
+    let out = f.rewind(&[]);
+    assert_success_notice(&out);
+    assert!(
+        stderr(&out).lines().any(|l| l == NO_EXPECT_NOTE),
+        "{}",
+        stderr(&out)
+    );
+
+    agent_edits_again(&f);
+    let head = f.chain_head();
+    let out = f.rewind(&["--expect", &head]);
+    assert_success_notice(&out);
+    assert!(
+        !stderr(&out).contains("no --expect given"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn the_safety_snapshot_digest_is_printed_and_is_the_undo_manifest_digest() {
+    let Some(mut f) = Fixture::gone() else { return };
+    populate(&f);
+    f.commit_step(0);
+    agent_edits(&f);
+    f.commit_step(1);
+
+    let out = f.rewind(&[]);
+    assert_success_notice(&out);
+    let digest = line_value(&out, "safety snapshot digest: ");
+    assert_eq!(digest.len(), 64);
+    assert!(
+        digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "{digest}"
+    );
+    let undo_store = open_dir(&f.undo_dir().join("undo-1"));
+    assert_eq!(load_manifest(&undo_store, 0).unwrap().1, digest);
+    let command = line_value(&out, "to undo this rewind: ");
+    assert!(
+        command.contains(&format!("--undo 1 --expect {digest} ")),
+        "{command}"
+    );
+}
+
+#[test]
+fn undo_checks_expect_against_the_undo_manifest_digest() {
+    let Some(mut f) = Fixture::gone() else { return };
+    populate(&f);
+    f.commit_step(0);
+    agent_edits(&f);
+    f.commit_step(1);
+    let out = f.rewind(&[]);
+    assert_success_notice(&out);
+    let digest = line_value(&out, "safety snapshot digest: ");
+    let after_rewind = tree_state(&f.ws);
+
+    let wrong = "cd".repeat(32);
+    let out = f.rewind(&["--undo", "1", "--expect", &wrong]);
+    assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
+    let message = stderr(&out);
+    assert!(
+        message.contains(&wrong) && message.contains(&digest),
+        "both values are printed: {message}"
+    );
+    assert_eq!(tree_state(&f.ws), after_rewind);
+
+    // without --expect the undo store is checked against nothing, and says so
+    let out = f.rewind(&["--undo", "1"]);
+    assert_success_notice(&out);
+    assert!(
+        stderr(&out).contains("no --expect given; the undo store is checked against nothing"),
+        "{}",
+        stderr(&out)
+    );
+
+    // the right digest restores
+    let out = f.rewind(&["--undo", "1", "--expect", &digest]);
+    assert_success_notice(&out);
+    assert!(
+        !stderr(&out).contains("no --expect given"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+// ---- hostile run directories ----
+
+fn assert_refused(out: &Output, code: i32, needle: &str) {
+    assert_eq!(out.status.code(), Some(code), "{}", stderr(out));
+    assert!(
+        stderr(out).contains(needle),
+        "wanted {needle:?} in: {}",
+        stderr(out)
+    );
+}
+
+/// a run with two committed steps and a workspace the agent changed.
+fn edited_fixture() -> Option<Fixture> {
+    let mut f = Fixture::gone()?;
+    populate(&f);
+    f.commit_step(0);
+    agent_edits(&f);
+    f.commit_step(1);
+    Some(f)
+}
+
+fn mkfifo(path: &Path) {
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: c_path is NUL-terminated and names a path this test owns.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+}
+
+#[test]
+fn a_symlinked_run_directory_is_not_followed() {
+    let Some(f) = edited_fixture() else { return };
+    let before = tree_state(&f.ws);
+    let real = f.state.path().join("real-run");
+    fs::rename(&f.run_dir, &real).unwrap();
+    symlink(&real, &f.run_dir).unwrap();
+
+    let out = f.rewind(&[]);
+    assert_refused(&out, 2, "unknown run");
+    assert_eq!(tree_state(&f.ws), before);
+    assert!(!real.join("rewind").exists());
+}
+
+#[test]
+fn a_symlinked_snapshots_directory_is_not_followed() {
+    let Some(f) = edited_fixture() else { return };
+    let before = tree_state(&f.ws);
+    let real = f.run_dir.join("snapshots-real");
+    fs::rename(f.run_dir.join("snapshots"), &real).unwrap();
+    symlink(&real, f.run_dir.join("snapshots")).unwrap();
+
+    let out = f.rewind(&[]);
+    assert_refused(&out, 2, "no snapshots");
+    assert_eq!(tree_state(&f.ws), before);
+}
+
+#[test]
+fn a_symlinked_rewind_directory_is_not_followed_or_written_through() {
+    let Some(f) = edited_fixture() else { return };
+    let before = tree_state(&f.ws);
+    let outside = tempfile::tempdir().unwrap();
+    symlink(outside.path(), f.run_dir.join("rewind")).unwrap();
+
+    let out = f.rewind(&[]);
+    assert_refused(&out, 125, "rewind directory");
+    assert_eq!(tree_state(&f.ws), before);
+    assert_eq!(
+        fs::read_dir(outside.path()).unwrap().count(),
+        0,
+        "nothing was written through the link"
+    );
+}
+
+#[test]
+fn a_symlinked_undo_snapshot_is_not_followed() {
+    let Some(f) = edited_fixture() else { return };
+    assert_success_notice(&f.rewind(&[]));
+    let after_rewind = tree_state(&f.ws);
+    let real = f.run_dir.join("undo-real");
+    fs::rename(f.undo_dir().join("undo-1"), &real).unwrap();
+    symlink(&real, f.undo_dir().join("undo-1")).unwrap();
+
+    let out = f.rewind(&["--undo", "1"]);
+    assert_refused(&out, 2, "no undo snapshot 1");
+    assert_eq!(tree_state(&f.ws), after_rewind);
+}
+
+#[test]
+fn a_fifo_trace_or_meta_is_refused_without_blocking() {
+    let Some(f) = edited_fixture() else { return };
+    let before = tree_state(&f.ws);
+    let trace = f.run_dir.join("trace.jsonl");
+    fs::remove_file(&trace).unwrap();
+    mkfifo(&trace);
+    let out = f.rewind(&[]);
+    assert_refused(&out, 125, "not a regular file");
+    assert_eq!(tree_state(&f.ws), before);
+    fs::remove_file(&trace).unwrap();
+    f.flush_trace();
+
+    let meta = f.run_dir.join("meta.json");
+    fs::remove_file(&meta).unwrap();
+    mkfifo(&meta);
+    let out = f.rewind(&[]);
+    assert_refused(&out, 125, "not a regular file");
+    assert_eq!(tree_state(&f.ws), before);
+}
+
+#[test]
+fn an_oversized_trace_or_meta_is_refused_unread() {
+    let Some(f) = edited_fixture() else { return };
+    let before = tree_state(&f.ws);
+    let trace = f.run_dir.join("trace.jsonl");
+    fs::remove_file(&trace).unwrap();
+    // sparse: nothing is written, and the size alone must refuse it
+    File::create(&trace)
+        .unwrap()
+        .set_len(TRACE_READ_CAP + 1)
+        .unwrap();
+    let out = f.rewind(&[]);
+    assert_refused(&out, 125, "read cap");
+    assert_eq!(tree_state(&f.ws), before);
+    fs::remove_file(&trace).unwrap();
+    f.flush_trace();
+
+    let meta = f.run_dir.join("meta.json");
+    fs::remove_file(&meta).unwrap();
+    File::create(&meta)
+        .unwrap()
+        .set_len(META_READ_CAP + 1)
+        .unwrap();
+    let out = f.rewind(&[]);
+    assert_refused(&out, 125, "read limit");
+    assert_eq!(tree_state(&f.ws), before);
+}
+
+#[test]
+fn a_trace_of_only_newlines_or_one_huge_line_is_refused_cleanly() {
+    let Some(f) = edited_fixture() else { return };
+    let before = tree_state(&f.ws);
+    let trace = f.run_dir.join("trace.jsonl");
+
+    fs::write(&trace, vec![b'\n'; 16 * 1024 * 1024]).unwrap();
+    let out = f.rewind(&[]);
+    assert_refused(&out, 125, "line 1 is empty");
+
+    // one line over the line cap, with and without its newline
+    let mut huge = vec![b'x'; leash::snapshot::store::TRACE_LINE_CAP + 10];
+    fs::write(&trace, &huge).unwrap();
+    let out = f.rewind(&[]);
+    assert_refused(&out, 125, "longer than");
+    huge.push(b'\n');
+    fs::write(&trace, &huge).unwrap();
+    let out = f.rewind(&[]);
+    assert_refused(&out, 125, "longer than");
+
+    assert_eq!(tree_state(&f.ws), before);
+    assert!(!f.undo_dir().exists(), "no safety snapshot was taken");
+}
+
+/// a completed rewind of the edited fixture, so `rewind/undo-1` is a real safety snapshot.
+/// returns the digest it printed.
+fn with_an_undo_snapshot(f: &Fixture) -> String {
+    let out = f.rewind(&[]);
+    assert_success_notice(&out);
+    line_value(&out, "safety snapshot digest: ")
+}
+
+#[test]
+fn a_forged_undo_store_with_a_corrupt_object_is_refused_before_any_write() {
+    let Some(f) = edited_fixture() else { return };
+    let digest = with_an_undo_snapshot(&f);
+    let after_rewind = tree_state(&f.ws);
+
+    // the undo store holds the tree as the agent left it, so a.txt is "changed"
+    let undo_store = f.undo_dir().join("undo-1");
+    let (manifest, _) = load_manifest(&open_dir(&undo_store), 0).unwrap();
+    let sha = manifest
+        .entries
+        .iter()
+        .find(|e| e.path == "a.txt")
+        .and_then(|e| e.sha256.clone())
+        .unwrap();
+    let object = undo_store.join("objects").join(&sha[..2]).join(&sha);
+    fs::remove_file(&object).unwrap();
+    fs::write(&object, "tampered\n").unwrap();
+
+    let out = f.rewind(&["--undo", "1", "--expect", &digest]);
+    assert_refused(&out, 125, "failed verification");
+    assert_eq!(tree_state(&f.ws), after_rewind, "nothing was written");
+    assert!(
+        !f.undo_dir().join("undo-2").exists(),
+        "the unused safety snapshot is removed"
+    );
+}
+
+#[test]
+fn an_undo_store_whose_manifest_is_not_step_zero_is_an_integrity_failure() {
+    let Some(f) = edited_fixture() else { return };
+    with_an_undo_snapshot(&f);
+    let after_rewind = tree_state(&f.ws);
+    let manifests = f.undo_dir().join("undo-1/manifests");
+
+    // a manifest under another step number
+    fs::rename(
+        manifests.join("step-000000.json"),
+        manifests.join("step-000007.json"),
+    )
+    .unwrap();
+    let out = f.rewind(&["--undo", "1"]);
+    assert_refused(&out, 125, "never completed or is not a safety snapshot");
+    assert_eq!(tree_state(&f.ws), after_rewind);
+
+    // step 0 plus an extra manifest
+    fs::rename(
+        manifests.join("step-000007.json"),
+        manifests.join("step-000000.json"),
+    )
+    .unwrap();
+    fs::copy(
+        manifests.join("step-000000.json"),
+        manifests.join("step-000001.json"),
+    )
+    .unwrap();
+    let out = f.rewind(&["--undo", "1"]);
+    assert_refused(&out, 125, "never completed or is not a safety snapshot");
+    assert_eq!(tree_state(&f.ws), after_rewind);
+}
+
+#[test]
+fn a_failed_apply_prints_an_undo_command_that_works() {
+    // the engine checks every owner before its first write; a target that records an owner
+    // an unprivileged process cannot create is refused after the safety snapshot is taken
+    // and before the workspace changes, which is the failure path the message covers
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let Some(mut f) = edited_fixture() else {
+        return;
+    };
+    let before = tree_state(&f.ws);
+    // a forger rewrites step 0 and the trace's digest for it, so the forgery is consistent
+    let path = f.run_dir.join("snapshots/manifests/step-000000.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let entry = manifest["entries"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["path"] == "a.txt")
+        .unwrap();
+    entry["uid"] = 0.into();
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let forged = load_manifest(&f.store(), 0).unwrap().1;
+    f.rebind_step_digest(0, &forged);
+
+    let out = f.rewind(&[]);
+    assert_refused(&out, 125, "rewind failed");
+    assert_eq!(tree_state(&f.ws), before, "the refusal wrote nothing");
+    let message = stderr(&out);
+    let command = message
+        .lines()
+        .find_map(|l| l.split("restore it with: ").nth(1))
+        .unwrap_or_else(|| panic!("no undo command in: {message}"))
+        .to_string();
+    assert!(command.contains("--undo 1 --expect "), "{command}");
+
+    // the printed command works: it restores the safety snapshot, which is the tree as it is
+    let undo = run_printed(&command);
+    assert_success_notice(&undo);
+    assert!(
+        stdout(&undo).contains("workspace already matches undo snapshot 1"),
+        "{}",
+        stdout(&undo)
+    );
+    assert_eq!(tree_state(&f.ws), before);
+}
+
+// ---- root, and the workspace swapped under the open ----
+
+fn request(f: &Fixture) -> RewindRequest {
+    RewindRequest {
+        run_id: f.id.clone(),
+        target: RewindTarget::Step(0),
+        expect: None,
+        no_undo: false,
+        workspace: f.ws.clone(),
+        state_root: f.state.path().canonicalize().unwrap(),
+    }
+}
+
+#[test]
+fn root_is_refused_before_anything_is_opened_or_created() {
+    let Some(f) = edited_fixture() else { return };
+    let before = tree_state(&f.ws);
+    let hooks = RewindHooks {
+        identity: Some(RestoreContext {
+            euid: 0,
+            egid: 0,
+            groups: Vec::new(),
+        }),
+        before_workspace_open: None,
+    };
+    let result = run_rewind_with_hooks(&request(&f), &mut Vec::new(), &mut Vec::new(), &hooks);
+    match result {
+        Err(RewindError::Failure(message)) => assert!(message.contains("root"), "{message}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(
+        !f.state.path().join("locks").exists(),
+        "no lock directory was created under the state root"
+    );
+    assert!(
+        !f.run_dir.join("run.lock").exists(),
+        "the run lock was not created, so no cleanup could have run"
+    );
+    assert!(!f.undo_dir().exists());
+    assert_eq!(tree_state(&f.ws), before);
+}
+
+#[test]
+fn a_workspace_path_swapped_between_the_check_and_the_open_is_refused() {
+    let Some(mut f) = Fixture::with(None, true) else {
+        return;
+    };
+    populate(&f);
+    f.commit_step(0);
+    agent_edits(&f);
+    let before = tree_state(&f.ws);
+    let outer = f.ws.parent().unwrap().to_path_buf();
+    let top = outer.parent().unwrap().to_path_buf();
+    // a decoy workspace the swap points the path at
+    let decoy = top.join("decoy");
+    create_dir(&decoy);
+    create_dir(&decoy.join("ws"));
+    fs::write(decoy.join("ws/keep.txt"), "keep").unwrap();
+    let decoy_before = tree_state(&decoy);
+
+    let moved = top.join("outer.moved");
+    let swap = || {
+        fs::rename(&outer, &moved).unwrap();
+        symlink(&decoy, &outer).unwrap();
+    };
+    let hooks = RewindHooks {
+        identity: None,
+        before_workspace_open: Some(&swap),
+    };
+    let result = run_rewind_with_hooks(&request(&f), &mut Vec::new(), &mut Vec::new(), &hooks);
+    match result {
+        Err(RewindError::Failure(message)) => assert!(
+            message.contains("the workspace changed while rewind opened it"),
+            "{message}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(tree_state(&decoy), decoy_before, "the decoy is untouched");
+    assert_eq!(
+        tree_state(&moved.join("ws")),
+        before,
+        "the real workspace is untouched"
+    );
+    assert!(
+        !f.undo_dir().exists(),
+        "no safety snapshot was taken of either"
+    );
 }
 
 // ---- a real snapshot run ----

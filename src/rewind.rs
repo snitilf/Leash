@@ -107,10 +107,17 @@ pub fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-/// the command that restores safety snapshot `n` of `run_id`.
-pub fn undo_command(run_id: &str, n: u64, workspace: &Path, state_root: &Path) -> String {
+/// the command that restores safety snapshot `n` of `run_id`, checked against the manifest
+/// digest `digest` the rewind printed when it took the snapshot.
+pub fn undo_command(
+    run_id: &str,
+    n: u64,
+    digest: &str,
+    workspace: &Path,
+    state_root: &Path,
+) -> String {
     format!(
-        "leash rewind {} --undo {n} --workspace {} --state-dir {}",
+        "leash rewind {} --undo {n} --expect {digest} --workspace {} --state-dir {}",
         shell_quote(run_id),
         shell_quote(&workspace.to_string_lossy()),
         shell_quote(&state_root.to_string_lossy()),
@@ -125,7 +132,31 @@ pub fn run_rewind(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(), RewindError> {
-    linux::run(req, out, err)
+    linux::run(req, out, err, &RewindHooks::default())
+}
+
+/// test seams of [`run_rewind`]: the identity the rewind believes it runs as, and a call
+/// made after the workspace is checked and just before it is opened and locked.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+#[derive(Default)]
+pub struct RewindHooks<'a> {
+    /// replaces the identity of the process, so the root refusal can be tested
+    pub identity: Option<crate::snapshot::restore::RestoreContext>,
+    /// runs between the workspace check and the open of the workspace
+    pub before_workspace_open: Option<&'a dyn Fn()>,
+}
+
+/// [`run_rewind`] with test seams.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn run_rewind_with_hooks(
+    req: &RewindRequest,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    hooks: &RewindHooks<'_>,
+) -> Result<(), RewindError> {
+    linux::run(req, out, err, hooks)
 }
 
 /// rewind reads snapshot stores, which only linux produces.
@@ -142,27 +173,25 @@ pub fn run_rewind(
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{HashMap, HashSet};
     use std::ffi::{CStr, CString};
     use std::fs::File;
     use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
 
-    use serde::Deserialize;
-
     use super::*;
     use crate::recorder::{RunMeta, TRACE_SCHEMA_VERSION};
     use crate::run_diff::open_dir_at;
-    use crate::runs::{META_READ_CAP, TRACE_READ_CAP};
+    use crate::runs::META_READ_CAP;
     use crate::snapshot::diff::display_path;
     use crate::snapshot::restore::{
-        RestoreContext, RestoreError, RestoreOp, apply_with_context, current_manifest, plan,
-        recompute_chain, scan_current,
+        RestoreContext, RestoreError, RestoreOp, apply_with_context, plan, recompute_chain,
+        scan_current,
     };
     use crate::snapshot::store::{
-        Limits, Manifest, ManifestEntry, committed_steps_from_trace, load_manifest,
-        published_steps, verify_object,
+        Limits, Manifest, ManifestEntry, TraceRead, capture, load_manifest, published_steps,
+        read_trace, verify_object,
     };
     use crate::supervisor::run_cgroup::{
         CgroupParent, RunCgroupState, RunLock, cleanup_stale, is_valid_run_id, run_cgroup_gone,
@@ -188,7 +217,17 @@ mod linux {
         req: &RewindRequest,
         out: &mut dyn Write,
         err: &mut dyn Write,
+        hooks: &RewindHooks<'_>,
     ) -> Result<(), RewindError> {
+        // root is refused before anything is opened: the stale-run cleanup and the workspace
+        // lock would otherwise create root-owned entries, and the cleanup would run as root
+        let ctx = match &hooks.identity {
+            Some(ctx) => ctx.clone(),
+            None => RestoreContext::from_process().map_err(|e| failure(e.to_string()))?,
+        };
+        if ctx.euid == 0 {
+            return Err(failure(RestoreError::RunningAsRoot.to_string()));
+        }
         let label = display_path(&req.run_id);
         if !is_valid_run_id(&req.run_id) {
             return Err(usage(format!("unknown run '{label}'")));
@@ -211,16 +250,37 @@ mod linux {
             .clone()
             .ok_or_else(|| usage(format!("run '{label}' is not a snapshot run")))?;
         let _run_lock = ensure_run_over(req, &open.run_dir, &recorded, &label)?;
+        if let Some(hook) = hooks.before_workspace_open {
+            hook();
+        }
         let workspace_lock = WorkspaceLock::acquire(&req.state_root, &req.workspace)
             .map_err(|e| failure(e.to_string()))?;
+        // the checks above compared a path, and the lock opened it a moment later. the path
+        // read back from the locked handle is the directory that was really opened, so a
+        // component swapped for a symlink in between is caught here, before any write.
+        if workspace_lock.canonical_workspace() != req.workspace {
+            return Err(failure(format!(
+                "the workspace changed while rewind opened it: expected {}, opened {}",
+                display_path(&req.workspace.to_string_lossy()),
+                display_path(&workspace_lock.canonical_workspace().to_string_lossy())
+            )));
+        }
 
         // the target and the integrity checks come before any write, the safety snapshot
         // included
         let target = resolve_target(req, &open, &label, out)?;
-
-        let ctx = RestoreContext::from_process().map_err(|e| failure(e.to_string()))?;
-        if ctx.euid == 0 {
-            return Err(failure(RestoreError::RunningAsRoot.to_string()));
+        if req.expect.is_none() {
+            let what = match req.target {
+                RewindTarget::Step(_) => {
+                    "the store is checked only against the trace beside it, so a forged store \
+                     and trace are not detected; pass the chain head printed at run end"
+                }
+                RewindTarget::Undo(_) => {
+                    "the undo store is checked against nothing, so a forged undo store is not \
+                     detected; pass the safety snapshot digest printed by the earlier rewind"
+                }
+            };
+            writeln!(err, "leash: note: no --expect given; {what}")?;
         }
         // the locked directory handle itself is what is scanned, captured and restored,
         // so the directory that is locked is the directory that changes (ADR-0026)
@@ -248,13 +308,16 @@ mod linux {
             }
             manifest
         } else {
-            let undo = create_undo_store(&open.run_dir, req)?;
-            let manifest = current_manifest(workspace, &undo.store, 0, &limits).map_err(|e| {
+            let mut undo = create_undo_store(&open.run_dir, req)?;
+            let refused = |e: &dyn std::fmt::Display| {
                 failure(format!(
                     "cannot take the safety snapshot of the workspace: {e}; \
                      pass --no-undo to rewind without one (the rewind then cannot be undone)"
                 ))
-            })?;
+            };
+            capture(workspace, &undo.store, 0, &limits).map_err(|e| refused(&e))?;
+            let (manifest, digest) = load_manifest(&undo.store, 0).map_err(|e| refused(&e))?;
+            undo.digest = digest;
             safety = Some(undo);
             manifest
         };
@@ -274,10 +337,17 @@ mod linux {
                 display_path(&undo.path.to_string_lossy()),
                 undo.n
             )?;
+            writeln!(out, "safety snapshot digest: {}", undo.digest)?;
             writeln!(
                 out,
                 "to undo this rewind: {}",
-                undo_command(&req.run_id, undo.n, &req.workspace, &req.state_root)
+                undo_command(
+                    &req.run_id,
+                    undo.n,
+                    &undo.digest,
+                    &req.workspace,
+                    &req.state_root
+                )
             )?;
         }
         write!(out, "{}", rewind_plan.summary())?;
@@ -317,7 +387,13 @@ mod linux {
                     Some(undo) => message.push_str(&format!(
                         "; the safety snapshot is at {}, restore it with: {}",
                         display_path(&undo.path.to_string_lossy()),
-                        undo_command(&req.run_id, undo.n, &req.workspace, &req.state_root)
+                        undo_command(
+                            &req.run_id,
+                            undo.n,
+                            &undo.digest,
+                            &req.workspace,
+                            &req.state_root
+                        )
                     )),
                     None => {
                         message.push_str("; --no-undo was given, so there is no safety snapshot")
@@ -517,7 +593,7 @@ mod linux {
     ) -> Result<Target, RewindError> {
         match req.target {
             RewindTarget::Step(step) => resolve_step(req, open, label, step, out),
-            RewindTarget::Undo(n) => resolve_undo(&open.run_dir, label, n),
+            RewindTarget::Undo(n) => resolve_undo(&open.run_dir, label, n, req.expect.as_deref()),
         }
     }
 
@@ -528,11 +604,10 @@ mod linux {
         step: u64,
         out: &mut dyn Write,
     ) -> Result<Target, RewindError> {
-        let trace = read_trace(&open.run_dir, &open.meta, label)?;
+        let trace = read_checked_trace(&open.run_dir, &open.meta, label)?;
         // the committed set comes from the trace's step events, never from the manifests on
         // disk, so an orphan manifest is neither a target nor part of the chain
-        let committed = committed_steps_from_trace(&open.run_dir)
-            .map_err(|e| failure(format!("run '{label}': trace.jsonl: {e}")))?;
+        let committed = &trace.committed;
         let published = published_steps(&open.store)
             .map_err(|e| failure(format!("run '{label}': snapshot store: {e}")))?;
         if !committed.contains(&step) {
@@ -553,9 +628,9 @@ mod linux {
                 ))
             });
         }
-        let chain = recompute_chain(&open.store, &committed)
+        let chain = recompute_chain(&open.store, committed)
             .map_err(|e| failure(format!("run '{label}': snapshot store: {e}")))?;
-        let Some(trace_digest) = trace.get(&step) else {
+        let Some(trace_digest) = trace.digests.get(&step) else {
             return Err(failure(format!(
                 "run '{label}' step {step} is committed but its step event carries no manifest digest"
             )));
@@ -599,7 +674,12 @@ mod linux {
         })
     }
 
-    fn resolve_undo(run_dir: &File, label: &str, n: u64) -> Result<Target, RewindError> {
+    fn resolve_undo(
+        run_dir: &File,
+        label: &str,
+        n: u64,
+        expect: Option<&str>,
+    ) -> Result<Target, RewindError> {
         let missing = || usage(format!("run '{label}' has no undo snapshot {n}"));
         let safety =
             open_dir_at(Some(run_dir), &c_name(SAFETY_DIR)?, false).map_err(|_| missing())?;
@@ -608,12 +688,22 @@ mod linux {
         let steps = published_steps(&store)
             .map_err(|e| failure(format!("run '{label}' undo snapshot {n}: {e}")))?;
         if steps != [0] {
-            return Err(usage(format!(
-                "undo snapshot {n} of run '{label}' was never completed"
+            // a store that is not exactly step 0 is an integrity failure of a directory a
+            // rewind made, not a request that names something missing
+            return Err(failure(format!(
+                "undo snapshot {n} of run '{label}' was never completed or is not a safety snapshot \
+                 (its manifests are {steps:?}, expected only step 0)"
             )));
         }
-        let (manifest, _) = load_manifest(&store, 0)
+        let (manifest, digest) = load_manifest(&store, 0)
             .map_err(|e| failure(format!("run '{label}' undo snapshot {n}: {e}")))?;
+        if let Some(expect) = expect
+            && expect != digest
+        {
+            return Err(failure(format!(
+                "--expect {expect} does not match the digest of undo snapshot {n} {digest}"
+            )));
+        }
         Ok(Target {
             manifest,
             store,
@@ -628,114 +718,151 @@ mod linux {
 
     // ---- the trace ----
 
-    #[derive(Deserialize)]
-    struct EventKind {
-        #[serde(rename = "type")]
-        kind: String,
-    }
-
-    #[derive(Deserialize)]
-    struct StepEvent {
-        step: u64,
-        manifest_digest: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    struct StartEvent {
-        workspace: PathBuf,
-        run_cgroup: Option<PathBuf>,
-    }
-
-    /// the committed steps of the trace: step number to the manifest digest its step event
-    /// carries. the trace is untrusted: it is read through a handle, capped, and every line
-    /// is parsed strictly, except that an unterminated final line (a crash mid-write) is
-    /// ignored when it does not parse.
-    fn read_trace(
+    /// read the trace once, through the store's streaming capped reader, and check what
+    /// rewind needs beyond the committed steps: the trace starts with the `run_start` of
+    /// this run's `meta.json`. every use of the trace goes through `read_trace`, so rewind
+    /// and `diff` agree on which steps are committed by construction.
+    fn read_checked_trace(
         run_dir: &File,
         meta: &RunMeta,
         label: &str,
-    ) -> Result<BTreeMap<u64, String>, RewindError> {
+    ) -> Result<TraceRead, RewindError> {
         let bad = |what: String| failure(format!("run '{label}': trace.jsonl: {what}"));
-        let bytes = read_capped_at(run_dir, c"trace.jsonl", TRACE_READ_CAP)
-            .map_err(|e| bad(e.to_string()))?;
-        let text = std::str::from_utf8(&bytes).map_err(|e| bad(e.to_string()))?;
-        let terminated = text.ends_with('\n');
-        let lines: Vec<&str> = text.split('\n').collect();
-        let mut steps = BTreeMap::new();
-        let mut events = 0usize;
-        for (index, line) in lines.iter().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let torn_tail = index + 1 == lines.len() && !terminated;
-            let at = index + 1;
-            let kind: EventKind = match serde_json::from_str(line) {
-                Ok(kind) => kind,
-                Err(_) if torn_tail => continue,
-                Err(e) => return Err(bad(format!("line {at}: {e}"))),
-            };
-            match kind.kind.as_str() {
-                "run_start" => {
-                    if events != 0 {
-                        return Err(bad(format!("line {at}: a second run_start")));
-                    }
-                    let start: StartEvent =
-                        serde_json::from_str(line).map_err(|e| bad(format!("line {at}: {e}")))?;
-                    if start.workspace != meta.workspace || start.run_cgroup != meta.run_cgroup {
-                        return Err(bad("run_start disagrees with meta.json".into()));
-                    }
-                }
-                _ if events == 0 => return Err(bad("the first event is not run_start".into())),
-                "step" => {
-                    let step: StepEvent = match serde_json::from_str(line) {
-                        Ok(step) => step,
-                        Err(_) if torn_tail => continue,
-                        Err(e) => return Err(bad(format!("line {at}: {e}"))),
-                    };
-                    // a step event without a digest binds no snapshot: not a target
-                    let Some(digest) = step.manifest_digest else {
-                        continue;
-                    };
-                    if digest.len() != 64
-                        || !digest
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                    {
-                        return Err(bad(format!(
-                            "line {at}: the digest of step {} is not 64 lowercase hex digits",
-                            step.step
-                        )));
-                    }
-                    if steps.insert(step.step, digest).is_some() {
-                        return Err(bad(format!("step {} is committed twice", step.step)));
-                    }
-                }
-                _ => {}
-            }
-            events += 1;
-        }
-        if events == 0 {
+        let trace = read_trace(run_dir).map_err(|e| bad(e.to_string()))?;
+        if trace.events == 0 {
             return Err(bad("no events".into()));
         }
-        Ok(steps)
+        let Some(start) = &trace.run_start else {
+            return Err(bad("the first event is not run_start".into()));
+        };
+        if start.workspace.as_deref() != Some(meta.workspace.as_path())
+            || start.run_cgroup != meta.run_cgroup
+        {
+            return Err(bad("run_start disagrees with meta.json".into()));
+        }
+        Ok(trace)
     }
 
     // ---- the safety snapshot ----
 
-    /// a safety snapshot store, removed again unless `keep` is set.
+    /// a safety snapshot store, removed again unless `keep` is set. it is removed through
+    /// the handle of the `rewind` directory, never by path, and never through a symlink.
     struct Undo {
         n: u64,
         path: PathBuf,
+        /// the `rewind` directory the snapshot lives in
+        parent: File,
+        /// the snapshot's name in `parent`
+        name: CString,
         store: File,
+        /// the manifest digest of the snapshot, set once it is captured
+        digest: String,
         keep: bool,
     }
 
     impl Drop for Undo {
         fn drop(&mut self) {
             if !self.keep {
-                let _ = std::fs::remove_dir_all(&self.path);
+                let _ = remove_tree_at(&self.parent, &self.name, 0);
             }
         }
+    }
+
+    /// the deepest tree `remove_tree_at` descends into: a store has three levels.
+    const REMOVE_DEPTH_LIMIT: u32 = 16;
+
+    /// remove the directory `name` of `parent` and everything beneath it, descriptor by
+    /// descriptor with `unlinkat`. a symlink is unlinked itself and never followed.
+    fn remove_tree_at(parent: &File, name: &CStr, depth: u32) -> io::Result<()> {
+        // SAFETY: parent is a live directory descriptor and name is nul-terminated;
+        // O_NOFOLLOW makes a symlink fail with ELOOP or ENOTDIR instead of opening its target.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::ENOENT) => Ok(()),
+                Some(libc::ENOTDIR | libc::ELOOP) => unlink_at(parent, name, 0),
+                _ => Err(e),
+            };
+        }
+        // SAFETY: fd was returned by openat and is uniquely owned here.
+        let dir = unsafe { File::from_raw_fd(fd) };
+        if depth >= REMOVE_DEPTH_LIMIT {
+            return Err(io::Error::other("directory tree is too deep"));
+        }
+        let mut first_error = None;
+        for child in read_names(&dir)? {
+            if let Err(e) = remove_tree_at(&dir, &child, depth + 1) {
+                first_error.get_or_insert(e);
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => unlink_at(parent, name, libc::AT_REMOVEDIR),
+        }
+    }
+
+    fn unlink_at(parent: &File, name: &CStr, flags: libc::c_int) -> io::Result<()> {
+        // SAFETY: parent is a live directory descriptor and name is nul-terminated.
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// the entry names of an open directory, without `.` and `..`.
+    fn read_names(dir: &File) -> io::Result<Vec<CString>> {
+        // SAFETY: dir is a live directory descriptor; "." reopens it as a fresh descriptor
+        // that the stream below owns.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd is a uniquely owned directory descriptor; fdopendir takes ownership on
+        // success.
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            let e = io::Error::last_os_error();
+            // SAFETY: fdopendir failed, so fd is still ours to close.
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        let mut names = Vec::new();
+        let result = loop {
+            // SAFETY: __errno_location returns the current thread's errno slot.
+            unsafe { *libc::__errno_location() = 0 };
+            // SAFETY: stream is a live DIR* owned by this function.
+            let ent = unsafe { libc::readdir(stream) };
+            if ent.is_null() {
+                let e = io::Error::last_os_error();
+                break if e.raw_os_error() == Some(0) {
+                    Ok(())
+                } else {
+                    Err(e)
+                };
+            }
+            // SAFETY: ent is non-null and d_name is NUL-terminated, valid until the next
+            // readdir or closedir.
+            let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
+            if name != c"." && name != c".." {
+                names.push(name.to_owned());
+            }
+        };
+        // SAFETY: stream came from fdopendir and is closed exactly once.
+        unsafe { libc::closedir(stream) };
+        result.map(|()| names)
     }
 
     /// create the next free `rewind/undo-<n>` directory of the run and open it as a store.
@@ -778,7 +905,10 @@ mod linux {
             return Ok(Undo {
                 n,
                 path,
+                parent: safety,
+                name,
                 store,
+                digest: String::new(),
                 keep: false,
             });
         }
@@ -812,6 +942,54 @@ mod linux {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    mod remove_tests {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        #[test]
+        fn remove_tree_at_unlinks_a_symlink_and_never_follows_it() {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("keep.txt"), "keep").unwrap();
+            let parent = tempfile::tempdir().unwrap();
+            let tree = parent.path().join("undo-1");
+            std::fs::create_dir_all(tree.join("objects/ab")).unwrap();
+            std::fs::write(tree.join("objects/ab/obj"), "x").unwrap();
+            symlink(outside.path(), tree.join("objects/link")).unwrap();
+            symlink(outside.path().join("keep.txt"), tree.join("file-link")).unwrap();
+
+            let handle = File::open(parent.path()).unwrap();
+            remove_tree_at(&handle, c"undo-1", 0).unwrap();
+            assert!(!tree.exists());
+            assert_eq!(
+                std::fs::read_to_string(outside.path().join("keep.txt")).unwrap(),
+                "keep",
+                "the link target is untouched"
+            );
+        }
+
+        #[test]
+        fn remove_tree_at_a_symlink_name_removes_only_the_link() {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("keep.txt"), "keep").unwrap();
+            let parent = tempfile::tempdir().unwrap();
+            symlink(outside.path(), parent.path().join("undo-1")).unwrap();
+
+            let handle = File::open(parent.path()).unwrap();
+            remove_tree_at(&handle, c"undo-1", 0).unwrap();
+            assert!(!parent.path().join("undo-1").exists());
+            assert!(outside.path().join("keep.txt").exists());
+        }
+
+        #[test]
+        fn remove_tree_at_a_missing_name_is_fine() {
+            let parent = tempfile::tempdir().unwrap();
+            let handle = File::open(parent.path()).unwrap();
+            remove_tree_at(&handle, c"nothing", 0).unwrap();
+        }
     }
 }
 
@@ -849,10 +1027,14 @@ mod tests {
             undo_command(
                 "20260101T000000Z-abc123",
                 2,
+                &"ab".repeat(32),
                 Path::new("/w/my project"),
                 Path::new("/s")
             ),
-            "leash rewind 20260101T000000Z-abc123 --undo 2 --workspace '/w/my project' --state-dir /s"
+            format!(
+                "leash rewind 20260101T000000Z-abc123 --undo 2 --expect {} --workspace '/w/my project' --state-dir /s",
+                "ab".repeat(32)
+            )
         );
     }
 }

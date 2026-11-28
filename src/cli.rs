@@ -176,7 +176,7 @@ everything after '--' is the command and is passed through verbatim.
                             compare the filesystem effects of two runs or steps
                             (a missing :<step> means the run's final committed step)
   leash rewind <run-id> [--step N] [--expect <digest>] [--no-undo] [--workspace <dir>] [--state-dir <dir>]
-  leash rewind <run-id> --undo <n> [--no-undo] [--workspace <dir>] [--state-dir <dir>]
+  leash rewind <run-id> --undo <n> [--expect <digest>] [--no-undo] [--workspace <dir>] [--state-dir <dir>]
                             restore the workspace to step N of a finished snapshot run
                             (default step 0, before the agent started) after a safety
                             snapshot that '--undo <n>' restores; '--no-undo' skips it.
@@ -334,9 +334,6 @@ fn parse_rewind(rest: &[String]) -> Result<RewindArgs, UsageError> {
     let run_id = run_id.ok_or(UsageError::MissingRewindRun)?;
     if undo.is_some() && step.is_some() {
         return Err(UsageError::ConflictingFlags("--undo", "--step"));
-    }
-    if undo.is_some() && expect.is_some() {
-        return Err(UsageError::ConflictingFlags("--undo", "--expect"));
     }
     Ok(RewindArgs {
         run_id,
@@ -1600,10 +1597,8 @@ mod tests {
             rewind(&["r", "--undo", "1", "--step", "0"]),
             Err(UsageError::ConflictingFlags("--undo", "--step"))
         );
-        assert_eq!(
-            rewind(&["r", "--undo", "1", "--expect", &"a".repeat(64)]),
-            Err(UsageError::ConflictingFlags("--undo", "--expect"))
-        );
+        // an undo is checked against the digest of its safety snapshot
+        assert!(rewind(&["r", "--undo", "1", "--expect", &"a".repeat(64)]).is_ok());
     }
 
     #[test]
