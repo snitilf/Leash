@@ -164,10 +164,23 @@ The freezer stops tasks, not in-flight I/O, so no AIO context may exist.
 A snapshot run also traps the metadata calls Landlock has no right for (ADR-0024 decision 4), and only that run: the filter of a run without snapshots is byte for byte unchanged.
 The path forms are `setxattr`, `lsetxattr`, `removexattr`, `lremovexattr`, `utimensat`, `utimes`, `utime`, `futimesat`, `fchmodat2` and `lchown`.
 They go through the same path as `chmod`: the broker resolves the path on a retained handle, the access is a write to the resolved identity, the implicit denies (`implicit:state_root`, `implicit:cgroup`) rank before policy, and an allow is realized by the broker, never by `CONTINUE`.
-The legacy time calls become one `utimensat` on the handle, and `fchmodat2` with only `AT_SYMLINK_NOFOLLOW` is refused `EOPNOTSUPP` for a symlink; any other `fchmodat2` flag is refused.
+The legacy time calls become one `utimensat` on the handle.
+`fchmodat2` with `AT_SYMLINK_NOFOLLOW` on a symlink is refused `EOPNOTSUPP`, as the kernel does.
+`lsetxattr` and `lremovexattr` on a symlink cannot be realized, because a symlink cannot be reached through its proc link without being followed: a `user.` name gets `EPERM`, which is the kernel's own answer for that namespace, and another namespace gets `EOPNOTSUPP`.
+`utimensat` and `fchmodat2` with `AT_EMPTY_PATH` and an empty path act on the object of their directory descriptor, as the kernel does, and are realized by the broker on that object's path, never continued, because the empty string is in agent memory.
+A call whose own arguments the kernel refuses before it looks at a path (an unknown flag, an xattr value over 65536 bytes) is answered with that errno and recorded as `failsafe:unsupported_operand`, not as a failed memory read.
+The path-naming calls newer than any C library, `setxattrat` (463), `removexattrat` (466, Linux 6.13) and `file_setattr` (469, Linux 6.17), are trapped in a snapshot run and answered `ENOSYS`, recorded as `snapshot:xattrat`.
+Nothing calls them yet, so refusing them costs nothing, and without a table entry the filter would pass them and an agent could set `user.leash.lock` on its run cgroup with no open.
+The numbers are those of `arch/x86/entry/syscalls/syscall_64.tbl`, pinned in the filter tests.
+Mediation can replace the `ENOSYS` later, and a kernel older than the call answers `ENOSYS` anyway, so the trace event is what shows the call was intercepted.
 The descriptor forms are `fchmod`, `fchown`, `fsetxattr`, `fremovexattr` and `utimensat` or `futimesat` with a null path (`futimens`).
 Their target is read back from `/proc/<pid>/fd/<n>`, judged as a write to that path, and an allow continues.
-That is not a pointer re-read: the object is the descriptor's, and a descriptor on a state-root or cgroup2 file cannot be obtained because the open is denied.
+That is not a pointer re-read: the object is the descriptor's, fixed when the agent opened it.
+It is a time-of-check gap all the same: a sibling thread can `dup2` another descriptor onto `<n>` between the `/proc` readlink and the `CONTINUE`, so the judged object and the acted-on object can differ.
+What bounds it is that no descriptor on a state-root or cgroup2 file can be opened from inside the tree, because the open is denied, so the only descriptors a sibling can swap in are on files the agent may already write.
+It is not true that such a descriptor cannot be obtained at all.
+`open_tree` yields an `O_PATH` descriptor, which these calls refuse with `EBADF` (unverified on Linux 6.13 and later), and an out-of-tree helper reached through an allowed channel can pass a descriptor over a socket (ADR-0024, the helper residual).
+A descriptor on an anonymous target reads back as `pipe:[N]`, `socket:[N]` or `/memfd:name (deleted)`, is judged as that path, and is usually denied by policy; that is a compatibility cost.
 A target that cannot be read is denied as `failsafe:memory_read`.
 The filter and the run flag are checked at the start of the loop, and a trapped metadata call that reaches a run without the flag is denied and recorded as `snapshot:metadata`.
 A run without snapshots keeps the filter and the trace unchanged: the AIO numbers are not in its filter.

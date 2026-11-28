@@ -28,8 +28,11 @@ Snapshots exist only in enforce mode, and only when the operator passes `--snaps
 Before spawn, verify a writable delegated cgroup v2 with working `cgroup.freeze` and `cgroup.kill`.
 Also verify Landlock ABI 3 or higher, and that no write-class Landlock grant overlaps the state root or any cgroup2 mount.
 The ABI comes from the preflight probe, which a test replaces to prove the refusal because no available host has an ABI below 3.
-The overlap check runs on the grants derived from the policy, with their roots resolved through symlinks and compared to the state root and to every cgroup2 mount of `/proc/self/mountinfo` by path component, as an ancestor or a descendant.
-It refuses on write, truncate, any `MAKE_*`, remove or refer rights, names the policy rule, the grant path, the right and the protected path, and runs before the cgroup probe and before any run directory exists.
+The overlap check runs on the anchors Landlock really opens, not on the grant roots the policy spells.
+Landlock cannot open a path that does not exist, so it anchors such a grant at the deepest existing ancestor and puts the rights there: `~/.local/state/mytool/**` with no `mytool` grants write on `~/.local/state`, and `/scratch/**` with no `/scratch` grants write on `/`.
+The session therefore builds the ruleset first, which opens the anchors without applying anything, and compares each anchor's canonical path and its rights, masked by the anchor's file type, with the state root and with every cgroup2 mount of `/proc/self/mountinfo`, by path component, as an ancestor or a descendant.
+It also compares the `(st_dev, st_ino)` of each anchor with those of the protected path and of its ancestors, and the reverse, so a bind mount alias of the state root is caught.
+It refuses on write, truncate, any `MAKE_*`, remove or refer rights, names the policy rule, the grant path as spelled, the anchor when the path is missing, the right and the protected path, and runs before the cgroup probe and before any run directory exists.
 Place the child in the run cgroup before untrusted execution; keep the supervisor outside.
 Leash creates the child directly inside the cgroup with `clone3(CLONE_INTO_CGROUP)` and a descriptor on the pinned run cgroup, so membership is atomic: the child is a member before it runs one instruction, before it installs its filter, and before `execve`.
 No `cgroup.procs` write is involved, no attach descriptor is handed to the child, and a failed entry fails the spawn before any agent code exists.
@@ -110,7 +113,10 @@ ADR-0024 replaces the ADR-0022 protected-storage prerequisite for this implement
 Protection during the run comes from three controls.
 Every enforce run adds an implicit, first-ranked deny for the state root that covers every access, read included.
 A snapshot run adds the same kind of deny, matched id `implicit:cgroup`, for every cgroup2 mount in the mount namespace, read included, as depth.
-It also denies removing, replacing or altering an ancestor of a mount, and the metadata calls a snapshot run traps (xattrs, timestamps, `fchmodat2`, `lchown` and the descriptor forms), because Landlock has no right for them.
+It is decided twice.
+By path, against the mounts read once before the run, which also covers the ancestors of a mount.
+By identity, on the handle the broker pinned: an object whose `fstatfs` type is `CGROUP2_SUPER_MAGIC` is denied whatever its path, so a bind mount of a cgroup directory and a cgroup2 mount made after the run started are covered.
+It also denies removing, replacing or altering an ancestor of a mount, and the metadata calls a snapshot run traps (xattrs, timestamps, `fchmodat2`, `lchown` and the descriptor forms), because Landlock has no right for them (ADR-0025).
 `clone3` returning `ENOSYS` is what closes `CLONE_INTO_CGROUP`, because `open_tree` and descriptor passing can still yield a directory descriptor.
 The state-root deny also covers rename, removal and replacement of every ancestor directory of the state root.
 It matches by path identity, so a second mount of the same directory is a residual, and metadata reads (`stat`, `readlink`, `inotify_add_watch`) are unmediated.
