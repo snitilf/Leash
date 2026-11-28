@@ -14,8 +14,9 @@ use std::io;
 pub const PATH_READ_CAP: usize = 4096;
 /// maximum destination-bearing send payload copied for broker realization (ADR-0020).
 pub const NETWORK_PAYLOAD_CAP: usize = 65_535;
-/// absolute ceiling for a fixed-size child-memory read.
-pub const ABSOLUTE_READ_CAP: usize = NETWORK_PAYLOAD_CAP;
+/// absolute ceiling for one fixed-size child-memory read: the kernel's `XATTR_SIZE_MAX`, the
+/// largest value the supervisor copies. a longer read is refused, never shortened.
+pub const ABSOLUTE_READ_CAP: usize = 65_536;
 /// bytes of `struct open_how` the loop needs: the leading u64 `flags` field.
 pub const OPEN_HOW_FLAGS_SIZE: usize = 8;
 
@@ -103,13 +104,19 @@ pub fn read_cstr_capped(
 }
 
 /// read exactly `len` bytes at `addr` through `read_at`. for fixed-size structs
-/// (`open_how` flags); `len` is capped at one page.
+/// (`open_how` flags) and xattr values. a `len` over `ABSOLUTE_READ_CAP` is an error: a clamped
+/// read would hand the caller a shorter value that it takes for the whole.
 pub fn read_exact_capped(
     mut read_at: impl FnMut(u64, &mut [u8]) -> io::Result<usize>,
     addr: u64,
     len: usize,
 ) -> Result<Vec<u8>, MemReadError> {
-    let len = len.min(ABSOLUTE_READ_CAP);
+    if len > ABSOLUTE_READ_CAP {
+        return Err(MemReadError::OverCap {
+            wanted: len,
+            cap: ABSOLUTE_READ_CAP,
+        });
+    }
     let mut buf = vec![0u8; len];
     let mut got = 0;
     while got < len {
