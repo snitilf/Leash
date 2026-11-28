@@ -253,9 +253,87 @@ pub fn fs_shape(syscall_nr: u32) -> Option<FsShape> {
             dest: None,
             access: Fixed(WRITE),
         },
+        // section 6: snapshot runs only. metadata changes are decided as a write to the
+        // path, like chmod. the utimensat and futimesat calls with a null path name a
+        // descriptor instead and never reach this table (see `fd_metadata_name`)
+        nr::LCHOWN => FsShape {
+            name: "lchown",
+            path: PathArg::cwd(0),
+            dest: None,
+            access: Fixed(WRITE),
+        },
+        nr::UTIME => FsShape {
+            name: "utime",
+            path: PathArg::cwd(0),
+            dest: None,
+            access: Fixed(WRITE),
+        },
+        nr::UTIMES => FsShape {
+            name: "utimes",
+            path: PathArg::cwd(0),
+            dest: None,
+            access: Fixed(WRITE),
+        },
+        nr::FUTIMESAT => FsShape {
+            name: "futimesat",
+            path: PathArg::at(0, 1),
+            dest: None,
+            access: Fixed(WRITE),
+        },
+        nr::UTIMENSAT => FsShape {
+            name: "utimensat",
+            path: PathArg::at(0, 1),
+            dest: None,
+            access: Fixed(WRITE),
+        },
+        nr::SETXATTR => FsShape {
+            name: "setxattr",
+            path: PathArg::cwd(0),
+            dest: None,
+            access: Fixed(WRITE),
+        },
+        nr::LSETXATTR => FsShape {
+            name: "lsetxattr",
+            path: PathArg::cwd(0),
+            dest: None,
+            access: Fixed(WRITE),
+        },
+        nr::REMOVEXATTR => FsShape {
+            name: "removexattr",
+            path: PathArg::cwd(0),
+            dest: None,
+            access: Fixed(WRITE),
+        },
+        nr::LREMOVEXATTR => FsShape {
+            name: "lremovexattr",
+            path: PathArg::cwd(0),
+            dest: None,
+            access: Fixed(WRITE),
+        },
+        nr::FCHMODAT2 => FsShape {
+            name: "fchmodat2",
+            path: PathArg::at(0, 1),
+            dest: None,
+            access: Fixed(WRITE),
+        },
         _ => return None,
     };
     Some(shape)
+}
+
+/// the name of a metadata call that names an open descriptor (argument 0) rather than a
+/// path: the `f*` forms, and `utimensat` or `futimesat` called with a null path, which is
+/// what `futimens` does. decided on the descriptor's resolved target.
+pub fn fd_metadata_name(syscall_nr: u32, path_arg: u64) -> Option<&'static str> {
+    match syscall_nr {
+        nr::FCHMOD => Some("fchmod"),
+        nr::FCHOWN => Some("fchown"),
+        nr::FSETXATTR => Some("fsetxattr"),
+        nr::FREMOVEXATTR => Some("fremovexattr"),
+        nr::UTIMENSAT if path_arg == 0 => Some("utimensat"),
+        nr::FUTIMESAT if path_arg == 0 => Some("futimesat"),
+        _ => None,
+    }
 }
 
 /// name any syscall in the mediated or denied-and-recorded tables, for the event
@@ -278,6 +356,10 @@ pub fn syscall_name(syscall_nr: u32) -> Option<&'static str> {
         nr::CONNECT => "connect",
         nr::SENDTO => "sendto",
         nr::BIND => "bind",
+        nr::FCHMOD => "fchmod",
+        nr::FCHOWN => "fchown",
+        nr::FSETXATTR => "fsetxattr",
+        nr::FREMOVEXATTR => "fremovexattr",
         nr::IO_SETUP => "io_setup",
         nr::IO_SUBMIT => "io_submit",
         nr::IO_URING_SETUP => "io_uring_setup",
@@ -328,7 +410,24 @@ pub fn openat2_o_path_invalid(open_flags: u64) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::sandbox::filter::{DENIED_RECORDED, MEDIATED};
+    use crate::sandbox::filter::{DENIED_RECORDED, MEDIATED, SNAPSHOT_METADATA};
+
+    #[test]
+    fn every_snapshot_metadata_call_names_a_path_or_a_descriptor() {
+        for &n in SNAPSHOT_METADATA {
+            let by_path = fs_shape(n);
+            let by_fd = fd_metadata_name(n, 0);
+            assert!(by_path.is_some() || by_fd.is_some(), "{n} is unclassified");
+            // a non-null path is always the path shape, a null path the descriptor one
+            assert_eq!(fd_metadata_name(n, 0x1000).is_some(), by_path.is_none());
+            if let Some(shape) = by_path {
+                assert_eq!(shape.access, AccessSpec::Fixed(&[FsAccess::Write]));
+                assert_eq!(syscall_name(n), Some(shape.name));
+            } else {
+                assert_eq!(syscall_name(n), by_fd);
+            }
+        }
+    }
 
     #[test]
     fn every_31_and_32_family_syscall_has_a_shape_and_nothing_else_does() {

@@ -878,6 +878,7 @@ fn enforce_mode_without_policy_is_refused() {
         capture: None,
         snapshot_integrity: false,
         state_root: None,
+        cgroup_mounts: None,
     };
     let result = run_loop(child, config, &mut writer);
     assert!(matches!(result, Err(RunError::EnforceWithoutPolicy)));

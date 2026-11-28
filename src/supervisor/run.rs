@@ -36,14 +36,16 @@ use crate::recorder::{
     SyscallEvent, TraceSink, TraceWriter,
 };
 use crate::sandbox::filter::{
-    AUDIT_ARCH_X86_64, DENIED_RECORDED, SNAPSHOT_TRAPPED, X32_SYSCALL_BIT, nr,
+    AUDIT_ARCH_X86_64, DENIED_RECORDED, SNAPSHOT_METADATA, SNAPSHOT_TRAPPED, X32_SYSCALL_BIT, nr,
 };
 use crate::supervisor::ask;
 #[cfg(target_os = "linux")]
 use crate::supervisor::broker::{
     BrokerResult, BrokerResultOrPath, MutationOperation, NetworkOperation,
 };
-use crate::supervisor::fact::{AccessSpec, FsShape, PathArg, flags, fs_shape, syscall_name};
+use crate::supervisor::fact::{
+    AccessSpec, FsShape, PathArg, fd_metadata_name, flags, fs_shape, syscall_name,
+};
 use crate::supervisor::mem::MemReadError;
 #[cfg(target_os = "linux")]
 use crate::supervisor::notify::SECCOMP_ADDFD_FLAG_SEND;
@@ -67,14 +69,49 @@ enum FsInvocation {
 
 #[derive(Debug, Clone)]
 enum MutationInvocation {
-    Truncate { length: i64 },
-    Rename { flags: u32 },
-    Mkdir { mode: u32 },
-    Unlink { flags: i32 },
-    Link { flags: i32 },
-    Symlink { target: Vec<u8> },
-    Chmod { mode: u32 },
-    Chown { uid: u32, gid: u32, flags: i32 },
+    Truncate {
+        length: i64,
+    },
+    Rename {
+        flags: u32,
+    },
+    Mkdir {
+        mode: u32,
+    },
+    Unlink {
+        flags: i32,
+    },
+    Link {
+        flags: i32,
+    },
+    Symlink {
+        target: Vec<u8>,
+    },
+    Chmod {
+        mode: u32,
+    },
+    Chown {
+        uid: u32,
+        gid: u32,
+        flags: i32,
+    },
+    ChmodNoFollow {
+        mode: u32,
+    },
+    Setxattr {
+        name: Vec<u8>,
+        value: Vec<u8>,
+        flags: i32,
+        follow: bool,
+    },
+    Removexattr {
+        name: Vec<u8>,
+        follow: bool,
+    },
+    Utimens {
+        times: Option<[i64; 4]>,
+        flags: i32,
+    },
 }
 
 /// matched-rule ids for a policy-less run (trace.md section 2).
@@ -101,6 +138,9 @@ pub mod rule {
     pub const SNAPSHOT_CLONE3: &str = "snapshot:clone3";
     /// legacy AIO denied in a snapshot run (ADR-0024)
     pub const SNAPSHOT_AIO: &str = "snapshot:aio";
+    /// a snapshot-only metadata call reached a run that is not a snapshot run, which only a
+    /// filter and flag that disagree can do (ADR-0024 decision 4)
+    pub const SNAPSHOT_METADATA: &str = "snapshot:metadata";
 }
 
 /// how the run ended.
@@ -425,7 +465,8 @@ fn open_mode(sys_nr: u32, notif: &SeccompNotif) -> u32 {
     }
 }
 
-fn mutation_invocation(
+fn mutation_invocation<N: Notifier>(
+    kernel: &N,
     sys_nr: u32,
     notif: &SeccompNotif,
     path: &std::path::Path,
@@ -474,11 +515,118 @@ fn mutation_invocation(
             gid: notif.data.args[3] as u32,
             flags: notif.data.args[4] as i32,
         },
+        nr::LCHOWN => MutationInvocation::Chown {
+            uid: notif.data.args[1] as u32,
+            gid: notif.data.args[2] as u32,
+            flags: AT_SYMLINK_NOFOLLOW,
+        },
+        nr::FCHMODAT2 => match notif.data.args[3] as i32 {
+            0 => MutationInvocation::Chmod {
+                mode: notif.data.args[2] as u32,
+            },
+            AT_SYMLINK_NOFOLLOW => MutationInvocation::ChmodNoFollow {
+                mode: notif.data.args[2] as u32,
+            },
+            _ => return Err(MemReadError::Io(io::Error::from_raw_os_error(libc::EINVAL))),
+        },
+        nr::UTIMENSAT => MutationInvocation::Utimens {
+            times: read_times(kernel, notif, notif.data.args[2], TimeLayout::Timespec)?,
+            flags: notif.data.args[3] as i32,
+        },
+        nr::UTIMES => MutationInvocation::Utimens {
+            times: read_times(kernel, notif, notif.data.args[1], TimeLayout::Timeval)?,
+            flags: 0,
+        },
+        nr::FUTIMESAT => MutationInvocation::Utimens {
+            times: read_times(kernel, notif, notif.data.args[2], TimeLayout::Timeval)?,
+            flags: 0,
+        },
+        nr::UTIME => MutationInvocation::Utimens {
+            times: read_times(kernel, notif, notif.data.args[1], TimeLayout::Utimbuf)?,
+            flags: 0,
+        },
+        nr::SETXATTR | nr::LSETXATTR => {
+            let size = usize::try_from(notif.data.args[3]).unwrap_or(usize::MAX);
+            if size > XATTR_SIZE_MAX {
+                return Err(MemReadError::Io(io::Error::from_raw_os_error(libc::E2BIG)));
+            }
+            let name = kernel.read_path(notif.pid, notif.data.args[1])?;
+            let value = if size == 0 {
+                Vec::new()
+            } else {
+                kernel.read_bytes(notif.pid, notif.data.args[2], size)?
+            };
+            MutationInvocation::Setxattr {
+                name,
+                value,
+                flags: notif.data.args[4] as i32,
+                follow: sys_nr == nr::SETXATTR,
+            }
+        }
+        nr::REMOVEXATTR | nr::LREMOVEXATTR => MutationInvocation::Removexattr {
+            name: kernel.read_path(notif.pid, notif.data.args[1])?,
+            follow: sys_nr == nr::REMOVEXATTR,
+        },
         _ => {
             return Err(MemReadError::Io(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
     };
     Ok(invocation)
+}
+
+/// the largest xattr value the kernel accepts (`XATTR_SIZE_MAX`).
+const XATTR_SIZE_MAX: usize = 65_536;
+
+/// `AT_SYMLINK_NOFOLLOW`, pinned to the x86-64 value like the other abi constants here, since
+/// the macos dev host's libc disagrees (0x20).
+const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+
+/// how a metadata call lays out the two timestamps behind its `times` pointer.
+#[derive(Clone, Copy)]
+enum TimeLayout {
+    /// `struct timespec[2]`: seconds and nanoseconds, nanoseconds may be UTIME_NOW or OMIT
+    Timespec,
+    /// `struct timeval[2]`: seconds and microseconds
+    Timeval,
+    /// `struct utimbuf`: access and modification seconds
+    Utimbuf,
+}
+
+/// read the timestamps a `utime` family call asks for, as `[atime_sec, atime_nsec,
+/// mtime_sec, mtime_nsec]`; a null pointer means "now" and reads nothing. a microsecond
+/// value too large to scale is left out of range, which the kernel refuses with EINVAL.
+fn read_times<N: Notifier>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    addr: u64,
+    layout: TimeLayout,
+) -> Result<Option<[i64; 4]>, MemReadError> {
+    if addr == 0 {
+        return Ok(None);
+    }
+    let take = |bytes: &[u8], at: usize| {
+        i64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]))
+    };
+    Ok(Some(match layout {
+        TimeLayout::Timespec => {
+            let b = kernel.read_bytes(notif.pid, addr, 32)?;
+            [take(&b, 0), take(&b, 8), take(&b, 16), take(&b, 24)]
+        }
+        TimeLayout::Timeval => {
+            let b = kernel.read_bytes(notif.pid, addr, 32)?;
+            let nsec = |usec: i64| usec.checked_mul(1000).unwrap_or(i64::MAX);
+            [
+                take(&b, 0),
+                nsec(take(&b, 8)),
+                take(&b, 16),
+                nsec(take(&b, 24)),
+            ]
+        }
+        TimeLayout::Utimbuf => {
+            let b = kernel.read_bytes(notif.pid, addr, 16)?;
+            [take(&b, 0), 0, take(&b, 8), 0]
+        }
+    }))
 }
 
 fn resolve_decision(config: &RunConfig<'_>, request: &Request<'_>) -> ResolvedDecision {
@@ -695,6 +843,26 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
         return Ok(Handled::Responded);
     }
 
+    // metadata calls trapped only in a snapshot run (ADR-0024 decision 4). a filter and flag
+    // that disagree deny and record, as the AIO calls do, so one can never pass unrecorded.
+    if SNAPSHOT_METADATA.contains(&sys_nr) && !config.snapshot_integrity {
+        record(
+            writer,
+            ts,
+            notif,
+            syscall_name(sys_nr).unwrap_or("unknown"),
+            Fact::Raw {},
+            &fixed_decision(Decision::Deny, rule::SNAPSHOT_METADATA),
+        )?;
+        tolerate_dead(kernel.send_error(notif.id, libc::ENOSYS))?;
+        return Ok(Handled::Responded);
+    }
+    if let Some(name) = fd_metadata_name(sys_nr, notif.data.args[1])
+        && SNAPSHOT_METADATA.contains(&sys_nr)
+    {
+        return handle_fd_metadata(kernel, notif, writer, config, ts, name);
+    }
+
     // the filesystem families (syscalls.md sections 3.1-3.2): the recorded slice.
     if let Some(shape) = fs_shape(sys_nr) {
         return handle_fs(kernel, notif, writer, config, ts, &shape, sys_nr);
@@ -718,6 +886,60 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
 
     tolerate_dead(kernel.send_continue(notif.id))?;
     Ok(Handled::Responded)
+}
+
+/// a snapshot-run metadata call that names an open descriptor (`fchmod`, `fchown`,
+/// `fsetxattr`, `fremovexattr`, and `futimens` as a null-path `utimensat`). the descriptor's
+/// target is read back from `/proc/<pid>/fd/<n>`, judged as a write to that path like
+/// `chmod`, and the call continues when allowed: the object is the descriptor's, fixed when
+/// the agent opened it, and the only pointer left is a timestamp or value the agent owns.
+/// a descriptor on a cgroup2 file cannot be opened (the open is denied), so this is depth.
+/// a target that cannot be read denies (case C).
+fn handle_fd_metadata<N: Notifier, S: TraceSink>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    writer: &mut TraceWriter<S>,
+    config: &RunConfig<'_>,
+    ts: u64,
+    name: &'static str,
+) -> Result<Handled, RunError> {
+    if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+        return Ok(Handled::Dropped);
+    }
+    let fd = notif.data.args[0] as u32;
+    let target = kernel.dir_prefix(notif.pid, DirAnchor::Fd(fd));
+    if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+        return Ok(Handled::Dropped);
+    }
+    let Ok(path) = target else {
+        record(
+            writer,
+            ts,
+            notif,
+            name,
+            Fact::Raw {},
+            &fixed_decision(Decision::Deny, rule::MEMORY_READ),
+        )?;
+        tolerate_dead(kernel.send_error(notif.id, libc::EACCES))?;
+        return Ok(Handled::Responded);
+    };
+    let access = vec![crate::recorder::FsAccess::Write];
+    let path_text = path.to_string_lossy();
+    let decision = resolve_decision(
+        config,
+        &Request::Fs {
+            path: &path_text,
+            access: &access,
+        },
+    );
+    let fact = Fact::Fs {
+        path: path.clone(),
+        access: access.clone(),
+        dest: None,
+    };
+    record(writer, ts, notif, name, fact, &decision)?;
+    respond_continue_or_deny(kernel, notif.id, &decision)?;
+    Ok(mutation_handled(decision.response_decision, &access))
 }
 
 /// gather, record, and respond for one filesystem-family notification.
@@ -753,7 +975,7 @@ fn handle_fs<N: Notifier, S: TraceSink>(
         let (access, invocation) = match shape.access {
             AccessSpec::Fixed(list) => (
                 list.to_vec(),
-                FsInvocation::Mutation(mutation_invocation(sys_nr, notif, &path)?),
+                FsInvocation::Mutation(mutation_invocation(kernel, sys_nr, notif, &path)?),
             ),
             AccessSpec::OpenFlags { arg } => {
                 // with O_PATH the kernel ignores every other bit (access mode, O_CREAT,
@@ -1163,7 +1385,17 @@ fn path_prepare_modes(invocation: &FsInvocation) -> (bool, bool, bool, bool) {
         | FsInvocation::Mutation(MutationInvocation::Chown { flags: 0, .. }) => {
             (true, false, false, false)
         }
-        FsInvocation::Mutation(MutationInvocation::Chown { .. }) => (false, false, false, false),
+        FsInvocation::Mutation(MutationInvocation::Chown { .. })
+        | FsInvocation::Mutation(MutationInvocation::ChmodNoFollow { .. }) => {
+            (false, false, false, false)
+        }
+        FsInvocation::Mutation(
+            MutationInvocation::Setxattr { follow, .. }
+            | MutationInvocation::Removexattr { follow, .. },
+        ) => (*follow, false, false, false),
+        FsInvocation::Mutation(MutationInvocation::Utimens { flags, .. }) => {
+            (flags & AT_SYMLINK_NOFOLLOW == 0, false, false, false)
+        }
         FsInvocation::Mutation(MutationInvocation::Rename { .. }) => (false, false, false, true),
         FsInvocation::Mutation(MutationInvocation::Mkdir { .. }) => (false, true, false, false),
         FsInvocation::Mutation(MutationInvocation::Unlink { .. }) => (false, false, false, false),
@@ -1193,7 +1425,11 @@ fn primary_access(
         FsInvocation::Mutation(
             MutationInvocation::Truncate { .. }
             | MutationInvocation::Chmod { .. }
-            | MutationInvocation::Chown { .. },
+            | MutationInvocation::Chown { .. }
+            | MutationInvocation::ChmodNoFollow { .. }
+            | MutationInvocation::Setxattr { .. }
+            | MutationInvocation::Removexattr { .. }
+            | MutationInvocation::Utimens { .. },
         ) => vec![Write],
     }
 }
@@ -1290,6 +1526,22 @@ fn broker_mutation(invocation: MutationInvocation) -> MutationOperation {
         MutationInvocation::Chown { uid, gid, flags } => {
             MutationOperation::Chown { uid, gid, flags }
         }
+        MutationInvocation::ChmodNoFollow { mode } => MutationOperation::ChmodNoFollow { mode },
+        MutationInvocation::Setxattr {
+            name,
+            value,
+            flags,
+            follow,
+        } => MutationOperation::Setxattr {
+            name,
+            value,
+            flags,
+            follow,
+        },
+        MutationInvocation::Removexattr { name, follow } => {
+            MutationOperation::Removexattr { name, follow }
+        }
+        MutationInvocation::Utimens { times, flags } => MutationOperation::Utimens { times, flags },
     }
 }
 
@@ -3538,6 +3790,238 @@ mod tests {
             },
         );
         assert_eq!(decision.matched_rule, "implicit:state_root");
+    }
+
+    /// an enforce snapshot config over a policy that grants everything, with the cgroup2
+    /// mount at /sys/fs/cgroup, so any refusal comes from an implicit rule.
+    fn metadata_run<R>(body: impl FnOnce(&RunConfig<'_>) -> R) -> R {
+        let p = policy(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/**\"\nmode=[\"read\",\"write\",\"create\",\"delete\"]\naction=\"allow\"\n",
+        );
+        let mounts = crate::supervisor::cgroup_mounts::CgroupMounts::from_resolved(vec![
+            "/sys/fs/cgroup".into(),
+        ])
+        .unwrap();
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
+            .with_snapshot_integrity(true)
+            .with_cgroup_mounts(&mounts);
+        body(&config)
+    }
+
+    #[test]
+    fn descriptor_metadata_calls_are_judged_on_the_descriptors_target() {
+        let fd_calls: [(u32, [u64; 6], &str); 5] = [
+            (nr::FCHMOD, [5, 0o777, 0, 0, 0, 0], "fchmod"),
+            (nr::FCHOWN, [5, 0, 0, 0, 0, 0], "fchown"),
+            (nr::FSETXATTR, [5, 0x1000, 0x2000, 1, 0, 0], "fsetxattr"),
+            (nr::FREMOVEXATTR, [5, 0x1000, 0, 0, 0, 0], "fremovexattr"),
+            // futimens: utimensat with a null path
+            (nr::UTIMENSAT, [5, 0, 0, 0, 0, 0], "utimensat"),
+        ];
+        for (sys_nr, args, name) in fd_calls {
+            // the target is a control file of the cgroup2 mount: denied by the implicit rule
+            let kernel = FakeNotifier {
+                fd_dirs: HashMap::from([(5, "/sys/fs/cgroup/leash-x/cgroup.procs")]),
+                ..FakeNotifier::default()
+            };
+            let mut w = writer();
+            metadata_run(|config| {
+                super::handle_notification(&kernel, &notif(sys_nr, args), &mut w, config, 1)
+                    .unwrap();
+            });
+            assert_eq!(
+                kernel.sent(),
+                vec![format!("error:7:{}", libc::EACCES)],
+                "{name}"
+            );
+            let ev = &events(w)[0];
+            assert_eq!(ev["syscall"], name);
+            assert_eq!(ev["decision"], "deny", "{name}");
+            assert_eq!(ev["matched_rule"], "implicit:cgroup", "{name}");
+            assert_eq!(ev["fact"]["path"], "/sys/fs/cgroup/leash-x/cgroup.procs");
+
+            // an ordinary file is decided by policy and continues
+            let kernel = FakeNotifier {
+                fd_dirs: HashMap::from([(5, "/work/file")]),
+                ..FakeNotifier::default()
+            };
+            let mut w = writer();
+            let handled = metadata_run(|config| {
+                super::handle_notification(&kernel, &notif(sys_nr, args), &mut w, config, 1)
+                    .unwrap()
+            });
+            assert_eq!(handled, Handled::RespondedMutation, "{name}");
+            assert_eq!(kernel.sent(), vec!["continue:7".to_string()], "{name}");
+            let ev = &events(w)[0];
+            assert_eq!(ev["decision"], "allow", "{name}");
+            assert_eq!(ev["matched_rule"], "fs.1", "{name}");
+        }
+    }
+
+    #[test]
+    fn a_descriptor_that_cannot_be_resolved_denies_the_metadata_call() {
+        // fd 9 is not in fd_dirs, so its target cannot be read back
+        let kernel = FakeNotifier::default();
+        let mut w = writer();
+        metadata_run(|config| {
+            super::handle_notification(
+                &kernel,
+                &notif(nr::FCHMOD, [9, 0o777, 0, 0, 0, 0]),
+                &mut w,
+                config,
+                1,
+            )
+            .unwrap();
+        });
+        assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::EACCES)]);
+        assert_eq!(events(w)[0]["matched_rule"], rule::MEMORY_READ);
+    }
+
+    #[test]
+    fn snapshot_metadata_calls_are_denied_and_recorded_when_the_flag_is_off() {
+        let p = policy("schema_version = 1\n");
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root());
+        for &sys_nr in SNAPSHOT_METADATA {
+            let kernel = FakeNotifier::default();
+            let mut w = writer();
+            super::handle_notification(&kernel, &notif(sys_nr, [0; 6]), &mut w, &config, 1)
+                .unwrap();
+            assert_eq!(kernel.sent(), vec![format!("error:7:{}", libc::ENOSYS)]);
+            let ev = &events(w)[0];
+            assert_eq!(ev["decision"], "deny");
+            assert_eq!(ev["matched_rule"], rule::SNAPSHOT_METADATA);
+        }
+    }
+
+    #[test]
+    fn path_metadata_calls_decode_their_operands_from_child_memory() {
+        let path = std::path::Path::new("/work/f");
+        let mut times = Vec::new();
+        for v in [10_i64, 20, 30, 40] {
+            times.extend_from_slice(&v.to_ne_bytes());
+        }
+        let kernel = FakeNotifier::default()
+            .with_cstr(0x1000, "user.leash.lock")
+            .with_bytes(0x2000, b"value".to_vec())
+            .with_bytes(0x3000, times.clone());
+
+        let set = mutation_invocation(
+            &kernel,
+            nr::LSETXATTR,
+            &notif(nr::LSETXATTR, [0, 0x1000, 0x2000, 5, 1, 0]),
+            path,
+        )
+        .unwrap();
+        assert!(matches!(
+            set,
+            MutationInvocation::Setxattr { ref name, ref value, flags: 1, follow: false }
+                if name == b"user.leash.lock" && value == b"value"
+        ));
+        let oversized = mutation_invocation(
+            &kernel,
+            nr::SETXATTR,
+            &notif(nr::SETXATTR, [0, 0x1000, 0x2000, 65_537, 0, 0]),
+            path,
+        );
+        assert!(oversized.is_err(), "a value past XATTR_SIZE_MAX is refused");
+
+        let remove = mutation_invocation(
+            &kernel,
+            nr::REMOVEXATTR,
+            &notif(nr::REMOVEXATTR, [0, 0x1000, 0, 0, 0, 0]),
+            path,
+        )
+        .unwrap();
+        assert!(matches!(
+            remove,
+            MutationInvocation::Removexattr { ref name, follow: true } if name == b"user.leash.lock"
+        ));
+
+        let timespec = mutation_invocation(
+            &kernel,
+            nr::UTIMENSAT,
+            &notif(nr::UTIMENSAT, [0, 0, 0x3000, 0x100, 0, 0]),
+            path,
+        )
+        .unwrap();
+        assert!(matches!(
+            timespec,
+            MutationInvocation::Utimens {
+                times: Some([10, 20, 30, 40]),
+                flags: 0x100
+            }
+        ));
+        let timeval = mutation_invocation(
+            &kernel,
+            nr::UTIMES,
+            &notif(nr::UTIMES, [0, 0x3000, 0, 0, 0, 0]),
+            path,
+        )
+        .unwrap();
+        assert!(matches!(
+            timeval,
+            MutationInvocation::Utimens {
+                times: Some([10, 20_000, 30, 40_000]),
+                flags: 0
+            }
+        ));
+        let now = mutation_invocation(
+            &kernel,
+            nr::UTIME,
+            &notif(nr::UTIME, [0, 0, 0, 0, 0, 0]),
+            path,
+        )
+        .unwrap();
+        assert!(matches!(
+            now,
+            MutationInvocation::Utimens {
+                times: None,
+                flags: 0
+            }
+        ));
+
+        let lchown = mutation_invocation(
+            &kernel,
+            nr::LCHOWN,
+            &notif(nr::LCHOWN, [0, 7, 8, 0, 0, 0]),
+            path,
+        )
+        .unwrap();
+        assert!(matches!(
+            lchown,
+            MutationInvocation::Chown {
+                uid: 7,
+                gid: 8,
+                flags: AT_SYMLINK_NOFOLLOW
+            }
+        ));
+        let follow = mutation_invocation(
+            &kernel,
+            nr::FCHMODAT2,
+            &notif(nr::FCHMODAT2, [0, 0, 0o600, 0, 0, 0]),
+            path,
+        )
+        .unwrap();
+        assert!(matches!(follow, MutationInvocation::Chmod { mode: 0o600 }));
+        let nofollow = mutation_invocation(
+            &kernel,
+            nr::FCHMODAT2,
+            &notif(nr::FCHMODAT2, [0, 0, 0o600, 0x100, 0, 0]),
+            path,
+        )
+        .unwrap();
+        assert!(matches!(
+            nofollow,
+            MutationInvocation::ChmodNoFollow { mode: 0o600 }
+        ));
+        let other_flags = mutation_invocation(
+            &kernel,
+            nr::FCHMODAT2,
+            &notif(nr::FCHMODAT2, [0, 0, 0o600, 0x1000, 0, 0]),
+            path,
+        );
+        assert!(other_flags.is_err(), "flags beyond NOFOLLOW are refused");
     }
 
     #[test]

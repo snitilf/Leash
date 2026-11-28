@@ -146,6 +146,39 @@ pub enum MutationOperation {
         /// `fchownat` flags.
         flags: i32,
     },
+    /// `fchmodat2(2)` with `AT_SYMLINK_NOFOLLOW`: refused with `EOPNOTSUPP` when the final
+    /// component is a symlink, as the kernel does.
+    ChmodNoFollow {
+        /// Requested mode.
+        mode: u32,
+    },
+    /// `setxattr(2)` or `lsetxattr(2)` against the pinned target (snapshot runs).
+    Setxattr {
+        /// Attribute name, without the terminating nul.
+        name: Vec<u8>,
+        /// Attribute value.
+        value: Vec<u8>,
+        /// `XATTR_CREATE` or `XATTR_REPLACE`, or zero.
+        flags: i32,
+        /// whether the final symlink was followed when the path was prepared
+        follow: bool,
+    },
+    /// `removexattr(2)` or `lremovexattr(2)` against the pinned target (snapshot runs).
+    Removexattr {
+        /// Attribute name, without the terminating nul.
+        name: Vec<u8>,
+        /// whether the final symlink was followed when the path was prepared
+        follow: bool,
+    },
+    /// `utimensat(2)` against the pinned target (snapshot runs). The legacy `utime`,
+    /// `utimes` and `futimesat` calls are converted to this form by the supervisor.
+    Utimens {
+        /// access seconds, access nanoseconds, modify seconds, modify nanoseconds; `None`
+        /// means "now" for both, as a null `times` pointer does
+        times: Option<[i64; 4]>,
+        /// `0` or `AT_SYMLINK_NOFOLLOW`
+        flags: i32,
+    },
 }
 
 /// Parent-side handle for one per-run broker process.
@@ -831,6 +864,17 @@ impl BrokerState<'_> {
             MutationOperation::Symlink { target } => symlink_held(&primary, &target),
             MutationOperation::Chmod { mode } => chmod_held(&primary, mode),
             MutationOperation::Chown { uid, gid, flags } => chown_held(&primary, uid, gid, flags),
+            MutationOperation::ChmodNoFollow { mode } => chmod_nofollow_held(&primary, mode),
+            MutationOperation::Setxattr {
+                name,
+                value,
+                flags,
+                follow,
+            } => setxattr_held(&primary, &name, &value, flags, follow),
+            MutationOperation::Removexattr { name, follow } => {
+                removexattr_held(&primary, &name, follow)
+            }
+            MutationOperation::Utimens { times, flags } => utimens_held(&primary, times, flags),
         };
         match result {
             Ok(value) => self.respond(&Response::Result { value }, None),
@@ -1001,6 +1045,103 @@ fn chown_held(path: &HeldPath, uid: u32, gid: u32, flags: i32) -> io::Result<i64
     let proc_path = proc_fd_path(target)?;
     // SAFETY: proc_path resolves to the retained target descriptor.
     rc_zero(unsafe { libc::chown(proc_path.as_ptr(), uid, gid) })
+}
+
+/// `S_ISLNK` of the pinned target, so a no-follow call can refuse a symlink it cannot act on.
+fn target_is_symlink(target: BorrowedFd<'_>) -> io::Result<bool> {
+    let mut stat: libc::stat = unsafe { zeroed() };
+    // SAFETY: target is a live descriptor and stat points to writable local storage.
+    if unsafe { libc::fstat(target.as_raw_fd(), &raw mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat.st_mode & libc::S_IFMT == libc::S_IFLNK)
+}
+
+fn chmod_nofollow_held(path: &HeldPath, mode: u32) -> io::Result<i64> {
+    if target_is_symlink(required_target(path)?)? {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    chmod_held(path, mode)
+}
+
+/// the xattr name or value as the C string the kernel takes, refusing an interior nul.
+fn xattr_name(name: &[u8]) -> io::Result<CString> {
+    CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+fn setxattr_held(
+    path: &HeldPath,
+    name: &[u8],
+    value: &[u8],
+    flags: i32,
+    follow: bool,
+) -> io::Result<i64> {
+    let target = required_target(path)?;
+    // a symlink cannot be reached through its proc link without being followed, and the
+    // namespaces a symlink may carry attributes in are not ones an agent may write
+    if !follow && target_is_symlink(target)? {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    let name = xattr_name(name)?;
+    let proc_path = proc_fd_path(target)?;
+    // SAFETY: proc_path and name are C strings, value is a live slice of the given length.
+    rc_zero(unsafe {
+        libc::setxattr(
+            proc_path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            flags,
+        )
+    })
+}
+
+fn removexattr_held(path: &HeldPath, name: &[u8], follow: bool) -> io::Result<i64> {
+    let target = required_target(path)?;
+    if !follow && target_is_symlink(target)? {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    let name = xattr_name(name)?;
+    let proc_path = proc_fd_path(target)?;
+    // SAFETY: proc_path and name are C strings.
+    rc_zero(unsafe { libc::removexattr(proc_path.as_ptr(), name.as_ptr()) })
+}
+
+fn utimens_held(path: &HeldPath, times: Option<[i64; 4]>, flags: i32) -> io::Result<i64> {
+    if flags & !libc::AT_SYMLINK_NOFOLLOW != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let spec = times.map(|t| {
+        [
+            libc::timespec {
+                tv_sec: t[0],
+                tv_nsec: t[1],
+            },
+            libc::timespec {
+                tv_sec: t[2],
+                tv_nsec: t[3],
+            },
+        ]
+    });
+    let spec_ptr = spec.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
+    if flags == libc::AT_SYMLINK_NOFOLLOW {
+        let (parent, name) = required_parent_name(path)?;
+        // SAFETY: name is retained, parent is a live directory descriptor, and spec_ptr is
+        // null or points at two live timespecs.
+        return rc_zero(unsafe {
+            libc::utimensat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                spec_ptr,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        });
+    }
+    let target = required_target(path)?;
+    let proc_path = proc_fd_path(target)?;
+    // SAFETY: proc_path resolves to the retained target descriptor and spec_ptr is null or
+    // points at two live timespecs.
+    rc_zero(unsafe { libc::utimensat(libc::AT_FDCWD, proc_path.as_ptr(), spec_ptr, 0) })
 }
 
 fn required_target(path: &HeldPath) -> io::Result<BorrowedFd<'_>> {
