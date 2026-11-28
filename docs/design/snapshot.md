@@ -228,6 +228,8 @@ modified while mounted. Capturing a layer still requires the section 2 barrier.
 
 Rewind and diff follow ADR-0024 rules 17-22.
 
+Rewind reads and checks the trace and the store first, and only then looks at the run's cgroup.
+The stale cleanup below is driven by the untrusted `meta.json`, so it never runs for a run whose trace or store failed those read-only checks.
 Rewind requires the run's cgroup to be gone, not a `run_end` event, so a crashed run can be rewound.
 The cgroup-gone check returns a tri-state (`Gone`, `Present`, `Unknown`) by pinning the recorded parent directory on a cgroup2 mount first, or walking up to the nearest existing ancestor when opening the parent returns `ENOENT`, so a vanished transient scope under a cgroup2 mount reports `Gone` while a non-cgroup2, inaccessible, or unresolvable path never fails open as `Gone`.
 Rewind treats `Unknown` as not gone and also takes `<run_dir>/run.lock` before modifying the workspace.

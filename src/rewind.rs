@@ -249,6 +249,11 @@ mod linux {
             .run_cgroup
             .clone()
             .ok_or_else(|| usage(format!("run '{label}' is not a snapshot run")))?;
+        // the target and the integrity checks are read-only, so they come before anything
+        // that acts on the run directory: the stale cleanup below is driven by the untrusted
+        // `meta.json` and may kill and remove cgroups, so it runs only for a run whose trace
+        // and store already passed
+        let target = resolve_target(req, &open, &label)?;
         let _run_lock = ensure_run_over(req, &open.run_dir, &recorded, &label)?;
         if let Some(hook) = hooks.before_workspace_open {
             hook();
@@ -266,9 +271,10 @@ mod linux {
             )));
         }
 
-        // the target and the integrity checks come before any write, the safety snapshot
-        // included
-        let target = resolve_target(req, &open, &label, out)?;
+        // the values the checks compared are printed once the whole of them has passed
+        for line in &target.heading {
+            writeln!(out, "{line}")?;
+        }
         if req.expect.is_none() {
             let what = match req.target {
                 RewindTarget::Step(_) => {
@@ -583,16 +589,18 @@ mod linux {
         label: String,
         /// "rewound the workspace to" or "restored the workspace from"
         verb: &'static str,
+        /// the lines to print once every check has passed: the chain head and the digest
+        /// the target was checked against
+        heading: Vec<String>,
     }
 
     fn resolve_target(
         req: &RewindRequest,
         open: &OpenRun,
         label: &str,
-        out: &mut dyn Write,
     ) -> Result<Target, RewindError> {
         match req.target {
-            RewindTarget::Step(step) => resolve_step(req, open, label, step, out),
+            RewindTarget::Step(step) => resolve_step(req, open, label, step),
             RewindTarget::Undo(n) => resolve_undo(&open.run_dir, label, n, req.expect.as_deref()),
         }
     }
@@ -602,7 +610,6 @@ mod linux {
         open: &OpenRun,
         label: &str,
         step: u64,
-        out: &mut dyn Write,
     ) -> Result<Target, RewindError> {
         let trace = read_checked_trace(&open.run_dir, &open.meta, label)?;
         // the committed set comes from the trace's step events, never from the manifests on
@@ -663,14 +670,17 @@ mod linux {
                  {store_digest} then {loaded_digest}"
             )));
         }
-        writeln!(out, "chain head: {}", chain.head)?;
-        writeln!(out, "step {step} digest: {store_digest}")?;
+        let heading = vec![
+            format!("chain head: {}", chain.head),
+            format!("step {step} digest: {store_digest}"),
+        ];
         let store = open.store.try_clone().map_err(|e| failure(e.to_string()))?;
         Ok(Target {
             manifest,
             store,
             label: format!("step {step}"),
             verb: "rewound the workspace to",
+            heading,
         })
     }
 
@@ -709,6 +719,7 @@ mod linux {
             store,
             label: format!("undo snapshot {n}"),
             verb: "restored the workspace from",
+            heading: Vec::new(),
         })
     }
 

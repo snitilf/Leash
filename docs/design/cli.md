@@ -146,17 +146,7 @@ The order of checks, each before any write to the workspace:
 1. The run is a directory under `<state-root>/runs`, opened component by component with `O_NOFOLLOW`; `meta.json` is a regular file of at most 64 KiB.
    An unknown run, a run with no `snapshots` directory, and a run whose metadata records no run cgroup (not a snapshot run) are refused.
 2. The workspace, the working directory or `--workspace` canonicalized, equals the workspace in `meta.json`.
-3. The run is over.
-   `run.lock` is taken without blocking; a held lock means the run is live.
-   The recorded run cgroup must be `Gone`; `Present` and `Unknown` are refused and the message names the cgroup.
-   A present cgroup of a dead run is first offered to the stale cleanup (ADR-0024 decision 17), which runs on the parent cgroup that `meta.json` records for the run cgroup.
-   It does not skip any cgroup, so it may kill and remove every stale Leash cgroup under that parent, not only this run's.
-   It touches a cgroup only when its name is a valid Leash run name, its run lock under this state root can be taken, and its lock xattr matches that lock file's inode.
-   A missing `run_end` is fine, so a crashed run can be rewound.
-4. The workspace lock (the `flock` on the workspace directory and the one under the state root, ADR-0026) is taken without blocking, and held to the end; a held lock refuses, whatever state directory the holder used.
-   The locked directory handle is the one that is scanned, captured and restored.
-   The canonical path read back from that handle must equal the workspace that check 2 compared, or rewind refuses with `the workspace changed while rewind opened it`; a path component swapped for a symlink between the two cannot redirect the restore.
-5. The target step has a committed `step` event in `trace.jsonl` and a manifest in the store.
+3. The target step has a committed `step` event in `trace.jsonl` and a manifest in the store.
    The committed steps are derived from the `step` events of the trace (`store::committed_steps_from_trace`), never from the manifests on disk.
    A `step` event followed by `capture_failed` with phase `step_event` for the same step is not committed.
    The trace is untrusted input, read once through a handle by the same streaming reader that `diff` uses, so the two agree on the committed steps.
@@ -165,8 +155,19 @@ The order of checks, each before any write to the workspace:
    A final line without a newline (a crash mid-write) is ignored; any other malformed line refuses.
    The first event must be a `run_start` that agrees with `meta.json`.
    A manifest with no committed `step` event is an orphan of an aborted capture and is not a target.
-6. The chain is recomputed from the manifests of the committed steps; an orphan manifest is not in it.
+4. The chain is recomputed from the manifests of the committed steps; an orphan manifest is not in it.
    The recomputed digest of the target must equal the digest in the trace's step event, and `--expect`, when given, must equal the chain head or that digest.
+   These checks only read, and they come before the run is touched: the stale cleanup in check 5 is driven by the untrusted `meta.json`, so it runs only for a run whose trace and store passed.
+5. The run is over.
+   `run.lock` is taken without blocking; a held lock means the run is live.
+   The recorded run cgroup must be `Gone`; `Present` and `Unknown` are refused and the message names the cgroup.
+   A present cgroup of a dead run is first offered to the stale cleanup (ADR-0024 decision 17), which runs on the parent cgroup that `meta.json` records for the run cgroup.
+   It does not skip any cgroup, so it may kill and remove every stale Leash cgroup under that parent, not only this run's.
+   It touches a cgroup only when its name is a valid Leash run name, its run lock under this state root can be taken, and its lock xattr matches that lock file's inode.
+   A missing `run_end` is fine, so a crashed run can be rewound.
+6. The workspace lock (the `flock` on the workspace directory and the one under the state root, ADR-0026) is taken without blocking, and held to the end; a held lock refuses, whatever state directory the holder used.
+   The locked directory handle is the one that is scanned, captured and restored.
+   The canonical path read back from that handle must equal the workspace that check 2 compared, or rewind refuses with `the workspace changed while rewind opened it`; a path component swapped for a symlink between the two cannot redirect the restore.
 7. Every store object the plan writes is verified, so a corrupt object refuses the rewind before the workspace changes.
 
 Exit codes:
@@ -175,7 +176,7 @@ Exit codes:
 |---|---|
 | rewound, or the workspace already matched | 0 |
 | usage error; unknown run (a symlinked run directory counts as unknown); run without snapshots or not a snapshot run; unknown step, or a step with no committed event; workspace differs from the run's; state directory inside the workspace; unknown `--undo` number (a symlinked undo directory counts as unknown) | 2 |
-| live run (lock held); cgroup `Present` or `Unknown`; workspace lock held; the workspace changed while it was opened; trace, metadata, store or digest mismatch; a trace or metadata file that is not a regular file or is over its cap; `--expect` mismatch; an undo store that is not exactly step 0 (an incomplete or forged safety snapshot); safety snapshot impossible; running as root; apply failed; a failed write of the result to stdout | 125 |
+| live run (lock held); cgroup `Present` or `Unknown`; workspace lock held; the workspace changed while it was opened; trace, metadata, store or digest mismatch; a trace or metadata file that is not a regular file, a trace line over `TRACE_LINE_CAP`, or a `meta.json` over its cap; `--expect` mismatch; an undo store that is not exactly step 0 (an incomplete or forged safety snapshot); safety snapshot impossible; running as root; apply failed; a failed write of the result to stdout | 125 |
 
 A failed write to stdout after the workspace was restored also exits 125, because the operator cannot be shown the result; the workspace stays restored, and the error says that it could not write the output.
 
