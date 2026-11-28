@@ -7,7 +7,7 @@
 //! `execve`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::policy::{Action, FsMode, Policy};
 
@@ -17,6 +17,15 @@ pub const RESIDUAL_TCP_HOST: &str = "landlock:tcp_host";
 pub const RESIDUAL_FS_TRUNCATE: &str = "landlock:fs_truncate_abi_lt_3";
 /// Residual stamped when the policy uses network rules but the running ABI lacks net ports.
 pub const RESIDUAL_TCP_PORT: &str = "landlock:tcp_port_abi_lt_4";
+
+/// Residual stamped when a snapshot run's policy grants read (or execute) beneath, or over,
+/// the state root or a cgroup2 mount. Landlock grants never subtract, so only the seccomp
+/// layer denies those reads (ADR-0024 decision 5).
+pub const RESIDUAL_SNAPSHOT_STORE_READ_OVERLAP: &str = "landlock:snapshot_store_read_overlap";
+
+/// the Landlock ABI a snapshot run needs so path truncation is in the backstop (ADR-0024
+/// decision 6).
+pub const SNAPSHOT_MIN_ABI: u32 = ABI_TRUNCATE;
 
 const ABI_TRUNCATE: u32 = 3;
 const ABI_NET: u32 = 4;
@@ -80,6 +89,165 @@ fn anchor_rights(rights: u64, is_directory: bool) -> u64 {
     } else {
         rights & !FS_DIRECTORY_ONLY_RIGHTS
     }
+}
+
+/// every right that changes a file tree: write, truncate, make (any `MAKE_*`), remove and
+/// refer. a snapshot run refuses a grant holding any of them over the state root or a
+/// cgroup2 mount (ADR-0024 decision 5).
+const FS_MUTATING_RIGHTS: u64 = ACCESS_FS_WRITE_FILE
+    | ACCESS_FS_TRUNCATE
+    | ACCESS_FS_REMOVE_DIR
+    | ACCESS_FS_REMOVE_FILE
+    | FS_CREATE_RIGHTS;
+
+/// the names of the mutating rights in `rights`, as the refusal message spells them.
+pub fn mutating_right_names(rights: u64) -> Vec<&'static str> {
+    [
+        (ACCESS_FS_WRITE_FILE, "write"),
+        (ACCESS_FS_TRUNCATE, "truncate"),
+        (FS_CREATE_RIGHTS & !ACCESS_FS_REFER, "make"),
+        (ACCESS_FS_REMOVE_DIR | ACCESS_FS_REMOVE_FILE, "remove"),
+        (ACCESS_FS_REFER, "refer"),
+    ]
+    .into_iter()
+    .filter(|(mask, _)| rights & mask != 0)
+    .map(|(_, name)| name)
+    .collect()
+}
+
+/// what a snapshot run keeps the agent away from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreKind {
+    /// the state root, which holds the retained snapshots and the trace
+    StateRoot,
+    /// a cgroup2 mount, which holds the run cgroup's control plane
+    CgroupMount,
+}
+
+impl StoreKind {
+    /// how a refusal message names it.
+    pub fn describe(self) -> &'static str {
+        match self {
+            StoreKind::StateRoot => "state root",
+            StoreKind::CgroupMount => "cgroup2 mount",
+        }
+    }
+}
+
+/// a resolved absolute path a snapshot run protects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedStore {
+    /// which kind of path this is
+    pub kind: StoreKind,
+    /// its resolved absolute path
+    pub path: PathBuf,
+}
+
+/// how a grant's hierarchy relates to a protected path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlapRelation {
+    /// the grant root is the protected path
+    Same,
+    /// the grant root is an ancestor of the protected path, so the grant covers it
+    GrantCoversStore,
+    /// the grant root lies beneath the protected path
+    GrantInsideStore,
+}
+
+impl OverlapRelation {
+    /// how a refusal message states the relation of the grant to the protected path.
+    pub fn describe(self) -> &'static str {
+        match self {
+            OverlapRelation::Same => "is the",
+            OverlapRelation::GrantCoversStore => "is an ancestor of the",
+            OverlapRelation::GrantInsideStore => "lies beneath the",
+        }
+    }
+}
+
+/// one grant that overlaps a protected path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreOverlap {
+    /// the grant's hierarchy root as the policy spelled it
+    pub grant_root: PathBuf,
+    /// every right the grant holds
+    pub rights: u64,
+    /// the protected path it overlaps
+    pub store: ProtectedStore,
+    /// how the two relate
+    pub relation: OverlapRelation,
+}
+
+impl StoreOverlap {
+    /// the mutating rights of the grant, which are what make this overlap a refusal.
+    pub fn mutating_rights(&self) -> u64 {
+        self.rights & FS_MUTATING_RIGHTS
+    }
+}
+
+/// the overlaps of a hull with the protected paths, split by whether the grant can mutate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoreOverlaps {
+    /// grants with write, truncate, make, remove or refer rights: the run is refused
+    pub mutating: Vec<StoreOverlap>,
+    /// grants with only read or execute rights: allowed, stamped as a residual
+    pub read_only: Vec<StoreOverlap>,
+}
+
+/// find every grant of `hull` that overlaps one of `stores`, as an ancestor or a descendant
+/// (ADR-0024 decision 5). `canonical` resolves a grant root the way the kernel will when the
+/// grant is anchored; the comparison is by path component, never by string prefix.
+pub fn snapshot_store_overlaps(
+    hull: &LandlockHull,
+    stores: &[ProtectedStore],
+    canonical: &dyn Fn(&Path) -> PathBuf,
+) -> StoreOverlaps {
+    let mut found = StoreOverlaps::default();
+    for grant in &hull.fs {
+        let root = canonical(&grant.root);
+        for store in stores {
+            let relation = if root == store.path {
+                OverlapRelation::Same
+            } else if store.path.starts_with(&root) {
+                OverlapRelation::GrantCoversStore
+            } else if root.starts_with(&store.path) {
+                OverlapRelation::GrantInsideStore
+            } else {
+                continue;
+            };
+            let overlap = StoreOverlap {
+                grant_root: grant.root.clone(),
+                rights: grant.allowed_access,
+                store: store.clone(),
+                relation,
+            };
+            if overlap.mutating_rights() != 0 {
+                found.mutating.push(overlap);
+            } else {
+                found.read_only.push(overlap);
+            }
+        }
+    }
+    found
+}
+
+/// which part of the policy produced a grant at `root` with a mutating right: the workspace
+/// base (`base:workspace`) and every allow or ask filesystem rule (`fs.N`) whose hierarchy
+/// root is `root` and whose modes give one. used to name the rule in a refusal.
+pub fn mutating_grant_origins(policy: &Policy, root: &Path, abi: u32) -> Vec<String> {
+    let mut origins = Vec::new();
+    if Path::new(&policy.workspace) == root {
+        origins.push("base:workspace".to_string());
+    }
+    for (index, rule) in policy.fs.iter().enumerate() {
+        if matches!(rule.action, Action::Allow | Action::Ask)
+            && hierarchy_root_from_glob(rule.path.as_str()) == root
+            && fs_modes_to_rights(&rule.mode, abi) & FS_MUTATING_RIGHTS != 0
+        {
+            origins.push(format!("fs.{}", index + 1));
+        }
+    }
+    origins
 }
 
 /// A derived Landlock hull, before Linux fds are opened.
@@ -639,6 +807,191 @@ mod tests {
         assert_eq!(
             grant(&hull, "/data/delete").allowed_access & FS_DELETE_RIGHTS,
             FS_DELETE_RIGHTS
+        );
+    }
+
+    fn hull_of(text: &str, abi: u32) -> (Policy, LandlockHull) {
+        let p = policy(text);
+        let hull = derive_hull(&p, abi);
+        (p, hull)
+    }
+
+    fn stores() -> Vec<ProtectedStore> {
+        vec![
+            ProtectedStore {
+                kind: StoreKind::StateRoot,
+                path: "/home/op/.local/state/leash".into(),
+            },
+            ProtectedStore {
+                kind: StoreKind::CgroupMount,
+                path: "/sys/fs/cgroup".into(),
+            },
+        ]
+    }
+
+    fn overlaps(text: &str) -> StoreOverlaps {
+        let (_, hull) = hull_of(text, 4);
+        snapshot_store_overlaps(&hull, &stores(), &|p| p.to_path_buf())
+    }
+
+    #[test]
+    fn a_write_grant_over_the_state_root_or_a_cgroup_mount_is_a_mutating_overlap() {
+        for (glob, mode, kind, relation) in [
+            (
+                "/home/op/**",
+                "write",
+                StoreKind::StateRoot,
+                OverlapRelation::GrantCoversStore,
+            ),
+            (
+                "/**",
+                "create",
+                StoreKind::CgroupMount,
+                OverlapRelation::GrantCoversStore,
+            ),
+            (
+                "/sys/**",
+                "delete",
+                StoreKind::CgroupMount,
+                OverlapRelation::GrantCoversStore,
+            ),
+            (
+                "/sys/fs/cgroup/**",
+                "write",
+                StoreKind::CgroupMount,
+                OverlapRelation::Same,
+            ),
+            (
+                "/sys/fs/cgroup/leash/cgroup.procs",
+                "write",
+                StoreKind::CgroupMount,
+                OverlapRelation::GrantInsideStore,
+            ),
+            (
+                "/home/op/.local/state/leash/runs/**",
+                "create",
+                StoreKind::StateRoot,
+                OverlapRelation::GrantInsideStore,
+            ),
+        ] {
+            let found = overlaps(&format!(
+                "schema_version = 1\n[[fs]]\npath=\"{glob}\"\nmode=[\"{mode}\"]\naction=\"allow\"\n"
+            ));
+            assert!(
+                found
+                    .mutating
+                    .iter()
+                    .any(|o| o.store.kind == kind && o.relation == relation),
+                "{glob} {mode}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_mutating_right_alone_makes_an_overlap_a_refusal() {
+        for mode in ["write", "create", "delete"] {
+            let found = overlaps(&format!(
+                "schema_version = 1\n[[fs]]\npath=\"/sys/**\"\nmode=[\"{mode}\"]\naction=\"ask\"\n"
+            ));
+            assert!(!found.mutating.is_empty(), "{mode}");
+            assert!(found.read_only.is_empty(), "{mode}");
+        }
+    }
+
+    #[test]
+    fn a_read_or_exec_grant_is_a_read_only_overlap() {
+        let found = overlaps(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+             [[exec]]\nbinary=\"/sys/**\"\naction=\"allow\"\n",
+        );
+        assert!(found.mutating.is_empty(), "{found:?}");
+        // "/" covers both protected paths, "/sys" covers the mount
+        assert_eq!(found.read_only.len(), 3, "{found:?}");
+    }
+
+    #[test]
+    fn a_deny_rule_and_unrelated_paths_overlap_nothing() {
+        let found = overlaps(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/sys/fs/cgroup/**\"\nmode=[\"write\"]\naction=\"deny\"\n\
+             [[fs]]\npath=\"/home/op/other/**\"\nmode=[\"write\"]\naction=\"allow\"\n\
+             [[fs]]\npath=\"/sys/fs/cgroup2/**\"\nmode=[\"write\"]\naction=\"allow\"\n\
+             [[fs]]\npath=\"/home/op/.local/state/leash2/**\"\nmode=[\"write\"]\naction=\"allow\"\n",
+        );
+        assert_eq!(found, StoreOverlaps::default());
+    }
+
+    #[test]
+    fn grant_roots_are_compared_after_canonicalization() {
+        let (_, hull) = hull_of(
+            "schema_version = 1\n[[fs]]\npath=\"/link/**\"\nmode=[\"write\"]\naction=\"allow\"\n",
+            4,
+        );
+        let canon = |p: &Path| {
+            if p == Path::new("/link") {
+                PathBuf::from("/sys/fs")
+            } else {
+                p.to_path_buf()
+            }
+        };
+        let found = snapshot_store_overlaps(&hull, &stores(), &canon);
+        assert_eq!(found.mutating.len(), 1, "{found:?}");
+        assert_eq!(found.mutating[0].grant_root, Path::new("/link"));
+        assert_eq!(found.mutating[0].store.kind, StoreKind::CgroupMount);
+    }
+
+    #[test]
+    fn the_workspace_base_grant_is_checked_like_any_other() {
+        let (_, hull) = hull_of("schema_version = 1\n", 4);
+        let inside_workspace = [ProtectedStore {
+            kind: StoreKind::StateRoot,
+            path: "/home/op/project/state".into(),
+        }];
+        let found = snapshot_store_overlaps(&hull, &inside_workspace, &|p| p.to_path_buf());
+        assert_eq!(found.mutating.len(), 1);
+        assert_eq!(
+            found.mutating[0].relation,
+            OverlapRelation::GrantCoversStore
+        );
+    }
+
+    #[test]
+    fn mutating_right_names_follow_the_adr_vocabulary() {
+        assert_eq!(
+            mutating_right_names(FS_READ_RIGHTS | ACCESS_FS_EXECUTE),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            mutating_right_names(FS_WRITE_RIGHTS),
+            vec!["write", "truncate"]
+        );
+        assert_eq!(
+            mutating_right_names(FS_CREATE_RIGHTS),
+            vec!["make", "refer"]
+        );
+        assert_eq!(
+            mutating_right_names(FS_DELETE_RIGHTS),
+            vec!["truncate", "remove", "refer"]
+        );
+    }
+
+    #[test]
+    fn grant_origins_name_the_rules_that_gave_the_mutating_right() {
+        let (p, _) = hull_of(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/sys/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+             [[fs]]\npath=\"/sys/**\"\nmode=[\"write\"]\naction=\"ask\"\n\
+             [[fs]]\npath=\"/sys/**\"\nmode=[\"delete\"]\naction=\"deny\"\n",
+            4,
+        );
+        assert_eq!(
+            mutating_grant_origins(&p, Path::new("/sys"), 4),
+            vec!["fs.2".to_string()]
+        );
+        assert_eq!(
+            mutating_grant_origins(&p, Path::new(WORKSPACE), 4),
+            vec!["base:workspace".to_string()]
         );
     }
 
