@@ -141,13 +141,15 @@ pub struct MetaChange {
     pub mtime: bool,
     /// owner or group differs.
     pub owner: bool,
-    /// user extended attributes or POSIX ACLs differ.
+    /// user extended attributes differ.
     pub xattrs: bool,
+    /// POSIX ACLs (`system.posix_acl_access` or `system.posix_acl_default`) differ.
+    pub acl: bool,
 }
 
 impl MetaChange {
     fn any(self) -> bool {
-        self.mode || self.mtime || self.owner || self.xattrs
+        self.mode || self.mtime || self.owner || self.xattrs || self.acl
     }
 }
 
@@ -165,6 +167,9 @@ impl fmt::Display for MetaChange {
         }
         if self.xattrs {
             parts.push("xattrs");
+        }
+        if self.acl {
+            parts.push("acl");
         }
         write!(f, "{}", parts.join(", "))
     }
@@ -430,8 +435,27 @@ fn meta_change(current: &ManifestEntry, target: &ManifestEntry) -> MetaChange {
         mode: target.kind != EntryKind::Symlink && current.mode != target.mode,
         mtime: (current.mtime_sec, current.mtime_nsec) != (target.mtime_sec, target.mtime_nsec),
         owner: current.uid != target.uid || current.gid != target.gid,
-        xattrs: current.xattrs != target.xattrs,
+        xattrs: user_xattrs(current) != user_xattrs(target),
+        acl: acl_xattrs(current) != acl_xattrs(target),
     }
+}
+
+/// the `user.*` entries of an entry's xattr map.
+fn user_xattrs(entry: &ManifestEntry) -> BTreeMap<&String, &String> {
+    entry
+        .xattrs
+        .iter()
+        .filter(|(name, _)| !super::acl::is_acl_name(name))
+        .collect()
+}
+
+/// the POSIX ACL entries of an entry's xattr map.
+fn acl_xattrs(entry: &ManifestEntry) -> BTreeMap<&String, &String> {
+    entry
+        .xattrs
+        .iter()
+        .filter(|(name, _)| super::acl::is_acl_name(name))
+        .collect()
 }
 
 /// compute the operations that make a workspace described by `current` equal `target`.
@@ -508,7 +532,8 @@ pub fn plan(current: &Manifest, target: &Manifest) -> RestorePlan {
                 mode: true,
                 mtime: true,
                 owner: true,
-                xattrs: !d.xattrs.is_empty(),
+                xattrs: !user_xattrs(d).is_empty(),
+                acl: !acl_xattrs(d).is_empty(),
             },
         })
         .collect();
