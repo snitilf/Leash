@@ -154,7 +154,8 @@ A snapshot run also writes these (ADR-0024 decisions 10, 14 and 16), all additiv
     The event must be durable before the thaw, so the thaw wait is not included.
     It is `0` for step 0 and the final step, where no agent is running.
   - `capture`: `{"entries": <files, directories and symlinks captured>, "bytes": <sum of regular-file sizes>, "new_objects": <content objects this capture added to the store>}`.
-  A `step` event is written, and the trace synced, only after the manifest is published and the cgroup is confirmed still frozen, and before the thaw.
+  A `step` event is written, and the trace synced, only after the cgroup is confirmed still frozen and the manifest is published, and before the thaw.
+  The frozen re-check runs after the capture and before the manifest is published, so a manifest exists only for a capture made under an unbroken freeze.
   Step 0 is captured after the run cgroup exists and before the agent is created, so its event follows `run_start` and any `stale_cleanup` events.
   The final step is captured after `cgroup.kill` reported `populated 0`, so its event follows the `cgroup_kill` event with reason `run_end` and precedes `run_end`.
   Each digest is also printed to stderr as `leash: step <n> snapshot <digest>` when its step commits.
@@ -164,12 +165,28 @@ A snapshot run also writes these (ADR-0024 decisions 10, 14 and 16), all additiv
   `final_step` names the last committed step.
 - A `capture_failed` event is written, on a best-effort basis because the trace may be what failed, when a capture boundary fails and the run aborts closed.
   It carries `step` (the step the boundary would have closed), `phase` and `error` (text).
-  `phase` is `freeze` (`frozen=1` not confirmed in time), `capture` (the store could not capture or publish, or a limit was hit), `frozen_check` (the cgroup was no longer frozen after the capture), `step_event` (the step event could not be written or made durable) or `thaw` (`frozen=0` not confirmed in time).
-  A failed boundary has no `step` event, except `thaw`, where the step event was already durable and the thaw failed afterwards.
-  A manifest published before a `frozen_check`, `step_event` or `thaw` failure stays in the store as an orphan: published, never committed.
+  `phase` is `freeze` (`frozen=1` not confirmed in time), `capture` (the store could not capture or publish, or a limit was hit), `frozen_check` (the cgroup was no longer frozen after the capture, checked before the manifest is published), `step_event` (the step event could not be written or made durable), `thaw` (`frozen=0` not confirmed in time) or `chain_head` (the final step was committed, and the chain head over the committed digests could not be computed).
+  A failed boundary has no committed step, except `thaw` and `chain_head`: after a `thaw` failure the step event was already durable, so the step is committed, and a `chain_head` failure follows a committed final step.
+  A `step_event` failure can leave an event in the file that was never made durable.
+  `capture_failed` with phase `step_event` for step N, after the event for step N, un-commits step N.
+  The only orphan is a `step_event` failure: the manifest was published, and no durable step event names it.
+  A `frozen_check` failure leaves no manifest, because the check runs before the manifest is published, and a `thaw` failure leaves a committed step.
   The run then kills the whole run cgroup (a `cgroup_kill` event with reason `abort`), exits 125 and writes no `run_end`.
+  After a `chain_head` failure the end-of-run kill (reason `run_end`) has already been recorded, so no `abort` kill follows.
   Hitting a capture limit (entries, total bytes, per-file size, store growth) is a `capture` failure, so it ends the run.
 - A snapshot run records the `clone3` `ENOSYS` denial and the legacy AIO denial as events (matched rules `snapshot:clone3` and `snapshot:aio`).
+
+The committed steps of a run are derived from its trace, not from the manifests on disk (ADR-0024 decision 16).
+A step is committed when its `step` event is in `trace.jsonl` and is not followed by `capture_failed` with phase `step_event` for the same step.
+A manifest with no such event is an orphan: published, never committed.
+`leash diff` takes its default step from the committed steps, and `restore::recompute_chain` takes the committed step list and hashes only those manifests.
+Digests still come from the manifests, never from the trace.
+The reader is `store::committed_steps_from_trace`, and `store::published_steps` lists the manifests on disk, orphans included.
+The trace is read as untrusted input.
+The file is opened without following a symlink and must be a regular file of at most 1 GiB (`TRACE_READ_CAP`).
+Each line is at most 1 MiB (`TRACE_LINE_CAP`) and there are at most 1,000,000 step events (`TRACE_STEP_CAP`).
+Step events must ascend, and a malformed event that could decide commitment is an error.
+A final line with no newline is a write torn by a crash and is ignored.
 
 The `fact` is what the supervisor resolved, not what the child's memory said after the fact: the
 trace records the kernel-trusted value the decision used (I4), so the trace and the decision cannot

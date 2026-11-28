@@ -79,7 +79,7 @@ leash diff <run-id>[:<step>] <run-id>[:<step>] [--state-dir <dir>]
 ```
 
 `diff` compares the filesystem effects of two runs or two steps, old side first.
-A missing `:<step>` means the highest committed step of that run.
+A missing `:<step>` means the highest committed step of that run, taken from its trace and never from a manifest that has no step event.
 The step is plain decimal digits; the run id is a plain directory name (not empty, not `.` or `..`, no `/`).
 Either violation is a usage error, as is a missing or extra run argument.
 The store is `<state-root>/runs/<run-id>/snapshots`.

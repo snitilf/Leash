@@ -5,7 +5,7 @@
   The ADR-0024 capture barrier, workspace lock, step digests and chain head (sections 2 and 3) are implemented; the other ADR-0024 controls in sections 2, 3 and 5 are specified, not yet implemented.
   Exact-capture implementation and adversarial validation pending.
   The historical M0 results below do not prove concurrent capture correctness.
-- Governs: FR-11, FR-12, FR-13, FR-17, FR-21; ADR-0005, ADR-0009, ADR-0022, ADR-0024.
+- Governs: FR-11, FR-12, FR-13, FR-17, FR-21; ADR-0005, ADR-0009, ADR-0022, ADR-0024, ADR-0026.
 
 ## 1. Consistency contract and step detection
 
@@ -21,6 +21,12 @@ not proof of filesystem quiescence. Writes through existing descriptors and shar
 mappings do not necessarily tick this clock. The barrier below makes captures exact
 within ADR-0022's supported filesystem state, regardless of those timing gaps. It does
 not make an application transaction atomic. Initial and final snapshots are mandatory.
+
+An agent that writes only through open descriptors or shared mappings, or that mutates faster than the window forever, gets no mid-run boundary.
+The step clock proposes a boundary only from mediated mutating events, and a boundary needs a quiet window of 250 ms.
+Granularity is lost, exactness is not.
+Every capture that does run is exact, because it runs under the barrier whatever proposed it.
+The final capture runs after `populated 0`, when no process of the tree exists, so it is exact for any agent.
 
 ## 2. Capture barrier
 
@@ -71,30 +77,43 @@ The supervisor marks itself non-dumpable before it starts the broker.
 
 A freeze that does not complete in time aborts the run closed and kills the whole cgroup.
 The kernel allows one notify listener per filter chain, and Leash's is already in the agent's chain, so an agent's own `SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EBUSY` (tested in `tests/capture_barrier_linux.rs`).
-No agent action is known to wedge a freeze, and the path is exercised through the `BarrierOps` seam.
+None of the agent actions tested wedges a freeze, and the abort path is exercised through the `BarrierOps` seam.
+Unverified: a task in uninterruptible sleep (a FUSE mount that never answers, a hard NFS mount) may stall a freeze until the timeout, and the run then aborts closed.
 A barrier, capture, publication or thaw error also aborts the run closed and kills the whole cgroup.
 Incomplete captures never appear as successful steps.
 Recovery ignores unpublished staging data.
+The frozen re-check runs inside the capture, after the whole tree is read and before the manifest is published, so a cgroup that thawed leaves no manifest for the step.
 A published snapshot without a committed step event is an orphan, not a successful boundary.
+The only orphan a boundary can leave is a `step_event` failure: the manifest was published, and the event never became durable.
+The committed steps are derived from the `step` events in `trace.jsonl`, excluding a step whose event is followed by `capture_failed` with phase `step_event` for the same step.
+`store::published_steps` lists the manifests on disk, orphans included, and `store::committed_steps_from_trace` lists the committed steps (trace.md section 2).
 
 In a `--snapshots` run, the run ends when the root process exits.
 Leash then writes `cgroup.kill`, records that, waits boundedly for `populated=0`, and takes the final snapshot.
 Every abort path kills the whole cgroup.
 Initial capture precedes spawn.
 
-The run takes an exclusive workspace lock (an `flock` under the state root) at start.
+The run takes an exclusive workspace lock at start: an `flock` on the pinned workspace directory handle and an `flock` on a file under the state root (ADR-0024 decision 13, ADR-0026).
 External writers remain the operator contract of ADR-0022.
 Captures enforce hard limits on entry count, total bytes, per-file apparent size and store growth, and a minimum interval between boundaries.
 Each step event records the capture pause.
 
 Implementation notes, with the constants chosen:
 
-- The workspace lock is `<state_root>/locks/<sha256 of the canonical workspace path>.lock`, taken non-blocking and `O_NOFOLLOW` through handles beneath the state root, before any run directory exists.
+- The workspace lock is two non-blocking `flock`s, both taken before any run directory exists.
+  The first is on the workspace directory itself, through a handle opened once (`O_DIRECTORY | O_CLOEXEC`).
+  It is keyed by the directory inode, so it does not depend on the state root or on the spelling of the path, and a run with a different `--state-dir` is refused too (ADR-0026).
+  The second is on `<state_root>/locks/<sha256 of the canonical workspace path>.lock`, taken `O_NOFOLLOW` through handles beneath the state root.
+  The canonical path is read from the directory handle, so no path is resolved twice.
   A held lock refuses the run before spawn: "another leash run or rewind owns this workspace".
-  `workspace_lock::WorkspaceLock::acquire` is the helper `leash rewind` reuses.
-  The descriptor is close-on-exec, so neither the broker nor the agent holds it.
+  `workspace_lock::WorkspaceLock::acquire` takes both locks and is the helper `leash rewind` reuses.
+  A leftover process that holds the directory `flock` blocks later runs, which fails closed.
+  The broker does not hold the locks because `broker_child` calls `close_all_except` as its first act (`broker.rs`), not because the descriptors are close-on-exec.
+  The agent child closes every descriptor above 2 before `execve`, so it holds neither.
 - The run's store is `<run_dir>/snapshots`.
-  The supervisor opens it and the workspace as pinned `O_DIRECTORY | O_NOFOLLOW` handles before spawn and captures through them for the whole run.
+  The supervisor opens it as a pinned `O_DIRECTORY | O_NOFOLLOW` handle before spawn.
+  Capture uses a duplicate of the workspace directory handle that the lock holds, so the locked directory is the captured directory.
+  Both handles are used for the whole run.
 - Step 0 is captured after the run cgroup exists and before `clone3` creates the agent, and its step event is durable before the agent exists.
 - The freeze wait is bounded by `FREEZE_TIMEOUT` (2 s) and the thaw wait by `THAW_TIMEOUT` (2 s).
   An idle tree freezes in about 5 ms (measurement 0003), so the bounds are slack for a loaded host, not a working budget.
@@ -108,7 +127,7 @@ Implementation notes, with the constants chosen:
 - The final capture needs no freeze: it runs after `cgroup.kill` reported `populated 0`, so no process of the tree exists.
 - A capture limit hit, or any entry capture refuses, at a boundary ends the run like any other capture error.
   The agent cannot make Leash skip a step.
-- Orphans: with Yama `ptrace_scope` 1 the supervisor cannot open `/proc/<pid>/mem` of a process that was reparented away from the run, because `proc_mem_open` asks for ptrace attach access.
+- Orphans (processes outliving their parent): with Yama `ptrace_scope` 1 the supervisor cannot open `/proc/<pid>/mem` of a process that was reparented away from the run, because `proc_mem_open` asks for ptrace attach access.
   A mediated syscall from such a process fails closed (`failsafe:memory_read`, `EACCES`).
   The freeze still stops it, because the cgroup holds it, and its unmediated writes are captured at a frozen moment like any other.
 
@@ -123,8 +142,8 @@ The store is content-addressed.
 Objects are keyed by sha256 of their bytes, and each step has one manifest that lists paths, object digests and supported metadata.
 A capture is written to staging and then renamed into place, so a reader never sees a partial snapshot.
 Hard caps on entries, bytes, apparent file size and store growth bound every capture, and exhaustion fails the capture closed.
-Each step event carries the manifest digest, and `run_end` carries a chain head over all digests, printed at run end.
-The chain is recomputed from the manifests, never read from the trace.
+Each step event carries the manifest digest, and `run_end` carries a chain head over the digests of the committed steps, printed at run end.
+The chain is recomputed from the manifests of the committed steps, never read from the trace, and an orphan manifest is not in it.
 Each step digest is printed when committed, so a crashed run has one.
 Pre-rewind snapshots are outside the chain.
 
@@ -192,6 +211,7 @@ Only a Leash-named child of Leash's own cgroup is killed; a name from metadata i
 Under per-run `systemd-run --scope` launches, a crashed run's cgroup lives in its own earlier scope, so a later run's parent-cgroup scan does not reach it (unverified, as systemd is absent in the codespace).
 Rewind also requires exclusive workspace ownership, and no live overlay mount or remaining references that could mutate the restored state.
 It targets only steps with a committed step event.
+The committed steps come from the trace (section 2), and the chain is recomputed over them (`restore::recompute_chain` takes the committed step list), so an orphan manifest is neither a target nor part of the chain.
 Without `--step`, it restores step 0, the workspace as it was before the agent started.
 It takes the workspace from the working directory or a flag, and refuses when that differs from the run metadata.
 
@@ -228,6 +248,7 @@ Failures are explicit, with recoverable staging and the prior state retained unt
 Rewind reverses filesystem effects only, and says so; it does not reverse effects already emitted off-host.
 
 Diff compares reconstructed visible states.
+A run reference without a step names the final committed step, never an orphan manifest, and a run with no `trace.jsonl` has no step known to be committed.
 Whiteouts mean deletion, opaque directories replace hidden lower entries, recoverable rename relations are reported, and hard links are treated as shared objects.
 Copy and overlay must produce equivalent results over their supported state, backed by the same fixtures and behavioral cases.
 
