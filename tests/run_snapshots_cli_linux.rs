@@ -126,12 +126,12 @@ fn populate(ws: &Path) {
     .unwrap();
 }
 
-/// the agent: three bursts of edits with a pause longer than the 250 ms quiet window between
-/// them, so each burst becomes its own step.
+/// the agent: three bursts of edits with a pause between them longer than the 250 ms quiet
+/// window plus the one second minimum between boundaries, so each burst becomes its own step.
 const AGENT: &str = "set -e; \
-    echo changed > a.txt; sleep 0.7; \
-    rm sub/b.txt; echo new > new.txt; sleep 0.7; \
-    mkdir sub/deep; echo c > sub/deep/c.txt; chmod 600 a.txt; rm link; echo now a file > link; sleep 0.7; \
+    echo changed > a.txt; sleep 1.4; \
+    rm sub/b.txt; echo new > new.txt; sleep 1.4; \
+    mkdir sub/deep; echo c > sub/deep/c.txt; chmod 600 a.txt; rm link; echo now a file > link; sleep 1.4; \
     mv new.txt renamed.txt; rmdir empty";
 
 /// run the printed command the way the shell would, with `leash` on the path and from a
