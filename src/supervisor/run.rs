@@ -452,8 +452,22 @@ pub(crate) fn fd_facts(fd: OwnedFd) -> io::Result<FdFacts> {
 
 /// the implicit denies that depend on what a descriptor is rather than where its link says
 /// it is: an object on cgroup2, and the state root itself.
-fn fd_identity_deny(_config: &RunConfig<'_>, _facts: &FdFacts) -> Option<Evaluation> {
-    None
+fn fd_identity_deny(config: &RunConfig<'_>, facts: &FdFacts) -> Option<Evaluation> {
+    if let Some(eval) = cgroup2_identity_deny(
+        config,
+        crate::supervisor::cgroup_mounts::is_cgroup2_magic(facts.f_type),
+    ) {
+        return Some(eval);
+    }
+    (config.mode == crate::recorder::Mode::Enforce
+        && config
+            .state_root
+            .is_some_and(|root| root.is_identity(facts.dev, facts.ino)))
+    .then_some(Evaluation {
+        decision: Decision::Deny,
+        matched: crate::policy::MatchId::ImplicitStateRoot,
+        would_deny: None,
+    })
 }
 
 /// where a relative path is anchored.
@@ -984,8 +998,13 @@ pub(crate) fn handle_notification<N: Notifier, S: TraceSink>(
 /// target is read back from `/proc/<pid>/fd/<n>`, judged as a write to that path like
 /// `chmod`, and the call continues when allowed: the object is the descriptor's, fixed when
 /// the agent opened it, and the only pointer left is a timestamp or value the agent owns.
+/// the descriptor is also duplicated with `pidfd_getfd` (the supervisor may, only the agent is
+/// denied it), described with `fstatfs` and `fstat`, and the duplicate closed at once: an object
+/// on cgroup2, or the state root directory itself, is denied whatever path the link spells.
 /// a descriptor on a cgroup2 file cannot be opened (the open is denied), so this is depth.
-/// a target that cannot be read denies (case C).
+/// a link or a duplicate that cannot be read denies (case C). what remains is the window
+/// between the readlink and the duplicate, in which the agent can `dup2` another object into
+/// the slot (escapes.md).
 fn handle_fd_metadata<N: Notifier, S: TraceSink>(
     kernel: &N,
     notif: &SeccompNotif,
@@ -999,10 +1018,12 @@ fn handle_fd_metadata<N: Notifier, S: TraceSink>(
     }
     let fd = notif.data.args[0] as u32;
     let target = kernel.dir_prefix(notif.pid, DirAnchor::Fd(fd));
+    // the descriptor itself, read from a duplicate that is closed before the call returns
+    let facts = kernel.describe_fd(notif.pid, fd as RawFd);
     if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
         return Ok(Handled::Dropped);
     }
-    let Ok(path) = target else {
+    let (Ok(path), Ok(facts)) = (target, facts) else {
         record(
             writer,
             ts,
@@ -1016,13 +1037,17 @@ fn handle_fd_metadata<N: Notifier, S: TraceSink>(
     };
     let access = vec![crate::recorder::FsAccess::Write];
     let path_text = path.to_string_lossy();
-    let decision = resolve_decision(
-        config,
-        &Request::Fs {
-            path: &path_text,
-            access: &access,
-        },
-    );
+    // what the descriptor is outranks where its link says it is
+    let decision = match fd_identity_deny(config, &facts) {
+        Some(eval) => finalize_decision(eval, None),
+        None => resolve_decision(
+            config,
+            &Request::Fs {
+                path: &path_text,
+                access: &access,
+            },
+        ),
+    };
     let fact = Fact::Fs {
         path: path.clone(),
         access: access.clone(),
@@ -1618,7 +1643,6 @@ fn secondary_access(
 /// whatever its spelling, so a bind mount of a cgroup directory and a cgroup2 mount made
 /// after the mounts were read are covered. the path rule stays for the ancestors of a mount,
 /// which are on another filesystem and which only it can protect.
-#[cfg(any(target_os = "linux", test))]
 fn cgroup2_identity_deny(config: &RunConfig<'_>, on_cgroup2: bool) -> Option<Evaluation> {
     (on_cgroup2
         && config.mode == crate::recorder::Mode::Enforce

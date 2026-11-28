@@ -80,17 +80,24 @@ impl StateRoot {
                 ));
             }
         }
+        // a root that cannot be statted (it does not exist yet) has no identity to match
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&root).ok().map(|m| (m.dev(), m.ino()))
+        };
         Ok(Self {
             root,
             links,
             proc_pids: Vec::new(),
-            identity: None,
+            identity,
         })
     }
 
-    /// is this `(st_dev, st_ino)` the root directory itself?
-    pub fn is_identity(&self, _dev: u64, _ino: u64) -> bool {
-        false
+    /// is this `(st_dev, st_ino)` the root directory itself? a descriptor that reaches the
+    /// root by a path nothing matches, such as a bind mount alias, still has this identity.
+    /// only the directory is known by identity: an object beneath it keeps the path rule.
+    pub fn is_identity(&self, dev: u64, ino: u64) -> bool {
+        self.identity == Some((dev, ino))
     }
 
     /// name the processes whose `/proc/<pid>` tree is denied (the supervisor and its broker).
