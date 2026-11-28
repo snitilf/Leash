@@ -135,7 +135,7 @@ Non-snapshot runs write neither.
   Kills performed by the `RunCgroup` `Drop` backstop on unwind or early return are not recorded in the trace.
   `cgroup` is the target cgroup's name.
   `processes` is the count listed in `cgroup.procs` just before the kill, and is absent when the list could not be read or no kill was attempted.
-  `error` is present only when checking the lock, opening or killing the cgroup failed, or `populated` did not reach 0 in time.
+  `error` is present only when checking the lock, opening or killing the cgroup failed, `populated` did not reach 0 in time, or, in an `abort` event with `processes` 0 and no `run_end`, taking or binding the run lock failed before any process entered the cgroup.
   `removal_error` is present only when the kill succeeded and removing the cgroup directory or its descendants failed; at run end that failure is recorded here without discarding `run_end`.
   At run end the event precedes `run_end`.
   An abort event is written on a best-effort basis, because the trace itself may be what failed.

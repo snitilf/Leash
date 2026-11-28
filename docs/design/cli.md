@@ -228,6 +228,10 @@ It refuses before spawn, as a supervisor failure with the message on stderr and 
 - the Landlock ABI is below 3, a refusal tested through an injected probe because no available host has an ABI below 3;
 - a Landlock grant with write, truncate, make, remove or refer rights overlaps the state root or any cgroup2 mount, as an ancestor or a descendant, judged on the anchors Landlock opens (a grant on a missing path is anchored at its deepest existing ancestor); the message names the rule, the grant path, the rights and the protected path.
 
+The refusals come in this order: the Landlock ABI and the grant overlaps, then the cgroup delegation probe, then the workspace lock, then the creation of the run cgroup, all before any run directory or broker exists.
+A failure to create the run cgroup, or any later failure before the run directory exists, is a supervisor failure with no run directory created, and removes the cgroup.
+Taking or binding the run lock happens once the run directory exists, so a failure there leaves a run directory with `run_start`, a `cgroup_kill` event with reason `abort` that names the error, and no `run_end`, and exits 125 with the empty cgroup removed.
+
 The session already applies all three refusals and the implicit `implicit:cgroup` deny when its `snapshot_integrity` field is set.
 What is still missing is the `--snapshots` flag that sets it, which the capture slice adds.
 
@@ -278,7 +282,8 @@ goes to stderr.
 1. Preflight: probe the host and evaluate the result ([`architecture.md`](architecture.md)
    section 5.1). A refusal is a supervisor failure, with the message on stderr and no run directory
    created. In enforce mode, policy load and validation also happen here, before any artifact is
-   created or child is spawned.
+   created or child is spawned. A snapshot run also creates its run cgroup here, after the
+   delegation probe and the workspace lock ([`snapshot.md`](snapshot.md) section 2).
 2. Create the run directory and write `meta.json`.
 3. Announce the mode on stderr.
 4. Append the `run_start` event and sync it, before the child is spawned.
