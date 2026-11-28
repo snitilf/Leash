@@ -1,7 +1,8 @@
 //! content-addressed exact snapshot store (ADR-0022, docs/design/snapshot.md).
 //!
 //! layout under a caller-provided store root directory handle (e.g. `<run_dir>/snapshots`):
-//! - `objects/<2-hex>/<64-hex-sha256>` (mode 0400, staged, fsynced, renamed into place)
+//! - `objects/<2-hex>/<64-hex-sha256>` (mode 0400, staged, fsynced, renamed into place; an
+//!   object already present is not written again)
 //! - `manifests/step-<6-digit>.json` (mode 0400, staged, fsynced, renamed, parent fsynced)
 //! - `staging/` (temporary files; ignored by loads and step listings)
 //!
@@ -1702,6 +1703,65 @@ mod linux {
         })
     }
 
+    /// read `src` from its current position to its end, hashing every byte and, when `sink` is
+    /// given, writing it there too. returns the lowercase hex sha256 and the byte count. a file
+    /// that yields more than `size` bytes grew during the read.
+    fn read_pass(
+        src: &mut File,
+        size: u64,
+        rel_path: &str,
+        copy_buf: &mut [u8],
+        mut sink: Option<&mut File>,
+    ) -> Result<(String, u64), StoreError> {
+        let mut hasher = Sha256::new();
+        let mut bytes_read = 0u64;
+        loop {
+            let n = match src.read(copy_buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(io_err("read", rel_path, e)),
+            };
+            bytes_read = bytes_read.saturating_add(n as u64);
+            if bytes_read > size {
+                return Err(StoreError::ConcurrentModification {
+                    path: rel_path.to_owned(),
+                });
+            }
+            hasher.update(&copy_buf[..n]);
+            if let Some(sink) = sink.as_deref_mut() {
+                sink.write_all(&copy_buf[..n])
+                    .map_err(|e| io_err("write staging", rel_path, e))?;
+            }
+        }
+        Ok((hex_encode(&hasher.finalize()), bytes_read))
+    }
+
+    /// refuse a file whose size or mtime moved while it was read, or whose read came up short.
+    fn check_unchanged_after_read(
+        src: &File,
+        before_fp: FileFingerprint,
+        bytes_read: u64,
+        rel_path: &str,
+    ) -> Result<(), StoreError> {
+        let after_stat = fstat_fd(src.as_raw_fd(), "fstat", rel_path)?;
+        let after_fp = FileFingerprint {
+            size: stat_size(&after_stat, rel_path)?,
+            mtime_sec: after_stat.st_mtime,
+            mtime_nsec: after_stat.st_mtime_nsec,
+        };
+        check_file_unchanged(rel_path, before_fp, after_fp, bytes_read)
+    }
+
+    /// store the content of one regular file as an object and return its sha256.
+    ///
+    /// the file is read once to hash it. an object that is already in the store needs nothing
+    /// more, which is the common case on every step after the first, so no staging file is
+    /// written and no fsync is paid for it. only a new object is read a second time into a
+    /// staging file, and that copy must hash to the same digest and leave the file unchanged,
+    /// or the capture is refused. a new object is fsynced, renamed into place and its bucket
+    /// directory fsynced before this returns, so the manifest that names it is published only
+    /// after the object is durable.
     #[allow(clippy::too_many_arguments)]
     fn store_regular_file(
         mut src: File,
@@ -1719,122 +1779,61 @@ mod linux {
             mtime_sec: before_stat.st_mtime,
             mtime_nsec: before_stat.st_mtime_nsec,
         };
-        let (mut staged, staged_name) = create_staging_file(staging_dir)?;
-        let mut hasher = Sha256::new();
-        let mut bytes_read = 0u64;
+        let (sha256_hex, bytes_read) = read_pass(&mut src, size, rel_path, copy_buf, None)?;
+        check_unchanged_after_read(&src, before_fp, bytes_read, rel_path)?;
 
-        loop {
-            let n = match src.read(copy_buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    drop(staged);
-                    unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                    return Err(io_err("read", rel_path, e));
-                }
-            };
-            bytes_read = bytes_read.saturating_add(n as u64);
-            if bytes_read > size {
-                drop(staged);
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                return Err(StoreError::ConcurrentModification {
-                    path: rel_path.to_owned(),
-                });
-            }
-            hasher.update(&copy_buf[..n]);
-            if let Err(e) = staged.write_all(&copy_buf[..n]) {
-                drop(staged);
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                return Err(io_err("write staging", rel_path, e));
-            }
-        }
-
-        let after_stat = match fstat_fd(src.as_raw_fd(), "fstat", rel_path) {
-            Ok(st) => st,
-            Err(err) => {
-                drop(staged);
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                return Err(err);
-            }
-        };
-        let after_size = match stat_size(&after_stat, rel_path) {
-            Ok(sz) => sz,
-            Err(err) => {
-                drop(staged);
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                return Err(err);
-            }
-        };
-        let after_fp = FileFingerprint {
-            size: after_size,
-            mtime_sec: after_stat.st_mtime,
-            mtime_nsec: after_stat.st_mtime_nsec,
-        };
-        if let Err(err) = check_file_unchanged(rel_path, before_fp, after_fp, bytes_read) {
-            drop(staged);
-            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-            return Err(err);
-        }
-
-        if let Err(e) = staged.sync_all() {
-            drop(staged);
-            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-            return Err(io_err("fsync staging", rel_path, e));
-        }
-        drop(staged);
-
-        let sha256_hex = hex_encode(&hasher.finalize());
         let bucket = &sha256_hex[..2];
         let c_bucket =
             CString::new(bucket).map_err(|_| StoreError::InvalidDigest(sha256_hex.clone()))?;
         let c_hash = CString::new(sha256_hex.as_str())
             .map_err(|_| StoreError::InvalidDigest(sha256_hex.clone()))?;
-
         let bucket_path = format!("objects/{bucket}");
         let object_path = format!("objects/{bucket}/{sha256_hex}");
-        let bucket_dir = match ensure_dir(objects_dir.as_raw_fd(), &c_bucket, &bucket_path) {
-            Ok(dir) => dir,
-            Err(err) => {
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                return Err(err);
-            }
-        };
+        let bucket_dir = ensure_dir(objects_dir.as_raw_fd(), &c_bucket, &bucket_path)?;
 
-        let already_exists =
-            match fstatat_exists(bucket_dir.as_raw_fd(), &c_hash, "fstatat", &object_path) {
-                Ok(exists) => exists,
-                Err(err) => {
-                    unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                    return Err(err);
-                }
-            };
-        if already_exists {
-            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+        if fstatat_exists(bucket_dir.as_raw_fd(), &c_hash, "fstatat", &object_path)? {
             stats.reused_objects += 1;
             return Ok(sha256_hex);
         }
 
-        let next_growth = stats.store_growth.checked_add(bytes_read).ok_or(
-            StoreError::StoreGrowthLimitExceeded {
-                growth: u64::MAX,
-                limit: limits.max_store_growth,
-            },
-        );
-        let next_growth = match next_growth {
-            Ok(g) if g <= limits.max_store_growth => g,
-            Ok(g) => {
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+        let next_growth = match stats.store_growth.checked_add(bytes_read) {
+            Some(growth) if growth <= limits.max_store_growth => growth,
+            Some(growth) => {
                 return Err(StoreError::StoreGrowthLimitExceeded {
-                    growth: g,
+                    growth,
                     limit: limits.max_store_growth,
                 });
             }
-            Err(err) => {
-                unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
-                return Err(err);
+            None => {
+                return Err(StoreError::StoreGrowthLimitExceeded {
+                    growth: u64::MAX,
+                    limit: limits.max_store_growth,
+                });
             }
         };
+
+        // a new object: copy it through a staging file, checking that the second read is the
+        // content the first read hashed
+        src.seek(SeekFrom::Start(0))
+            .map_err(|e| io_err("seek", rel_path, e))?;
+        let (mut staged, staged_name) = create_staging_file(staging_dir)?;
+        let staged_result = read_pass(&mut src, size, rel_path, copy_buf, Some(&mut staged))
+            .and_then(|(second_hex, second_len)| {
+                if second_hex != sha256_hex || second_len != bytes_read {
+                    return Err(StoreError::ConcurrentModification {
+                        path: rel_path.to_owned(),
+                    });
+                }
+                check_unchanged_after_read(&src, before_fp, second_len, rel_path)?;
+                staged
+                    .sync_all()
+                    .map_err(|e| io_err("fsync staging", rel_path, e))
+            });
+        drop(staged);
+        if let Err(err) = staged_result {
+            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+            return Err(err);
+        }
 
         let placed = match rename_noreplace(
             staging_dir.as_raw_fd(),
