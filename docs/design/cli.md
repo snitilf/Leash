@@ -233,17 +233,18 @@ The refusals come in this order: the Landlock ABI and the grant overlaps, then t
 A failure to create the run cgroup, or any later failure before the run directory exists, is a supervisor failure with no run directory created, and removes the cgroup.
 Taking or binding the run lock happens once the run directory exists, so a failure there leaves a run directory with `run_start`, a `cgroup_kill` event with reason `abort` that names the error, and no `run_end`, and exits 125 with the empty cgroup removed.
 
-When the run ends, stderr carries the steps and how to undo the run, after the child's own output and before the exit:
+While the run goes and when it ends, stderr carries the steps and how to undo the run:
 
 ```
-leash: step 0 digest: <64 hex>
-leash: step <N> digest: <64 hex>
+leash: step 0 snapshot <64 hex>
+leash: step <N> snapshot <64 hex>
 leash: snapshot chain head <64 hex>
 leash: run <run-id> recorded; report: <state-root>/runs/<run-id>/report.txt
 leash: to undo this run: leash rewind <run-id> --expect <chain head> --workspace <dir> --state-dir <dir>
 ```
 
-The step lines list every committed step in order, and the chain head is the one `rewind --expect` checks.
+Each step line is printed as the step is committed, so a run that crashed still showed its digests.
+The chain head is the one `rewind --expect` checks.
 The last line is shell-quoted so it can be pasted, and it carries the workspace and state directory so it works from any directory.
 Keep the chain head outside the state root: without it, `rewind` can only check the store against the trace beside it.
 

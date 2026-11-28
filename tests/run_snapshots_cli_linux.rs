@@ -204,7 +204,7 @@ fn a_snapshot_run_is_diffed_and_rewound_with_what_it_printed() {
         .iter()
         .filter_map(|l| l.strip_prefix("leash: step "))
         .map(|rest| {
-            let (n, digest) = rest.split_once(" digest: ").expect(rest);
+            let (n, digest) = rest.split_once(" snapshot ").expect(rest);
             (n.parse().unwrap(), digest.to_string())
         })
         .collect();
@@ -233,7 +233,7 @@ fn a_snapshot_run_is_diffed_and_rewound_with_what_it_printed() {
         "the last line is the rewind command"
     );
     let position = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap();
-    assert!(position("step 0 digest") < position("snapshot chain head"));
+    assert!(position("step 0 snapshot") < position("snapshot chain head"));
     assert!(position("snapshot chain head") < position("recorded; report:"));
     assert!(position("recorded; report:") < lines.len() - 1);
 

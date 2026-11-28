@@ -880,9 +880,6 @@ mod linux {
         let trace = std::fs::read_to_string(run_dir.path.join("trace.jsonl"))
             .map_err(SessionError::Report)?;
         if let Some(head) = outcome.chain_head.as_deref() {
-            for line in crate::run_summary::step_digest_lines(&trace) {
-                eprintln!("{line}");
-            }
             eprintln!("leash: snapshot chain head {head}");
         }
         let report = crate::recorder::report::render_report(&trace)?;
@@ -901,12 +898,7 @@ mod linux {
         if let Some(head) = outcome.chain_head.as_deref() {
             eprintln!(
                 "{}",
-                crate::run_summary::rewind_hint(
-                    &run_dir.id,
-                    head,
-                    &spec.workspace,
-                    &spec.state_root
-                )
+                crate::rewind::rewind_hint(&run_dir.id, head, &spec.workspace, &spec.state_root)
             );
         }
 

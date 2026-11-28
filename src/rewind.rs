@@ -124,6 +124,19 @@ pub fn undo_command(
     )
 }
 
+/// the last line a finished snapshot run prints: the command that rewinds it, checked against
+/// the chain head the run just printed. the workspace and state directory are spelled out so
+/// the command works from any directory and for a non-default state root, and every value
+/// is shell-quoted so the line can be pasted.
+pub fn rewind_hint(run_id: &str, chain_head: &str, workspace: &Path, state_root: &Path) -> String {
+    format!(
+        "leash: to undo this run: leash rewind {} --expect {chain_head} --workspace {} --state-dir {}",
+        shell_quote(run_id),
+        shell_quote(&workspace.to_string_lossy()),
+        shell_quote(&state_root.to_string_lossy()),
+    )
+}
+
 /// restore the workspace of `req` and report to `out` (results) and `err` (warnings).
 /// every refusal happens before the first write to the workspace.
 #[cfg(target_os = "linux")]
@@ -1047,5 +1060,27 @@ mod tests {
                 "ab".repeat(32)
             )
         );
+    }
+
+    #[test]
+    fn the_run_end_hint_names_the_run_the_head_the_workspace_and_the_state_root() {
+        assert_eq!(
+            rewind_hint(
+                "20260101T000000Z-abc123",
+                &"cd".repeat(32),
+                Path::new("/work/my repo"),
+                Path::new("/state")
+            ),
+            format!(
+                "leash: to undo this run: leash rewind 20260101T000000Z-abc123 --expect {} --workspace '/work/my repo' --state-dir /state",
+                "cd".repeat(32)
+            )
+        );
+    }
+
+    #[test]
+    fn the_run_end_hint_cannot_carry_a_line_break_from_a_path() {
+        let hint = rewind_hint("id", &"0".repeat(64), Path::new("/a\nb"), Path::new("/s"));
+        assert!(!hint.contains('\n'), "{hint:?}");
     }
 }
