@@ -864,6 +864,66 @@ fn a_stale_cgroup_of_a_dead_run_is_cleaned_and_the_rewind_proceeds() {
     assert_eq!(tree_state(&f.ws), original);
 }
 
+/// the stale cleanup is driven by the untrusted `meta.json`, so it runs only after the trace
+/// and the store have passed their read-only checks (ADR-0024 decision 17).
+#[test]
+fn a_stale_cgroup_is_not_cleaned_when_the_trace_or_the_expect_check_refuses() {
+    if !common::delegated_cgroup_or_skip("stale_cgroup_after_checks") {
+        return;
+    }
+    let parent = CgroupParent::locate().unwrap();
+    let pick: &dyn Fn(&str) -> PathBuf = &|id| parent.child_path(id).unwrap();
+    let Some(mut f) = Fixture::new(Some(pick)) else {
+        return;
+    };
+    populate(&f);
+    f.commit_step(0);
+    agent_edits(&f);
+    let before = tree_state(&f.ws);
+    let lock = RunLock::acquire(&f.run_dir).unwrap();
+    let group = RunCgroup::create(&parent, &f.id).unwrap();
+    group.bind_lock(&lock).unwrap();
+    std::mem::forget(group);
+    drop(lock);
+    let cgroup = f.meta.run_cgroup.clone().unwrap();
+    assert!(cgroup.exists());
+
+    // a digest that matches neither the chain head nor the step
+    let wrong = "0".repeat(64);
+    let out = f.rewind(&["--expect", &wrong]);
+    let expect_survived = cgroup.exists();
+    // a trace that disagrees with meta.json
+    let trace = f.trace[0].clone();
+    f.trace[0] = trace.replace(&*f.ws.to_string_lossy(), "/somewhere/else");
+    f.flush_trace();
+    let disagreeing = f.rewind(&[]);
+    let trace_survived = cgroup.exists();
+    let _ = fs::remove_dir(&cgroup);
+
+    assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
+    assert!(stderr(&out).contains("--expect"), "{}", stderr(&out));
+    assert!(
+        expect_survived,
+        "a refused --expect left the stale cgroup alone"
+    );
+    assert_eq!(
+        disagreeing.status.code(),
+        Some(125),
+        "{}",
+        stderr(&disagreeing)
+    );
+    assert!(
+        stderr(&disagreeing).contains("disagrees"),
+        "{}",
+        stderr(&disagreeing)
+    );
+    assert!(
+        trace_survived,
+        "a refused trace left the stale cgroup alone"
+    );
+    assert_eq!(tree_state(&f.ws), before);
+}
+
 #[test]
 fn a_held_workspace_lock_is_refused() {
     let Some(mut f) = Fixture::gone() else { return };
