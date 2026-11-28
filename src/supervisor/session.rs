@@ -92,6 +92,29 @@ pub struct SessionSpec {
     pub snapshot_integrity: bool,
 }
 
+/// the refusal of a snapshot run whose policy grants a mutating Landlock right over the state
+/// root or a cgroup2 mount (ADR-0024 decision 5).
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "snapshot integrity refused: {origin} grants {rights} beneath \"{grant}\", which {relation} {what} \"{protected}\"; a Landlock grant cannot subtract a subtree, so the agent could change snapshot state or its own cgroup. Narrow the rule so it does not cover that path, or remove those rights from it (ADR-0024 decision 5)",
+    grant = grant.display(),
+    protected = protected.display()
+)]
+pub struct GrantOverlapRefusal {
+    /// the policy rule or base grant that gave the right, such as `rule fs.3`
+    pub origin: String,
+    /// the mutating rights, such as `write, truncate`
+    pub rights: String,
+    /// the grant's hierarchy root as the policy spelled it
+    pub grant: PathBuf,
+    /// how the grant relates to the protected path
+    pub relation: &'static str,
+    /// `state root` or `cgroup2 mount`
+    pub what: &'static str,
+    /// the protected path
+    pub protected: PathBuf,
+}
+
 /// how a completed run ended.
 #[derive(Debug, Clone)]
 pub struct SessionOutcome {
@@ -118,6 +141,26 @@ pub enum SessionError {
         "snapshot integrity restrictions require enforce mode; record-only cannot keep the agent away from snapshot state"
     )]
     SnapshotIntegrityNeedsEnforce,
+    /// a snapshot run needs Landlock ABI 3 or higher so path truncation is in the backstop
+    /// (ADR-0024 decision 6).
+    #[error(
+        "snapshot integrity refused: Landlock ABI {abi} is below the required ABI {required}, so path truncation would not be in the Landlock backstop (ADR-0024 decision 6)"
+    )]
+    SnapshotLandlockAbi {
+        /// the ABI the host reported
+        abi: u32,
+        /// the lowest ABI a snapshot run accepts
+        required: u32,
+    },
+    /// a policy grant with a mutating right overlaps the state root or a cgroup2 mount
+    /// (ADR-0024 decision 5). Landlock cannot subtract a subtree from a grant, so only the
+    /// grant can be narrowed.
+    #[error(transparent)]
+    SnapshotGrantOverlap(Box<GrantOverlapRefusal>),
+    /// the cgroup2 mounts of this mount namespace could not be read, so the implicit deny
+    /// that protects them could not be armed (ADR-0024 decision 4).
+    #[error("cgroup2 mounts could not be read: {0}")]
+    CgroupMounts(#[source] std::io::Error),
     /// the supervisor could not mark itself non-dumpable.
     #[cfg(target_os = "linux")]
     #[error("could not mark the supervisor non-dumpable: {0}")]
@@ -179,9 +222,12 @@ mod linux {
         AskResolution, CgroupKillEvent, CgroupKillReason, EventBody, Mode, RecorderError, RunDir,
         RunMeta, TRACE_SCHEMA_VERSION, TraceSink, TraceWriter,
     };
-    use crate::sandbox::landlock::{self, LandlockHull, PreparedRuleset};
+    use crate::sandbox::landlock::{
+        self, LandlockHull, PreparedRuleset, ProtectedStore, StoreKind,
+    };
     use crate::supervisor::broker::Broker;
     use crate::supervisor::cgroup;
+    use crate::supervisor::cgroup_mounts::CgroupMounts;
     use crate::supervisor::preflight::{self, Outcome};
     use crate::supervisor::run::run_loop_with_cgroup_kill;
     use crate::supervisor::run_cgroup::{
@@ -207,6 +253,11 @@ mod linux {
         pub kill: &'a dyn Fn(&RunCgroup, CgroupKillReason) -> CgroupKillEvent,
         /// resolves attended asks (defaults to `ask::tty_prompt`).
         pub prompter: &'a dyn Fn(&[crate::supervisor::ask::PendingAsk], Duration) -> AskResolution,
+        /// probes the host capabilities, the Landlock ABI included (defaults to
+        /// `preflight::probe`). a test injects an ABI no available host has, to prove the
+        /// ADR-0024 decision 6 refusal.
+        pub capabilities:
+            &'a dyn Fn() -> Result<preflight::Capabilities, preflight::PreflightError>,
     }
 
     impl Default for SessionHooks<'_> {
@@ -215,6 +266,7 @@ mod linux {
                 probe: &|parent| cgroup::probe_delegation(parent, PROBE_TIMEOUT),
                 kill: &RunCgroup::kill_all,
                 prompter: &crate::supervisor::ask::tty_prompt,
+                capabilities: &preflight::probe,
             }
         }
     }
@@ -245,7 +297,7 @@ mod linux {
         refuse_snapshot_integrity_outside_enforce(&spec)?;
         // first, before any run directory, broker or child exists (ADR-0024 decision 9)
         set_non_dumpable()?;
-        let caps = preflight::probe()?;
+        let caps = (hooks.capabilities)()?;
         let (caps, mechanism, mechanism_reason) = match preflight::evaluate(&caps, spec.mode) {
             Outcome::Proceed {
                 caps,
@@ -254,7 +306,21 @@ mod linux {
             } => (caps, mechanism, mechanism_reason),
             Outcome::Refuse(message) => return Err(SessionError::Refused(message)),
         };
-        let enforcement = prepare_enforcement(&spec, caps.landlock_abi)?;
+        // the host-side refusals of a snapshot run come before anything exists: the ABI, then
+        // the policy's grants against the state root and the cgroup2 mounts (ADR-0024
+        // decisions 4 to 6). the mounts are read once, here, and denied for the whole run.
+        if spec.snapshot_integrity && caps.landlock_abi < landlock::SNAPSHOT_MIN_ABI {
+            return Err(SessionError::SnapshotLandlockAbi {
+                abi: caps.landlock_abi,
+                required: landlock::SNAPSHOT_MIN_ABI,
+            });
+        }
+        let cgroup_mounts = if spec.snapshot_integrity {
+            Some(CgroupMounts::from_proc_self().map_err(SessionError::CgroupMounts)?)
+        } else {
+            None
+        };
+        let enforcement = prepare_enforcement(&spec, caps.landlock_abi, cgroup_mounts.as_ref())?;
         // a snapshot run needs a writable delegated cgroup with working clone3 entry,
         // lock xattrs, freeze, thaw and kill; refuse before any run directory or broker
         // exists (cli.md section 1, ADR-0024 decision 2).
@@ -297,6 +363,7 @@ mod linux {
             enforcement.ruleset.as_ref(),
             &enforcement.resolved_hosts,
             located_parent.as_ref(),
+            cgroup_mounts.as_ref(),
             &hooks,
         )
     }
@@ -326,6 +393,7 @@ mod linux {
     fn prepare_enforcement(
         spec: &SessionSpec,
         landlock_abi: u32,
+        cgroup_mounts: Option<&CgroupMounts>,
     ) -> Result<EnforcementSetup, SessionError> {
         if spec.mode == Mode::RecordOnly {
             return Ok(EnforcementSetup {
@@ -351,7 +419,10 @@ mod linux {
             },
         )?;
         let resolved_hosts = resolve_policy_hosts(&loaded.policy)?;
-        let hull: LandlockHull = landlock::derive_hull(&loaded.policy, landlock_abi);
+        let mut hull: LandlockHull = landlock::derive_hull(&loaded.policy, landlock_abi);
+        if let Some(mounts) = cgroup_mounts {
+            check_snapshot_overlaps(spec, &loaded.policy, &mut hull, mounts, landlock_abi)?;
+        }
         let ruleset = landlock::prepare_ruleset(&hull)?;
 
         Ok(EnforcementSetup {
@@ -362,6 +433,59 @@ mod linux {
             ruleset: Some(ruleset),
             resolved_hosts,
         })
+    }
+
+    /// refuse a policy whose Landlock grants could change the state root or a cgroup2 mount,
+    /// and stamp the read-only overlaps that are allowed (ADR-0024 decision 5). a grant
+    /// overlaps as an ancestor or a descendant, compared by component on resolved paths. the
+    /// state root may not exist yet, so it is resolved as far as it does.
+    fn check_snapshot_overlaps(
+        spec: &SessionSpec,
+        policy: &crate::policy::Policy,
+        hull: &mut LandlockHull,
+        mounts: &CgroupMounts,
+        abi: u32,
+    ) -> Result<(), SessionError> {
+        let mut stores = vec![ProtectedStore {
+            kind: StoreKind::StateRoot,
+            path: crate::supervisor::state_root::resolve_leniently(&spec.state_root),
+        }];
+        stores.extend(mounts.paths().iter().map(|path| ProtectedStore {
+            kind: StoreKind::CgroupMount,
+            path: path.clone(),
+        }));
+        let canonical = |root: &Path| {
+            let absolute = if root.is_absolute() {
+                root.to_path_buf()
+            } else {
+                std::env::current_dir().map_or_else(|_| root.to_path_buf(), |cwd| cwd.join(root))
+            };
+            crate::supervisor::state_root::resolve_leniently(&absolute)
+        };
+        let overlaps = landlock::snapshot_store_overlaps(hull, &stores, &canonical);
+        if let Some(first) = overlaps.mutating.first() {
+            let origins = landlock::mutating_grant_origins(policy, &first.grant_root, abi);
+            let origin = match origins.as_slice() {
+                [] => "a policy rule".to_string(),
+                [one] => format!("rule {one}"),
+                many => format!("rules {}", many.join(", ")),
+            };
+            return Err(SessionError::SnapshotGrantOverlap(Box::new(
+                GrantOverlapRefusal {
+                    origin,
+                    rights: landlock::mutating_right_names(first.mutating_rights()).join(", "),
+                    grant: first.grant_root.clone(),
+                    relation: first.relation.describe(),
+                    what: first.store.kind.describe(),
+                    protected: first.store.path.clone(),
+                },
+            )));
+        }
+        if !overlaps.read_only.is_empty() {
+            hull.residuals
+                .push(landlock::RESIDUAL_SNAPSHOT_STORE_READ_OVERLAP.to_string());
+        }
+        Ok(())
     }
 
     fn resolve_policy_hosts(
@@ -420,6 +544,7 @@ mod linux {
             None,
             &HashMap::new(),
             None,
+            None,
             &SessionHooks::default(),
         )
     }
@@ -434,9 +559,17 @@ mod linux {
         prepared_ruleset: Option<&PreparedRuleset>,
         resolved_hosts: &HashMap<String, Vec<IpAddr>>,
         located_parent: Option<&CgroupParent>,
+        cgroup_mounts: Option<&CgroupMounts>,
         hooks: &SessionHooks<'_>,
     ) -> Result<SessionOutcome, SessionError> {
         refuse_snapshot_integrity_outside_enforce(spec)?;
+        // the implicit cgroup deny cannot be armed without the mounts, so a snapshot run
+        // that reaches here without them is refused before the broker or the child exist
+        if spec.snapshot_integrity && cgroup_mounts.is_none() {
+            return Err(SessionError::Run(
+                crate::supervisor::run::RunError::SnapshotIntegrityNeedsCgroupMounts,
+            ));
+        }
         // an enforce run resolves its state root once, here, before any process exists: the
         // implicit deny compares resolved paths against this value (FR-21, ADR-0024). a root
         // that cannot be resolved refuses the run. record-only has no deny, so it needs none.
@@ -529,6 +662,9 @@ mod linux {
         }
         .with_ask_timeout(spec.ask_timeout)
         .with_snapshot_integrity(spec.snapshot_integrity);
+        if let Some(mounts) = cgroup_mounts {
+            config = config.with_cgroup_mounts(mounts);
+        }
         config.prompter = hooks.prompter;
         let outcome = run_loop_with_cgroup_kill(child, config, writer, hooks.kill)?;
 
