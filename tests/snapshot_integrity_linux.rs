@@ -460,7 +460,7 @@ fn a_home_write_grant_that_covers_the_state_root_is_refused_before_any_run_direc
     let state_path = state.path().to_path_buf();
     let session = Session::with_state(state);
     session.write_policy(&format!(
-        "{POLICY}[[fs]]\npath=\"{{home}}/**\"\nmode=[\"read\", \"write\"]\naction=\"allow\"\n"
+        "{POLICY}[[fs]]\npath=\"~/**\"\nmode=[\"read\", \"write\"]\naction=\"allow\"\n"
     ));
     let message = overlap_refusal(session.run(&["/bin/true"]));
     assert!(message.contains("rule fs.2"), "names the rule: {message}");
