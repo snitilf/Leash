@@ -21,6 +21,42 @@ use serde::{Deserialize, Serialize};
 use crate::sandbox::landlock::{PreparedRuleset, RootAnchor};
 
 const MAX_PACKET: usize = 1_048_576;
+
+/// two hex digits per byte on the wire, for the fields that can reach 64 KiB. json spells a
+/// `Vec<u8>` as decimal numbers, up to four characters a byte, and a packet over the
+/// socket's send buffer (about 208 KiB) is refused with `EMSGSIZE`, which would end the run
+/// over one large value. hex is two characters a byte whatever the byte.
+mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut text = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            text.push(char::from(DIGITS[usize::from(byte >> 4)]));
+            text.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+        }
+        serializer.serialize_str(&text)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let digit = |c: u8| match c {
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            _ => Err(D::Error::custom("not a lowercase hex digit")),
+        };
+        let raw = text.as_bytes();
+        if raw.len() % 2 != 0 {
+            return Err(D::Error::custom("odd number of hex digits"));
+        }
+        raw.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| Ok(digit(pair[0])? << 4 | digit(pair[1])?))
+            .collect()
+    }
+}
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
@@ -165,6 +201,7 @@ pub enum MutationOperation {
         /// Attribute name, without the terminating nul.
         name: Vec<u8>,
         /// Attribute value.
+        #[serde(with = "hex_bytes")]
         value: Vec<u8>,
         /// `XATTR_CREATE` or `XATTR_REPLACE`, or zero.
         flags: i32,
@@ -501,6 +538,7 @@ enum Request {
     Network {
         operation: NetworkOperation,
         address: Vec<u8>,
+        #[serde(with = "hex_bytes")]
         payload: Vec<u8>,
         flags: i32,
     },
