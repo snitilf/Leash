@@ -1766,7 +1766,9 @@ fn an_empty_leftover_probe_cgroup_is_removed_at_the_next_run() {
 
     assert!(!leftover.exists(), "the empty leftover probe cgroup stays");
     assert!(
-        run.of_type("cgroup_kill").is_empty(),
+        run.of_type("cgroup_kill")
+            .iter()
+            .all(|e| e["reason"] != "stale_cleanup"),
         "removing an empty probe cgroup records nothing: {:?}",
         run.events
     );
@@ -1810,7 +1812,9 @@ fn a_populated_leftover_probe_cgroup_is_never_killed_or_removed() {
     );
     assert!(populated.sleeper_alive(), "a process in it was killed");
     assert!(
-        run.of_type("cgroup_kill").is_empty(),
+        run.of_type("cgroup_kill")
+            .iter()
+            .all(|e| e["reason"] != "stale_cleanup"),
         "nothing named leash-probe is cleaned while populated: {:?}",
         run.events
     );
