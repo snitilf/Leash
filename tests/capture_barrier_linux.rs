@@ -778,8 +778,8 @@ fn the_barrier_runs_in_adr_order_and_no_notification_is_recorded_across_it() {
         let step = boundary.load(Ordering::SeqCst);
         let run = first_run(&state).unwrap();
         assert!(
-            manifest_path(&run, step).exists(),
-            "the capture is published before the re-check"
+            !manifest_path(&run, step).exists(),
+            "the re-check runs before the manifest is published (ADR-0024 decision 10)"
         );
         assert_eq!(
             step_events(&run),
@@ -792,6 +792,10 @@ fn the_barrier_runs_in_adr_order_and_no_notification_is_recorded_across_it() {
     let thaw = |group: &Cgroup, timeout: Duration| -> std::io::Result<()> {
         let step = boundary.load(Ordering::SeqCst);
         let run = first_run(&state).unwrap();
+        assert!(
+            manifest_path(&run, step).exists(),
+            "the manifest is published before the thaw"
+        );
         assert_eq!(
             step_events(&run),
             step + 1,
@@ -1131,7 +1135,7 @@ fn a_limit_hit_by_the_initial_capture_refuses_the_run_before_any_agent_exists() 
 }
 
 #[test]
-fn a_cgroup_that_thaws_during_the_capture_aborts_closed_and_leaves_an_orphan_manifest() {
+fn a_cgroup_that_thaws_during_the_capture_aborts_closed_and_publishes_no_manifest() {
     let _guard = spawn_lock();
     if !common::delegated_cgroup_or_skip("frozen_dropped") {
         return;
@@ -1153,9 +1157,14 @@ fn a_cgroup_that_thaws_during_the_capture_aborts_closed_and_leaves_an_orphan_man
         vec![0],
         "no step event for the failed boundary"
     );
-    // the manifest was published before the re-check: it is an orphan, never a committed step
+    // the re-check runs before the manifest is published (ADR-0024 decision 10), so the failed
+    // boundary leaves no manifest at all: not an orphan, nothing
     let run = harness.run_dir().unwrap();
-    assert_eq!(committed_steps(&open_store(&run)).unwrap(), vec![0, 1]);
+    assert!(
+        !manifest_path(&run, 1).exists(),
+        "a failed frozen re-check publishes no manifest"
+    );
+    assert_eq!(committed_steps(&open_store(&run)).unwrap(), vec![0]);
     assert_agent_dead(&harness);
 }
 
