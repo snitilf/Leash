@@ -380,6 +380,9 @@ pub struct CaptureStats {
     pub total_bytes: u64,
     /// number of new content objects written to `objects/`.
     pub new_objects: u64,
+    /// number of staging files this capture created for file content. an object that was
+    /// already in the store needs none, so a capture of an unchanged tree stages nothing.
+    pub staged: u64,
     /// number of file objects deduplicated against existing objects or hard links.
     pub reused_objects: u64,
     /// bytes of new objects written to `objects/` by this capture.
@@ -1401,6 +1404,7 @@ mod linux {
             symlinks: 0,
             total_bytes: 0,
             new_objects: 0,
+            staged: 0,
             reused_objects: 0,
             store_growth: 0,
         };
@@ -1791,7 +1795,13 @@ mod linux {
         let object_path = format!("objects/{bucket}/{sha256_hex}");
         let bucket_dir = ensure_dir(objects_dir.as_raw_fd(), &c_bucket, &bucket_path)?;
 
-        if fstatat_exists(bucket_dir.as_raw_fd(), &c_hash, "fstatat", &object_path)? {
+        if existing_object(
+            bucket_dir.as_raw_fd(),
+            &c_hash,
+            &object_path,
+            &sha256_hex,
+            bytes_read,
+        )? {
             stats.reused_objects += 1;
             return Ok(sha256_hex);
         }
@@ -1817,6 +1827,7 @@ mod linux {
         src.seek(SeekFrom::Start(0))
             .map_err(|e| io_err("seek", rel_path, e))?;
         let (mut staged, staged_name) = create_staging_file(staging_dir)?;
+        stats.staged += 1;
         let staged_result = read_pass(&mut src, size, rel_path, copy_buf, Some(&mut staged))
             .and_then(|(second_hex, second_len)| {
                 if second_hex != sha256_hex || second_len != bytes_read {
@@ -1848,15 +1859,73 @@ mod linux {
             }
         };
         if placed {
-            fsync_fd(bucket_dir.as_raw_fd(), "fsync", &bucket_path)?;
+            if let Err(err) = fsync_fd(bucket_dir.as_raw_fd(), "fsync", &bucket_path) {
+                // the object is in place but the rename is not known to be durable, so it
+                // must not be left for a later capture to take as present
+                unlink_best_effort(bucket_dir.as_raw_fd(), &c_hash);
+                return Err(err);
+            }
             stats.new_objects += 1;
             stats.store_growth = next_growth;
         } else {
+            // another writer placed the object first: this capture names it, so make its
+            // directory entry durable here too
             unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+            fsync_fd(bucket_dir.as_raw_fd(), "fsync", &bucket_path)?;
             stats.reused_objects += 1;
         }
 
         Ok(sha256_hex)
+    }
+
+    /// is a usable object for `sha256_hex` already in the bucket? absent is `false`. anything
+    /// at that name that is not a regular file of exactly `size` bytes, a symlink, a fifo, a
+    /// directory or a file of the wrong length, is refused, because a manifest naming it
+    /// would name an object that cannot be restored. the content itself is checked when the
+    /// object is read back, as it was before this check existed.
+    fn existing_object(
+        bucket_fd: RawFd,
+        name: &CStr,
+        object_path: &str,
+        sha256_hex: &str,
+        size: u64,
+    ) -> Result<bool, StoreError> {
+        // SAFETY: bucket_fd and name are live; O_NOFOLLOW refuses a symlink and O_NONBLOCK
+        // keeps a planted FIFO from blocking the open.
+        let fd = unsafe {
+            libc::openat(
+                bucket_fd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            return match err.raw_os_error() {
+                Some(libc::ENOENT) => Ok(false),
+                Some(libc::ELOOP) => Err(StoreError::InvalidObject {
+                    digest: sha256_hex.to_owned(),
+                    reason: "object is a symlink",
+                }),
+                _ => Err(io_err("openat", object_path, err)),
+            };
+        }
+        // SAFETY: fd was returned by openat and is uniquely owned here.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let st = fstat_fd(file.as_raw_fd(), "fstat", object_path)?;
+        if !is_reg_mode(st.st_mode) {
+            return Err(StoreError::InvalidObject {
+                digest: sha256_hex.to_owned(),
+                reason: "object is not a regular file",
+            });
+        }
+        if u64::try_from(st.st_size).ok() != Some(size) {
+            return Err(StoreError::InvalidObject {
+                digest: sha256_hex.to_owned(),
+                reason: "object size differs from the content",
+            });
+        }
+        Ok(true)
     }
 
     fn fstatat_nofollow(dir_fd: RawFd, name: &CStr, path: &str) -> Result<libc::stat, StoreError> {

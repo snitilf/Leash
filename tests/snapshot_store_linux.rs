@@ -632,13 +632,19 @@ fn an_object_already_in_the_store_is_not_written_again() {
     let ws_fd = open_dir(&ws_path);
     let store_fd = open_dir(&store_path);
 
-    capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
+    let first = capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
+    assert_eq!(first.stats.staged, 1, "a new object is staged once");
     let (manifest, _) = load_manifest(&store_fd, 0).unwrap();
     let sha = manifest.entries[0].sha256.clone().unwrap();
     let object = store_path.join("objects").join(&sha[..2]).join(&sha);
     let inode = fs::metadata(&object).unwrap().ino();
 
-    capture(&ws_fd, &store_fd, 1, &Limits::default()).unwrap();
+    let second = capture(&ws_fd, &store_fd, 1, &Limits::default()).unwrap();
+    assert_eq!(
+        second.stats.staged, 0,
+        "an object already stored is not staged"
+    );
+    assert_eq!(second.stats.new_objects, 0);
     assert_eq!(
         fs::metadata(&object).unwrap().ino(),
         inode,
@@ -649,6 +655,49 @@ fn an_object_already_in_the_store_is_not_written_again() {
         0,
         "nothing was staged for it"
     );
+}
+
+/// anything planted at an object's name that is not a regular file of the right size is
+/// refused, because a manifest naming it would name an object that cannot be restored.
+#[test]
+fn a_planted_entry_at_an_object_path_refuses_the_capture_and_publishes_no_manifest() {
+    for plant in ["symlink", "fifo", "directory", "short file"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_path = tmp.path().join("ws");
+        let store_path = tmp.path().join("store");
+        create_workspace_dir(&ws_path);
+        fs::create_dir(&store_path).unwrap();
+        fs::write(ws_path.join("one.txt"), b"alpha").unwrap();
+        let ws_fd = open_dir(&ws_path);
+        let store_fd = open_dir(&store_path);
+
+        capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
+        let (manifest, _) = load_manifest(&store_fd, 0).unwrap();
+        let sha = manifest.entries[0].sha256.clone().unwrap();
+        let object = store_path.join("objects").join(&sha[..2]).join(&sha);
+        fs::remove_file(&object).unwrap();
+        match plant {
+            "symlink" => symlink("/etc/hostname", &object).unwrap(),
+            "fifo" => {
+                let c_object = CString::new(object.as_os_str().as_bytes()).unwrap();
+                // SAFETY: c_object is NUL-terminated inside a temp directory we own.
+                assert_eq!(unsafe { libc::mkfifo(c_object.as_ptr(), 0o600) }, 0);
+            }
+            "directory" => fs::create_dir(&object).unwrap(),
+            _ => fs::write(&object, b"al").unwrap(),
+        }
+
+        let err = capture(&ws_fd, &store_fd, 1, &Limits::default()).unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidObject { .. }),
+            "{plant}: {err:?}"
+        );
+        assert_eq!(
+            published_steps(&store_fd).unwrap(),
+            vec![0],
+            "{plant}: no manifest was published for step 1"
+        );
+    }
 }
 
 #[test]

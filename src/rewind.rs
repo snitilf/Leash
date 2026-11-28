@@ -87,8 +87,10 @@ pub fn shell_quote(text: &str) -> String {
 
 /// `shell_quote` for a path, from its raw bytes: a name that is not UTF-8 is not rewritten
 /// with replacement characters, which would name a different path, but written with each
-/// invalid byte as `\xHH` inside `$'...'`. that form is bash, zsh and ksh syntax, not POSIX
-/// `sh`; a path made of valid UTF-8 without control characters is quoted for any shell.
+/// invalid byte as a three-digit octal escape `\ooo` inside `$'...'`, which is unambiguous
+/// whatever digits follow it (a `\x` escape is not, in ksh93). that form is bash and zsh
+/// syntax, not POSIX `sh`; a path made of valid UTF-8 without control characters is quoted
+/// for any shell.
 pub fn shell_quote_path(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
     shell_quote_bytes(path.as_os_str().as_bytes())
@@ -112,14 +114,14 @@ fn shell_quote_bytes(bytes: &[u8]) -> String {
                     c if c.is_control() => {
                         let mut buf = [0u8; 4];
                         for byte in c.encode_utf8(&mut buf).bytes() {
-                            quoted.push_str(&format!("\\x{byte:02x}"));
+                            quoted.push_str(&format!("\\{byte:03o}"));
                         }
                     }
                     c => quoted.push(c),
                 }
             }
             for byte in chunk.invalid() {
-                quoted.push_str(&format!("\\x{byte:02x}"));
+                quoted.push_str(&format!("\\{byte:03o}"));
             }
         }
         quoted.push('\'');
@@ -1065,9 +1067,9 @@ mod tests {
 
     #[test]
     fn control_characters_are_escaped_never_printed() {
-        assert_eq!(shell_quote("a\nb"), "$'a\\x0ab'");
-        assert_eq!(shell_quote("\x1b[2J"), "$'\\x1b[2J'");
-        assert_eq!(shell_quote("a\\b\tc'"), "$'a\\\\b\\x09c\\''");
+        assert_eq!(shell_quote("a\nb"), "$'a\\012b'");
+        assert_eq!(shell_quote("\x1b[2J"), "$'\\033[2J'");
+        assert_eq!(shell_quote("a\\b\tc'"), "$'a\\\\b\\011c\\''");
     }
 
     #[test]
@@ -1107,9 +1109,9 @@ mod tests {
     fn a_path_that_is_not_utf8_is_quoted_from_its_bytes() {
         use std::os::unix::ffi::OsStrExt;
         let path = Path::new(std::ffi::OsStr::from_bytes(b"/w/caf\xe9 dir"));
-        assert_eq!(shell_quote_path(path), "$'/w/caf\\xe9 dir'");
+        assert_eq!(shell_quote_path(path), "$'/w/caf\\351 dir'");
         let hint = rewind_hint("id", &"0".repeat(64), path, Path::new("/s"));
-        assert!(hint.contains("--workspace $'/w/caf\\xe9 dir' "), "{hint}");
+        assert!(hint.contains("--workspace $'/w/caf\\351 dir' "), "{hint}");
         assert!(!hint.contains('\u{fffd}'), "{hint}");
     }
 
