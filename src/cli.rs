@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::recorder::Attendance;
+use crate::rewind::{RewindError, RewindRequest, RewindTarget, run_rewind};
 use crate::run_diff::{DiffRunError, RefError, RunRef, parse_run_ref, run_diff};
 
 /// arguments to the `run` subcommand (docs/design/cli.md section 1).
@@ -27,8 +28,7 @@ pub struct RunArgs {
     pub ask_timeout: Option<u64>,
 }
 
-/// the parsed command line: either the one implemented subcommand, or a reserved name that
-/// parses but is not implemented yet.
+/// the parsed command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// `leash run ...`
@@ -41,14 +41,8 @@ pub enum Command {
     Runs(RunsArgs),
     /// compare the filesystem effects of two runs or steps (FR-13)
     Diff(DiffArgs),
-    /// a reserved subcommand name that parses correctly but has no implementation yet
-    NotImplemented {
-        /// the subcommand name, e.g. "diff"
-        name: &'static str,
-        /// the stable message printed to stderr; names the milestone or requirement, never
-        /// a fabricated issue number
-        message: &'static str,
-    },
+    /// restore a run's workspace to an earlier step (FR-12)
+    Rewind(RewindArgs),
 }
 
 /// arguments of `leash runs` (FR-21).
@@ -67,6 +61,25 @@ pub struct DiffArgs {
     pub old: RunRef,
     /// the newer side
     pub new: RunRef,
+    /// state directory override
+    pub state_dir: Option<PathBuf>,
+}
+
+/// arguments of `leash rewind` (docs/design/cli.md section 1, FR-12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewindArgs {
+    /// the run to rewind; a plain directory name
+    pub run_id: String,
+    /// the step to restore; absent means step 0 (unless `undo` is given)
+    pub step: Option<u64>,
+    /// restore the safety snapshot of an earlier rewind instead of a step
+    pub undo: Option<u64>,
+    /// a chain head or step digest the operator kept outside the store (lowercase hex)
+    pub expect: Option<String>,
+    /// skip the safety snapshot; the rewind then cannot be undone
+    pub no_undo: bool,
+    /// the workspace when the working directory is not it
+    pub workspace: Option<PathBuf>,
     /// state directory override
     pub state_dir: Option<PathBuf>,
 }
@@ -126,6 +139,21 @@ pub enum UsageError {
     /// a positional argument `runs` does not accept
     #[error("leash: unexpected argument '{0}'")]
     UnexpectedArgument(String),
+    /// `rewind` given no run id
+    #[error("leash: 'rewind' requires a run id: leash rewind <run-id> [--step N]")]
+    MissingRewindRun,
+    /// a `rewind` flag that takes a value was given none
+    #[error("leash: '{0}' is missing its value")]
+    MissingValue(&'static str),
+    /// `--step` or `--undo` that is not a non-negative whole number
+    #[error("leash: invalid value {1:?} for '{0}': expected a non-negative whole number")]
+    InvalidNumber(&'static str, String),
+    /// `--expect` that is not a 64-digit hexadecimal sha256
+    #[error("leash: invalid value {0:?} for '--expect': expected 64 hexadecimal digits")]
+    InvalidDigest(String),
+    /// two `rewind` flags that cannot be combined
+    #[error("leash: '{0}' cannot be combined with '{1}'")]
+    ConflictingFlags(&'static str, &'static str),
 }
 
 /// the text printed by `--help` (docs/design/cli.md section 1).
@@ -147,8 +175,14 @@ everything after '--' is the command and is passed through verbatim.
   leash diff <run-id>[:<step>] <run-id>[:<step>] [--state-dir <dir>]
                             compare the filesystem effects of two runs or steps
                             (a missing :<step> means the run's final committed step)
+  leash rewind <run-id> [--step N] [--expect <digest>] [--no-undo] [--workspace <dir>] [--state-dir <dir>]
+  leash rewind <run-id> --undo <n> [--no-undo] [--workspace <dir>] [--state-dir <dir>]
+                            restore the workspace to step N of a finished snapshot run
+                            (default step 0, before the agent started) after a safety
+                            snapshot that '--undo <n>' restores; '--no-undo' skips it.
+                            filesystem effects only: nothing sent off this machine is undone
 
-reserved subcommands, not implemented yet: rewind, runs prune
+reserved, not available yet: runs prune
 
 options:
   -h, --help                print this help and exit
@@ -187,13 +221,132 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     match first.as_str() {
         "run" => parse_run(&args[1..]).map(Command::Run),
         "diff" => parse_diff(&args[1..]).map(Command::Diff),
-        "rewind" => Ok(Command::NotImplemented {
-            name: "rewind",
-            message: "leash: 'rewind' is not implemented yet (planned: time-travel milestone M3)",
-        }),
+        "rewind" => parse_rewind(&args[1..]).map(Command::Rewind),
         "runs" => parse_runs(&args[1..]).map(Command::Runs),
         other => Err(UsageError::UnknownSubcommand(other.to_string())),
     }
+}
+
+/// does `token` spell `flag`, alone or as `flag=value`?
+fn is_flag(token: &str, flag: &str) -> bool {
+    token == flag
+        || token
+            .strip_prefix(flag)
+            .is_some_and(|rest| rest.starts_with('='))
+}
+
+/// the value of a flag that takes one, in the space or the equals form. `i` indexes the
+/// flag token and moves onto the value token in the space form.
+fn flag_value<'a>(
+    rest: &'a [String],
+    i: &mut usize,
+    flag: &'static str,
+) -> Result<&'a str, UsageError> {
+    let token = &rest[*i];
+    if token == flag {
+        *i += 1;
+        rest.get(*i)
+            .filter(|v| !v.is_empty())
+            .map(String::as_str)
+            .ok_or(UsageError::MissingValue(flag))
+    } else {
+        let value = &token[flag.len() + 1..];
+        if value.is_empty() {
+            Err(UsageError::MissingValue(flag))
+        } else {
+            Ok(value)
+        }
+    }
+}
+
+/// a plain decimal number: digits only, no sign, no whitespace, fits in a u64.
+fn parse_number(flag: &'static str, value: &str) -> Result<u64, UsageError> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(UsageError::InvalidNumber(flag, value.to_string()));
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| UsageError::InvalidNumber(flag, value.to_string()))
+}
+
+fn parse_rewind(rest: &[String]) -> Result<RewindArgs, UsageError> {
+    let mut run_id: Option<String> = None;
+    let mut step = None;
+    let mut undo = None;
+    let mut expect: Option<String> = None;
+    let mut no_undo = false;
+    let mut workspace: Option<PathBuf> = None;
+    let mut state_dir: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        let token = rest[i].as_str();
+        if is_flag(token, "--step") {
+            if step.is_some() {
+                return Err(UsageError::DuplicateFlag("--step"));
+            }
+            step = Some(parse_number("--step", flag_value(rest, &mut i, "--step")?)?);
+        } else if is_flag(token, "--undo") {
+            if undo.is_some() {
+                return Err(UsageError::DuplicateFlag("--undo"));
+            }
+            undo = Some(parse_number("--undo", flag_value(rest, &mut i, "--undo")?)?);
+        } else if is_flag(token, "--expect") {
+            if expect.is_some() {
+                return Err(UsageError::DuplicateFlag("--expect"));
+            }
+            let value = flag_value(rest, &mut i, "--expect")?;
+            if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(UsageError::InvalidDigest(value.to_string()));
+            }
+            expect = Some(value.to_ascii_lowercase());
+        } else if is_flag(token, "--workspace") {
+            if workspace.is_some() {
+                return Err(UsageError::DuplicateFlag("--workspace"));
+            }
+            workspace = Some(PathBuf::from(flag_value(rest, &mut i, "--workspace")?));
+        } else if is_flag(token, "--state-dir") {
+            if state_dir.is_some() {
+                return Err(UsageError::DuplicateFlag("--state-dir"));
+            }
+            state_dir = Some(PathBuf::from(flag_value(rest, &mut i, "--state-dir")?));
+        } else if token == "--no-undo" {
+            if no_undo {
+                return Err(UsageError::DuplicateFlag("--no-undo"));
+            }
+            no_undo = true;
+        } else if token.starts_with('-') {
+            return Err(UsageError::UnknownFlag(token.to_string()));
+        } else if run_id.is_some() {
+            return Err(UsageError::UnexpectedArgument(token.to_string()));
+        } else {
+            if token.is_empty()
+                || token == "."
+                || token == ".."
+                || token.contains('/')
+                || token.contains('\0')
+            {
+                return Err(UsageError::InvalidRunId(token.to_string()));
+            }
+            run_id = Some(token.to_string());
+        }
+        i += 1;
+    }
+    let run_id = run_id.ok_or(UsageError::MissingRewindRun)?;
+    if undo.is_some() && step.is_some() {
+        return Err(UsageError::ConflictingFlags("--undo", "--step"));
+    }
+    if undo.is_some() && expect.is_some() {
+        return Err(UsageError::ConflictingFlags("--undo", "--expect"));
+    }
+    Ok(RewindArgs {
+        run_id,
+        step,
+        undo,
+        expect,
+        no_undo,
+        workspace,
+        state_dir,
+    })
 }
 
 fn parse_diff(rest: &[String]) -> Result<DiffArgs, UsageError> {
@@ -518,10 +671,7 @@ pub fn run() -> ExitCode {
         }
         Command::Runs(args) => return dispatch_runs(args),
         Command::Diff(args) => return dispatch_diff(args),
-        Command::NotImplemented { message, .. } => {
-            eprintln!("{message}");
-            return ExitCode::from(EXIT_USAGE);
-        }
+        Command::Rewind(args) => return dispatch_rewind(args),
     };
 
     // the workspace is the canonicalized cwd; a run that cannot name its own workspace
@@ -628,6 +778,87 @@ fn dispatch_diff(args: DiffArgs) -> ExitCode {
         }
         Err(e @ DiffRunError::Failure(_)) => {
             eprintln!("{e}");
+            ExitCode::from(EXIT_SUPERVISOR_FAILURE)
+        }
+    }
+}
+
+/// resolve the workspace and state root of a rewind, run it, and map the outcome to the
+/// exit codes of cli.md section 6: a request that names something that does not exist or
+/// does not fit is 2, a failure or refusal at run time is 125.
+fn dispatch_rewind(args: RewindArgs) -> ExitCode {
+    use std::io::Write as _;
+
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("leash: cannot determine the working directory: {e}");
+            return ExitCode::from(EXIT_SUPERVISOR_FAILURE);
+        }
+    };
+    let (workspace_spelling, workspace_flag) = match &args.workspace {
+        Some(dir) => (cwd.join(dir), true),
+        None => (cwd.clone(), false),
+    };
+    let workspace = match workspace_spelling.canonicalize() {
+        Ok(dir) => dir,
+        Err(e) if workspace_flag => {
+            eprintln!(
+                "leash: cannot resolve the workspace {}: {e}",
+                workspace_spelling.display()
+            );
+            return ExitCode::from(EXIT_USAGE);
+        }
+        Err(e) => {
+            eprintln!("leash: cannot canonicalize the workspace: {e}");
+            return ExitCode::from(EXIT_SUPERVISOR_FAILURE);
+        }
+    };
+    let candidate = match args.state_dir.clone().or_else(|| {
+        let xdg = std::env::var("XDG_STATE_HOME").ok();
+        let home = std::env::var("HOME").ok();
+        crate::recorder::default_state_root(xdg.as_deref(), home.as_deref())
+    }) {
+        Some(root) => root,
+        None => {
+            eprintln!("leash: no state directory: set XDG_STATE_HOME or HOME, or pass --state-dir");
+            return ExitCode::from(EXIT_SUPERVISOR_FAILURE);
+        }
+    };
+    let state_root = match resolve_state_root(&cwd, &workspace, &candidate) {
+        Ok(root) => root,
+        Err(e @ StateDirError::InsideWorkspace { .. }) => {
+            eprintln!("{e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+        Err(e) => {
+            eprintln!("leash: {e}");
+            return ExitCode::from(EXIT_SUPERVISOR_FAILURE);
+        }
+    };
+    let request = RewindRequest {
+        run_id: args.run_id,
+        target: match args.undo {
+            Some(n) => RewindTarget::Undo(n),
+            None => RewindTarget::Step(args.step.unwrap_or(0)),
+        },
+        expect: args.expect,
+        no_undo: args.no_undo,
+        workspace,
+        state_root,
+    };
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    let result = run_rewind(&request, &mut stdout, &mut stderr);
+    let _ = stdout.flush();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e @ RewindError::Usage(_)) => {
+            let _ = writeln!(stderr, "{e}");
+            ExitCode::from(EXIT_USAGE)
+        }
+        Err(e @ RewindError::Failure(_)) => {
+            let _ = writeln!(stderr, "{e}");
             ExitCode::from(EXIT_SUPERVISOR_FAILURE)
         }
     }
@@ -1146,7 +1377,9 @@ mod tests {
             "--ask-timeout",
             "-h, --help",
             "-V, --version",
-            "rewind, runs prune",
+            "leash rewind <run-id> [--step N] [--expect <digest>] [--no-undo]",
+            "--undo <n>",
+            "reserved, not available yet: runs prune",
             "leash diff <run-id>[:<step>] <run-id>[:<step>]",
         ] {
             assert!(HELP.contains(needle), "{needle}");
@@ -1239,19 +1472,138 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_rewind_is_not_implemented() {
-        let cmd = parse(&args(&["rewind"])).unwrap();
-        match cmd {
-            Command::NotImplemented { name, message } => {
-                assert_eq!(name, "rewind");
-                assert_eq!(
-                    message,
-                    "leash: 'rewind' is not implemented yet (planned: time-travel milestone M3)"
-                );
-            }
-            other => panic!("expected NotImplemented, got {other:?}"),
+    fn rewind(v: &[&str]) -> Result<RewindArgs, UsageError> {
+        let mut argv = vec!["rewind"];
+        argv.extend_from_slice(v);
+        match parse(&args(&argv))? {
+            Command::Rewind(a) => Ok(a),
+            other => panic!("expected Rewind, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_rewind_minimal_and_full() {
+        assert_eq!(
+            rewind(&["r1"]).unwrap(),
+            RewindArgs {
+                run_id: "r1".into(),
+                step: None,
+                undo: None,
+                expect: None,
+                no_undo: false,
+                workspace: None,
+                state_dir: None,
+            }
+        );
+        let digest = "AB".repeat(32);
+        let full = rewind(&[
+            "r1",
+            "--step",
+            "3",
+            "--expect",
+            &digest,
+            "--no-undo",
+            "--workspace=/w",
+            "--state-dir",
+            "/s",
+        ])
+        .unwrap();
+        assert_eq!(full.step, Some(3));
+        assert_eq!(
+            full.expect,
+            Some("ab".repeat(32)),
+            "digests normalize to lowercase"
+        );
+        assert!(full.no_undo);
+        assert_eq!(full.workspace, Some(PathBuf::from("/w")));
+        assert_eq!(full.state_dir, Some(PathBuf::from("/s")));
+        // flags may come before the run id, and the equals forms work
+        let early = rewind(&["--step=0", "r1"]).unwrap();
+        assert_eq!((early.run_id.as_str(), early.step), ("r1", Some(0)));
+        assert_eq!(rewind(&["r1", "--undo", "2"]).unwrap().undo, Some(2));
+        assert!(rewind(&["r1", "--undo=2", "--no-undo"]).is_ok());
+    }
+
+    #[test]
+    fn parse_rewind_usage_errors() {
+        assert_eq!(rewind(&[]), Err(UsageError::MissingRewindRun));
+        assert_eq!(
+            rewind(&["--no-undo"]),
+            Err(UsageError::MissingRewindRun),
+            "flags alone name no run"
+        );
+        for bad in ["", ".", "..", "a/b", "../x"] {
+            assert_eq!(
+                rewind(&[bad]),
+                Err(UsageError::InvalidRunId(bad.into())),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            rewind(&["r", "s"]),
+            Err(UsageError::UnexpectedArgument("s".into()))
+        );
+        assert_eq!(
+            rewind(&["r", "--force"]),
+            Err(UsageError::UnknownFlag("--force".into()))
+        );
+        for bad in ["x", "-1", "+1", "1.5", " 1", "", "99999999999999999999"] {
+            assert_eq!(
+                rewind(&["r", "--step", bad]),
+                if bad.is_empty() {
+                    Err(UsageError::MissingValue("--step"))
+                } else {
+                    Err(UsageError::InvalidNumber("--step", bad.into()))
+                },
+                "--step {bad:?}"
+            );
+        }
+        assert_eq!(
+            rewind(&["r", "--undo", "x"]),
+            Err(UsageError::InvalidNumber("--undo", "x".into()))
+        );
+        assert_eq!(
+            rewind(&["r", "--step"]),
+            Err(UsageError::MissingValue("--step"))
+        );
+        assert_eq!(
+            rewind(&["r", "--step="]),
+            Err(UsageError::MissingValue("--step"))
+        );
+        assert_eq!(
+            rewind(&["r", "--workspace"]),
+            Err(UsageError::MissingValue("--workspace"))
+        );
+        for bad in ["abc", &"g".repeat(64), &"a".repeat(63), &"a".repeat(65)] {
+            assert_eq!(
+                rewind(&["r", "--expect", bad]),
+                Err(UsageError::InvalidDigest(bad.to_string())),
+                "{bad:?}"
+            );
+        }
+        let digest = "a".repeat(64);
+        let expect_eq = format!("--expect={digest}");
+        for flag in ["--step=1", "--workspace=/a", "--state-dir=/a", &expect_eq] {
+            assert!(
+                matches!(
+                    rewind(&["r", flag, flag]),
+                    Err(UsageError::DuplicateFlag(_))
+                ),
+                "{flag}"
+            );
+        }
+        assert_eq!(
+            rewind(&["r", "--no-undo", "--no-undo"]),
+            Err(UsageError::DuplicateFlag("--no-undo"))
+        );
+        assert_eq!(
+            rewind(&["r", "--undo", "1", "--step", "0"]),
+            Err(UsageError::ConflictingFlags("--undo", "--step"))
+        );
+        assert_eq!(
+            rewind(&["r", "--undo", "1", "--expect", &"a".repeat(64)]),
+            Err(UsageError::ConflictingFlags("--undo", "--expect"))
+        );
     }
 
     #[test]

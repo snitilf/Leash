@@ -79,8 +79,10 @@ pub fn run_diff(_state_root: &Path, _old: &RunRef, _new: &RunRef) -> Result<Stri
     ))
 }
 
+/// open `path` as a directory relative to `parent` (or the working directory), refusing a
+/// final symlink unless `follow`. `rewind` opens the same run layout through it.
 #[cfg(target_os = "linux")]
-fn open_dir_at(
+pub(crate) fn open_dir_at(
     parent: Option<&std::fs::File>,
     path: &std::ffi::CStr,
     follow: bool,

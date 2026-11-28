@@ -236,10 +236,7 @@ fn usage_and_reserved_subcommands_exit_2() {
             "given twice",
         ),
         (vec!["frobnicate"], "unknown"),
-        (
-            vec!["rewind"],
-            "leash: 'rewind' is not implemented yet (planned: time-travel milestone M3)",
-        ),
+        (vec!["rewind"], "'rewind' requires a run id"),
         (vec!["runs", "prune"], "requires at least one run id"),
     ] {
         let out = run_leash(&args, ws.path());

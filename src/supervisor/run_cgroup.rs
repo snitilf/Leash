@@ -346,6 +346,46 @@ impl RunLock {
         }
     }
 
+    /// take the lock of an existing run through a pinned run directory handle, for `leash
+    /// rewind`. `run.lock` is opened relative to `run_dir` with `O_NOFOLLOW | O_NONBLOCK |
+    /// O_CLOEXEC` and created when missing (a run that never took one holds nothing), then
+    /// checked to be a regular file. returns `Ok(None)` when another process holds the lock,
+    /// which means the run is alive, and `Err` for a symlink, a fifo or any other
+    /// non-regular file.
+    pub fn try_acquire_in(run_dir: &File) -> io::Result<Option<Self>> {
+        // SAFETY: run_dir is a live directory descriptor and the name is nul-terminated;
+        // openat returns a fresh descriptor or -1.
+        let fd = unsafe {
+            libc::openat(
+                run_dir.as_raw_fd(),
+                c"run.lock".as_ptr(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd was returned by openat and is uniquely owned here.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "run.lock is not a regular file",
+            ));
+        }
+        let identity = lock_identity_from_meta(&meta);
+        Ok(flock_nonblocking(&file)?.then_some(Self {
+            _file: file,
+            identity,
+        }))
+    }
+
     /// `<st_dev>:<st_ino>` of the locked regular file, stamped onto the run cgroup's
     /// `user.leash.lock` xattr so a copied state root cannot match a live run's cgroup.
     pub fn identity(&self) -> &str {
