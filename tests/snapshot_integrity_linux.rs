@@ -1159,6 +1159,30 @@ if others:
 }
 
 #[test]
+fn mkdir_of_the_workspace_root_is_eexist_like_the_kernel_answers_it() {
+    let _guard = spawn_lock();
+    if !delegated("anchor_root_mkdir") {
+        return;
+    }
+    let session = Session::new();
+    let ws = session.ws();
+    let script = r#"
+import errno, os
+os.chdir(@WS@)
+for what, call in (('absolute', lambda: os.mkdir(@WS@)), ('dot', lambda: os.mkdir('.'))):
+    try:
+        call()
+    except OSError as e:
+        assert e.errno == errno.EEXIST, (what, e)
+    else:
+        raise SystemExit('mkdir of the root succeeded: ' + what)
+"#
+    .replace("@WS@", &format!("{:?}", ws.to_string_lossy()));
+    let run = session.python(&script).unwrap();
+    run.assert_exit_zero();
+}
+
+#[test]
 fn tar_extracting_into_the_workspace_root_restores_the_time_of_dot() {
     let _guard = spawn_lock();
     if !delegated("anchor_root_tar") {
