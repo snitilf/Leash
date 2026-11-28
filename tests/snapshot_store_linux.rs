@@ -13,8 +13,8 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 
 use leash::snapshot::store::{
-    DEFAULT_MAX_FILE_SIZE, EntryKind, Limits, StoreError, capture, capture_gated, load_manifest,
-    published_steps, verify_object,
+    DEFAULT_MAX_FILE_SIZE, EntryKind, Limits, StoreError, TRACE_LINE_CAP, TRACE_READ_CAP, capture,
+    capture_gated, committed_steps_from_trace, load_manifest, published_steps, verify_object,
 };
 
 fn open_dir(path: &Path) -> File {
@@ -610,4 +610,196 @@ fn a_refused_before_publish_check_publishes_no_manifest_and_leaves_no_staging_fi
     // the refused step can be captured again: nothing was left behind to collide with
     capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
     assert_eq!(published_steps(&store_fd).unwrap(), vec![0]);
+}
+
+// ---------------------------------------------------------------------------------------
+// the committed steps of a run come from its trace, not from the manifests on disk
+// ---------------------------------------------------------------------------------------
+
+fn step_line(seq: u64, step: u64) -> String {
+    format!(
+        r#"{{"seq":{seq},"ts":1,"type":"step","step":{step},"manifest_digest":"{}"}}"#,
+        "ab".repeat(32)
+    )
+}
+
+fn failed_line(seq: u64, step: u64, phase: &str) -> String {
+    format!(
+        r#"{{"seq":{seq},"ts":1,"type":"capture_failed","step":{step},"phase":"{phase}","error":"x"}}"#
+    )
+}
+
+fn trace_dir(lines: &[String]) -> (tempfile::TempDir, File) {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("trace.jsonl"), lines.join("\n") + "\n").unwrap();
+    let handle = open_dir(dir.path());
+    (dir, handle)
+}
+
+#[test]
+fn committed_steps_are_the_step_events_in_the_trace() {
+    let (_dir, run) = trace_dir(&[
+        r#"{"seq":0,"ts":1,"type":"run_start"}"#.into(),
+        step_line(1, 0),
+        r#"{"seq":2,"ts":1,"type":"syscall","decision":"allow"}"#.into(),
+        step_line(3, 1),
+        step_line(4, 2),
+    ]);
+    assert_eq!(committed_steps_from_trace(&run).unwrap(), vec![0, 1, 2]);
+}
+
+#[test]
+fn an_orphan_manifest_is_published_but_not_committed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run_path = tmp.path().join("run");
+    let ws_path = tmp.path().join("ws");
+    fs::create_dir(&run_path).unwrap();
+    fs::create_dir(run_path.join("snapshots")).unwrap();
+    create_workspace_dir(&ws_path);
+    let store_fd = open_dir(&run_path.join("snapshots"));
+    let ws_fd = open_dir(&ws_path);
+    capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
+    capture(&ws_fd, &store_fd, 1, &Limits::default()).unwrap();
+    // step 1's event never became durable
+    fs::write(
+        run_path.join("trace.jsonl"),
+        [step_line(0, 0), failed_line(1, 1, "step_event")].join("\n") + "\n",
+    )
+    .unwrap();
+    let run = open_dir(&run_path);
+    assert_eq!(published_steps(&store_fd).unwrap(), vec![0, 1]);
+    assert_eq!(committed_steps_from_trace(&run).unwrap(), vec![0]);
+}
+
+#[test]
+fn only_a_step_event_failure_for_the_same_step_uncommits_it() {
+    // thaw, capture, frozen_check and freeze failures leave the committed set alone: after a
+    // thaw failure the step event was already durable, and the others never wrote one
+    for phase in ["thaw", "capture", "frozen_check", "freeze"] {
+        let (_dir, run) = trace_dir(&[step_line(0, 0), step_line(1, 1), failed_line(2, 1, phase)]);
+        assert_eq!(
+            committed_steps_from_trace(&run).unwrap(),
+            vec![0, 1],
+            "{phase}"
+        );
+    }
+    // a step_event failure for a different step changes nothing either
+    let (_dir, run) = trace_dir(&[
+        step_line(0, 0),
+        step_line(1, 1),
+        failed_line(2, 2, "step_event"),
+    ]);
+    assert_eq!(committed_steps_from_trace(&run).unwrap(), vec![0, 1]);
+    // and one for the step just written removes exactly that step
+    let (_dir, run) = trace_dir(&[
+        step_line(0, 0),
+        step_line(1, 1),
+        failed_line(2, 1, "step_event"),
+    ]);
+    assert_eq!(committed_steps_from_trace(&run).unwrap(), vec![0]);
+}
+
+#[test]
+fn text_an_agent_controls_cannot_forge_a_step_event() {
+    // a syscall event whose recorded path spells a step event: JSON escapes its quotes
+    let forged = serde_json::json!({
+        "seq": 1, "ts": 1, "type": "syscall",
+        "fact": {"path": r#"x","type":"step","step":9,"y":""#},
+    })
+    .to_string();
+    let (_dir, run) = trace_dir(&[step_line(0, 0), forged]);
+    assert_eq!(committed_steps_from_trace(&run).unwrap(), vec![0]);
+}
+
+#[test]
+fn a_final_line_torn_by_a_crash_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut text = [step_line(0, 0), step_line(1, 1)].join("\n");
+    text.push('\n');
+    text.push_str(r#"{"seq":2,"ts":1,"type":"step","step":2"#);
+    fs::write(dir.path().join("trace.jsonl"), text).unwrap();
+    assert_eq!(
+        committed_steps_from_trace(&open_dir(dir.path())).unwrap(),
+        vec![0, 1]
+    );
+}
+
+#[test]
+fn a_malformed_or_non_ascending_step_event_is_an_invalid_trace() {
+    for lines in [
+        vec![
+            step_line(0, 0),
+            r#"{"seq":1,"type":"step","step":"one"}"#.to_string(),
+        ],
+        vec![step_line(0, 0), r#"{"seq":1,"type":"step"}"#.to_string()],
+        vec![step_line(0, 1), step_line(1, 1)],
+        vec![step_line(0, 2), step_line(1, 1)],
+        vec![
+            step_line(0, 0),
+            r#"{"type":"step","step":1 not json"#.to_string(),
+        ],
+    ] {
+        let (_dir, run) = trace_dir(&lines);
+        let err = committed_steps_from_trace(&run).unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidTrace { .. }),
+            "{lines:?}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn a_symlinked_or_special_trace_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    fs::write(&real, step_line(0, 0) + "\n").unwrap();
+    symlink(&real, dir.path().join("trace.jsonl")).unwrap();
+    let err = committed_steps_from_trace(&open_dir(dir.path())).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidTrace { reason } if reason.contains("symlink")),
+        "{err:?}"
+    );
+
+    let fifo_dir = tempfile::tempdir().unwrap();
+    let fifo = CString::new(fifo_dir.path().join("trace.jsonl").as_os_str().as_bytes()).unwrap();
+    // SAFETY: fifo is NUL-terminated inside a directory this test owns.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let err = committed_steps_from_trace(&open_dir(fifo_dir.path())).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidTrace { reason } if reason.contains("not a regular file")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn an_oversized_trace_or_line_is_refused_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = File::create(dir.path().join("trace.jsonl")).unwrap();
+    // sparse: nothing is written, and the size alone must refuse it
+    big.set_len(TRACE_READ_CAP + 1).unwrap();
+    let err = committed_steps_from_trace(&open_dir(dir.path())).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidTrace { reason } if reason.contains("read cap")),
+        "{err:?}"
+    );
+
+    let long = tempfile::tempdir().unwrap();
+    let mut text = "x".repeat(TRACE_LINE_CAP + 10);
+    text.push('\n');
+    fs::write(long.path().join("trace.jsonl"), text).unwrap();
+    let err = committed_steps_from_trace(&open_dir(long.path())).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidTrace { reason } if reason.contains("longer than")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_missing_trace_is_a_not_found_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = committed_steps_from_trace(&open_dir(dir.path())).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound),
+        "{err:?}"
+    );
 }

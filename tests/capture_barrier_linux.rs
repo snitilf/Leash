@@ -37,7 +37,9 @@ use std::time::{Duration, Instant};
 use leash::cli::session_exit_code;
 use leash::recorder::{AskResolution, Attendance, CapturePhase, Mode};
 use leash::snapshot::restore::recompute_chain;
-use leash::snapshot::store::{EntryKind, Limits, load_manifest, published_steps, verify_object};
+use leash::snapshot::store::{
+    EntryKind, Limits, committed_steps_from_trace, load_manifest, published_steps, verify_object,
+};
 use leash::supervisor::barrier::BarrierOps;
 use leash::supervisor::cgroup::Cgroup;
 use leash::supervisor::run::RunError;
@@ -233,6 +235,11 @@ fn tree(pairs: &[(&str, &str)]) -> BTreeMap<String, Vec<u8>> {
         .collect()
 }
 
+/// the committed steps of a run as `leash diff` and rewind read them: from the trace.
+fn committed_of(run: &Path) -> Vec<u64> {
+    committed_steps_from_trace(&File::open(run).unwrap()).unwrap()
+}
+
 fn step_numbers(events: &[Value]) -> Vec<u64> {
     of_type(events, "step")
         .iter()
@@ -257,8 +264,9 @@ fn assert_digests_and_chain(run: &Path, events: &[Value]) {
         );
     }
     assert_eq!(step_numbers(events), published_steps(&store).unwrap());
+    assert_eq!(step_numbers(events), committed_of(run));
     assert_eq!(step_numbers(events)[0], 0, "step 0 is the first step event");
-    let chain = recompute_chain(&store).unwrap();
+    let chain = recompute_chain(&store, &committed_of(run)).unwrap();
     let end = of_type(events, "run_end");
     assert_eq!(end.len(), 1);
     assert_eq!(end[0]["chain_head"], chain.head);
@@ -1448,7 +1456,7 @@ fn each_digest_is_printed_as_its_step_commits_and_run_end_carries_the_chain_head
     let events = events_of(&run);
     assert_digests_and_chain(&run, &events);
     let store = open_store(&run);
-    let chain = recompute_chain(&store).unwrap();
+    let chain = recompute_chain(&store, &committed_of(&run)).unwrap();
     assert!(chain.digests.len() >= 3, "{:?}", chain.digests);
     for (step, digest) in &chain.digests {
         assert!(
