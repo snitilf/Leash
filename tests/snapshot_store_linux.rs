@@ -26,14 +26,10 @@ fn open_dir(path: &Path) -> File {
         .unwrap()
 }
 
-/// create a test workspace directory and strip any inherited `system.posix_acl_default`
-/// from `/tmp` so newly created subdirectories inside the test fixture do not inherit
-/// host-level default ACLs (which `capture` intentionally refuses as unsupported metadata).
+/// create a test workspace directory. it keeps any default ACL its parent hands down, as a
+/// `/tmp` with default ACLs does, because `capture` records ACLs.
 fn create_workspace_dir(path: &Path) {
     fs::create_dir(path).unwrap();
-    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
-    // SAFETY: c_path and the static attribute name are NUL-terminated.
-    let _ = unsafe { libc::removexattr(c_path.as_ptr(), c"system.posix_acl_default".as_ptr()) };
 }
 
 fn set_mtime(path: &Path, sec: i64, nsec: i64) {
@@ -184,6 +180,198 @@ fn exact_round_trip_preserves_content_metadata_symlink_empty_dir_and_xattr() {
         .unwrap();
     assert_eq!(link.kind, EntryKind::Symlink);
     assert_eq!(link.target.as_deref(), Some("sub/nested.bin"));
+}
+
+const ACL_ACCESS: &str = "system.posix_acl_access";
+const ACL_DEFAULT: &str = "system.posix_acl_default";
+
+/// a POSIX ACL xattr value: `(tag, perm, id)` entries behind the version 2 header.
+fn acl_blob(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut out = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in entries {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&perm.to_le_bytes());
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    out
+}
+
+/// raw `setxattr`; returns the error instead of panicking so callers can decide.
+fn set_xattr_raw(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let c_name = CString::new(name).unwrap();
+    // SAFETY: c_path and c_name are NUL-terminated and value is a valid byte slice.
+    let rc = unsafe {
+        libc::setxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn get_xattr_raw(path: &Path, name: &str) -> Option<Vec<u8>> {
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let c_name = CString::new(name).unwrap();
+    let mut buf = vec![0u8; 4096];
+    // SAFETY: c_path and c_name are NUL-terminated and buf has `buf.len()` writable bytes.
+    let n = unsafe {
+        libc::getxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        let err = std::io::Error::last_os_error();
+        assert_eq!(err.raw_os_error(), Some(libc::ENODATA), "{err}");
+        return None;
+    }
+    buf.truncate(n as usize);
+    Some(buf)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// whether this filesystem takes ACLs; an unsupported one skips the test and says so, unless
+/// `LEASH_REQUIRE_XATTR=1`, which turns the skip into a failure.
+fn acl_supported(path: &Path, probe: &[u8]) -> bool {
+    match set_xattr_raw(path, ACL_DEFAULT, probe) {
+        Ok(()) => true,
+        Err(err) => {
+            assert!(
+                matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP | libc::ENOSYS)),
+                "unexpected setxattr failure on {}: {err}",
+                path.display()
+            );
+            assert!(
+                std::env::var("LEASH_REQUIRE_XATTR").as_deref() != Ok("1"),
+                "LEASH_REQUIRE_XATTR=1 but {} does not support ACLs: {err}",
+                path.display()
+            );
+            eprintln!(
+                "SKIPPED ACL coverage: {} does not support ACLs ({err}); set LEASH_REQUIRE_XATTR=1 to fail instead",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
+#[test]
+fn a_workspace_under_a_default_acl_is_captured_with_its_acl_values() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("parent");
+    let store_path = tmp.path().join("store");
+    fs::create_dir(&parent).unwrap();
+    fs::create_dir(&store_path).unwrap();
+    // setfacl -d -m u::rwx,u:4242:rwx,g::r-x,m::rwx,o::--- on the parent
+    let default = acl_blob(&[
+        (0x01, 7, u32::MAX),
+        (0x02, 7, 4242),
+        (0x04, 5, u32::MAX),
+        (0x10, 7, u32::MAX),
+        (0x20, 0, u32::MAX),
+    ]);
+    if !acl_supported(&parent, &default) {
+        return;
+    }
+    // the workspace and everything made in it inherits from the parent
+    let ws_path = parent.join("ws");
+    fs::create_dir(&ws_path).unwrap();
+    fs::write(ws_path.join("file"), b"data").unwrap();
+    fs::create_dir(ws_path.join("dir")).unwrap();
+    fs::write(ws_path.join("dir/inner"), b"inner").unwrap();
+
+    let ws_fd = open_dir(&ws_path);
+    let store_fd = open_dir(&store_path);
+    capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
+    let (manifest, _) = load_manifest(&store_fd, 0).unwrap();
+
+    let entry = |p: &str| manifest.entries.iter().find(|e| e.path == p).unwrap();
+    for p in ["file", "dir", "dir/inner"] {
+        let access = get_xattr_raw(&ws_path.join(p), ACL_ACCESS)
+            .unwrap_or_else(|| panic!("{p} inherited no access ACL"));
+        assert_eq!(
+            entry(p).xattrs.get(ACL_ACCESS).map(String::as_str),
+            Some(hex(&access).as_str()),
+            "{p}"
+        );
+        assert_eq!(
+            entry(p).mode,
+            fs::metadata(ws_path.join(p)).unwrap().mode() & 0o7777
+        );
+    }
+    assert_eq!(
+        entry("dir").xattrs.get(ACL_DEFAULT).map(String::as_str),
+        Some(hex(&default).as_str())
+    );
+    assert!(!entry("file").xattrs.contains_key(ACL_DEFAULT));
+    assert!(!entry("dir/inner").xattrs.contains_key(ACL_DEFAULT));
+}
+
+#[test]
+fn a_workspace_under_the_default_tmp_is_captured() {
+    // whatever default ACL the host's /tmp carries is inherited by the workspace and the
+    // directories in it; capture must accept it rather than refuse the whole workspace
+    let tmp = tempfile::tempdir_in("/tmp").unwrap();
+    let ws_path = tmp.path().join("ws");
+    let store_path = tmp.path().join("store");
+    fs::create_dir(&ws_path).unwrap();
+    fs::create_dir(&store_path).unwrap();
+    fs::create_dir(ws_path.join("dir")).unwrap();
+    fs::write(ws_path.join("dir/f"), b"x").unwrap();
+    let ws_fd = open_dir(&ws_path);
+    let store_fd = open_dir(&store_path);
+    capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
+    let (manifest, _) = load_manifest(&store_fd, 0).unwrap();
+    let dir = manifest.entries.iter().find(|e| e.path == "dir").unwrap();
+    assert_eq!(
+        dir.xattrs.get(ACL_DEFAULT).map(String::as_str),
+        get_xattr_raw(&ws_path.join("dir"), ACL_DEFAULT)
+            .map(|v| hex(&v))
+            .as_deref()
+    );
+}
+
+#[test]
+fn a_trusted_xattr_is_still_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_path = tmp.path().join("ws");
+    let store_path = tmp.path().join("store");
+    create_workspace_dir(&ws_path);
+    fs::create_dir(&store_path).unwrap();
+    fs::write(ws_path.join("f"), b"x").unwrap();
+    match set_xattr_raw(&ws_path.join("f"), "trusted.leash.test", b"v") {
+        Ok(()) => {}
+        Err(err) if matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES)) => {
+            eprintln!("SKIPPED trusted.* refusal: setting it needs CAP_SYS_ADMIN ({err})");
+            return;
+        }
+        Err(err) if matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP | libc::ENOSYS)) => {
+            eprintln!("SKIPPED trusted.* refusal: not supported here ({err})");
+            return;
+        }
+        Err(err) => panic!("unexpected setxattr failure: {err}"),
+    }
+    let ws_fd = open_dir(&ws_path);
+    let store_fd = open_dir(&store_path);
+    let err = capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::UnsupportedMetadata { attr, .. } if attr == "trusted.leash.test"),
+        "{err}"
+    );
+    assert!(published_steps(&store_fd).unwrap().is_empty());
 }
 
 #[test]

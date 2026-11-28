@@ -24,12 +24,10 @@ fn open_dir(path: &Path) -> File {
         .unwrap()
 }
 
-/// create a directory and strip inherited default acls so capture does not refuse it.
+/// create a directory. it keeps whatever default ACL its parent hands down (a `/tmp` with
+/// default ACLs does), because capture and restore now carry ACLs.
 fn create_dir(path: &Path) {
     fs::create_dir(path).unwrap();
-    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
-    // SAFETY: c_path and the static attribute name are NUL-terminated.
-    let _ = unsafe { libc::removexattr(c_path.as_ptr(), c"system.posix_acl_default".as_ptr()) };
 }
 
 fn set_mtime(path: &Path, sec: i64, nsec: i64) {
@@ -1498,4 +1496,348 @@ fn a_failed_apply_is_undone_by_restoring_the_safety_snapshot() {
     assert_eq!(fs::read(fx.ws.join("a")).unwrap(), b"a-new");
     assert_eq!(fs::read(fx.ws.join("added")).unwrap(), b"added");
     assert_eq!(fs::read(fx.ws.join("zz")).unwrap(), b"zz-new!");
+}
+
+// ---- POSIX ACLs ----
+
+const ACCESS: &str = "system.posix_acl_access";
+const DEFAULT: &str = "system.posix_acl_default";
+const NAMED_UID: u32 = 4242;
+const OTHER_UID: u32 = 4243;
+
+/// a POSIX ACL xattr value: `(tag, perm, id)` entries behind the version 2 header.
+fn acl_blob(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut out = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in entries {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&perm.to_le_bytes());
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    out
+}
+
+/// owner, one named user, group, mask and other, in the order the kernel stores them.
+fn ext_acl(owner: u16, user: (u32, u16), group: u16, mask: u16, other: u16) -> Vec<u8> {
+    acl_blob(&[
+        (0x01, owner, u32::MAX),
+        (0x02, user.1, user.0),
+        (0x04, group, u32::MAX),
+        (0x10, mask, u32::MAX),
+        (0x20, other, u32::MAX),
+    ])
+}
+
+/// set an ACL attribute. returns false, after saying why, only when the filesystem does not
+/// support ACLs; `LEASH_REQUIRE_XATTR=1` turns that into a failure.
+fn try_set_acl(path: &Path, name: &str, value: &[u8]) -> bool {
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let c_name = CString::new(name).unwrap();
+    // SAFETY: c_path and c_name are NUL-terminated and value is a valid byte slice.
+    let rc = unsafe {
+        libc::setxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if rc == 0 {
+        return true;
+    }
+    let err = std::io::Error::last_os_error();
+    assert!(
+        matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP | libc::ENOSYS)),
+        "unexpected setxattr failure on {}: {err}",
+        path.display()
+    );
+    assert!(
+        std::env::var("LEASH_REQUIRE_XATTR").as_deref() != Ok("1"),
+        "LEASH_REQUIRE_XATTR=1 but {} does not support ACLs: {err}",
+        path.display()
+    );
+    eprintln!(
+        "SKIPPED ACL coverage: {} does not support ACLs ({err}); set LEASH_REQUIRE_XATTR=1 to fail instead",
+        path.display()
+    );
+    false
+}
+
+fn remove_acl(path: &Path, name: &str) {
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let c_name = CString::new(name).unwrap();
+    // SAFETY: c_path and c_name are NUL-terminated.
+    let rc = unsafe { libc::removexattr(c_path.as_ptr(), c_name.as_ptr()) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        assert_eq!(err.raw_os_error(), Some(libc::ENODATA), "{err}");
+    }
+}
+
+fn get_xattr(path: &Path, name: &str) -> Option<Vec<u8>> {
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let c_name = CString::new(name).unwrap();
+    let mut buf = vec![0u8; 4096];
+    // SAFETY: c_path and c_name are NUL-terminated and buf has `buf.len()` writable bytes.
+    let n = unsafe {
+        libc::getxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        let err = std::io::Error::last_os_error();
+        assert_eq!(err.raw_os_error(), Some(libc::ENODATA), "{err}");
+        return None;
+    }
+    buf.truncate(n as usize);
+    Some(buf)
+}
+
+/// the mode and both raw ACL values of an entry, the state restore must reproduce exactly.
+type AclState = (u32, Option<Vec<u8>>, Option<Vec<u8>>);
+
+fn acl_state(path: &Path) -> AclState {
+    (
+        mode_of(path),
+        get_xattr(path, ACCESS),
+        get_xattr(path, DEFAULT),
+    )
+}
+
+#[test]
+fn acls_and_modes_survive_a_round_trip_exactly() {
+    let fx = Fixture::new();
+    if root_guard(&fx) {
+        return;
+    }
+    let ws = &fx.ws;
+    fs::write(ws.join("f"), b"file").unwrap();
+    if !try_set_acl(&ws.join("f"), ACCESS, &ext_acl(6, (NAMED_UID, 4), 4, 4, 0)) {
+        return;
+    }
+    fs::write(ws.join("g"), b"gone and back").unwrap();
+    assert!(try_set_acl(
+        &ws.join("g"),
+        ACCESS,
+        &ext_acl(6, (NAMED_UID, 6), 4, 6, 4)
+    ));
+    fs::write(ws.join("plain"), b"no acl").unwrap();
+    create_dir(&ws.join("d"));
+    assert!(try_set_acl(
+        &ws.join("d"),
+        ACCESS,
+        &ext_acl(7, (NAMED_UID, 5), 5, 5, 0)
+    ));
+    assert!(try_set_acl(
+        &ws.join("d"),
+        DEFAULT,
+        &ext_acl(7, (NAMED_UID, 7), 5, 7, 0)
+    ));
+    // created under the default ACL of `d`, so it inherits an access ACL
+    fs::write(ws.join("d/inner"), b"inner").unwrap();
+    create_dir(&ws.join("d/sub"));
+    create_dir(&ws.join("gone-dir"));
+    assert!(try_set_acl(
+        &ws.join("gone-dir"),
+        DEFAULT,
+        &acl_blob(&[
+            (0x01, 7, u32::MAX),
+            (0x04, 5, u32::MAX),
+            (0x20, 0, u32::MAX)
+        ])
+    ));
+    // pin the directory mtimes the creations above moved
+    for (i, name) in ["d/sub", "d", "gone-dir"].iter().enumerate() {
+        set_mtime(&ws.join(name), 1_500_000_000 + i as i64, 0);
+    }
+
+    let paths = ["f", "g", "plain", "d", "d/inner", "d/sub", "gone-dir"];
+    let before: Vec<AclState> = paths.iter().map(|p| acl_state(&ws.join(p))).collect();
+    assert!(before[0].1.is_some() && before[3].1.is_some() && before[3].2.is_some());
+    assert!(before[4].1.is_some(), "d/inner inherited an access ACL");
+    let base = fx.capture(0);
+    for (path, state) in paths.iter().zip(&before) {
+        let entry = base.entries.iter().find(|e| e.path == *path).unwrap();
+        let hex = |v: &Option<Vec<u8>>| {
+            v.as_ref()
+                .map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+        };
+        assert_eq!(entry.xattrs.get(ACCESS), hex(&state.1).as_ref(), "{path}");
+        assert_eq!(entry.xattrs.get(DEFAULT), hex(&state.2).as_ref(), "{path}");
+        assert_eq!(entry.mode, state.0, "{path}");
+    }
+
+    // mutate every way an ACL can move: new value, chmod rewriting the mask, removal,
+    // adding one where there was none, and entries replaced by new inodes
+    assert!(try_set_acl(
+        &ws.join("f"),
+        ACCESS,
+        &ext_acl(6, (OTHER_UID, 6), 6, 6, 0)
+    ));
+    chmod(&ws.join("f"), 0o604);
+    chmod(&ws.join("g"), 0o600);
+    remove_acl(&ws.join("d"), DEFAULT);
+    assert!(try_set_acl(
+        &ws.join("d"),
+        ACCESS,
+        &ext_acl(7, (OTHER_UID, 7), 7, 7, 5)
+    ));
+    remove_acl(&ws.join("d/inner"), ACCESS);
+    assert!(try_set_acl(
+        &ws.join("plain"),
+        ACCESS,
+        &ext_acl(6, (NAMED_UID, 4), 4, 4, 4)
+    ));
+    fs::remove_file(ws.join("g")).unwrap();
+    fs::write(ws.join("g"), b"gone and back").unwrap();
+    fs::remove_dir(ws.join("d/sub")).unwrap();
+    fs::remove_dir(ws.join("gone-dir")).unwrap();
+    let now = fx.capture(1);
+    assert_ne!(now.entries, base.entries);
+
+    let p = plan(&now, &base);
+    apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap();
+
+    for (path, state) in paths.iter().zip(&before) {
+        assert_eq!(&acl_state(&ws.join(path)), state, "{path}");
+    }
+    let after = fx.capture(2);
+    assert_eq!(after.entries, base.entries);
+    assert!(plan(&after, &base).is_empty());
+}
+
+#[test]
+fn a_restored_entry_does_not_keep_an_acl_inherited_from_its_parent() {
+    let fx = Fixture::new();
+    if root_guard(&fx) {
+        return;
+    }
+    let ws = &fx.ws;
+    fs::write(ws.join("plain"), b"plain").unwrap();
+    create_dir(&ws.join("sub"));
+    fs::write(ws.join("sub/child"), b"child").unwrap();
+    // the target has no ACL anywhere
+    remove_acl(&ws.join("sub"), DEFAULT);
+    for p in ["plain", "sub", "sub/child"] {
+        remove_acl(&ws.join(p), ACCESS);
+    }
+    chmod(&ws.join("plain"), 0o640);
+    chmod(&ws.join("sub"), 0o750);
+    chmod(&ws.join("sub/child"), 0o600);
+    for (i, name) in ["plain", "sub/child", "sub"].iter().enumerate() {
+        set_mtime(&ws.join(name), 1_600_000_000 + i as i64, 0);
+    }
+    let base = fx.capture(0);
+    assert!(base.entries.iter().all(|e| e.xattrs.is_empty()));
+
+    // from now on everything created in the workspace root inherits a named-user ACL
+    if !try_set_acl(ws, DEFAULT, &ext_acl(7, (NAMED_UID, 7), 5, 7, 0)) {
+        return;
+    }
+    fs::remove_file(ws.join("plain")).unwrap();
+    fs::remove_file(ws.join("sub/child")).unwrap();
+    fs::remove_dir(ws.join("sub")).unwrap();
+
+    let now = fx.capture(1);
+    let p = plan(&now, &base);
+    apply(&fx.ws_fd(), &fx.store_fd(), &base, &p).unwrap();
+
+    for path in ["plain", "sub", "sub/child"] {
+        let (_, access, default) = acl_state(&ws.join(path));
+        assert_eq!(
+            (access, default),
+            (None, None),
+            "{path} kept an inherited ACL"
+        );
+    }
+    let after = fx.capture(2);
+    assert_eq!(after.entries, base.entries);
+}
+
+#[test]
+fn a_malformed_acl_in_a_forged_manifest_is_refused_before_any_write() {
+    let fx = Fixture::new();
+    if root_guard(&fx) {
+        return;
+    }
+    let ws = &fx.ws;
+    fs::write(ws.join("f"), b"file").unwrap();
+    if !try_set_acl(&ws.join("f"), ACCESS, &ext_acl(6, (NAMED_UID, 4), 4, 4, 0)) {
+        return;
+    }
+    fs::write(ws.join("victim"), b"victim").unwrap();
+    create_dir(&ws.join("d"));
+    let base = fx.capture(0);
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let good = ext_acl(6, (NAMED_UID, 4), 4, 4, 0);
+    let mut wrong_version = good.clone();
+    wrong_version[0] = 1;
+    let forgeries: Vec<(&str, &str, String)> = vec![
+        ("f", ACCESS, hex(&wrong_version)),
+        ("f", ACCESS, hex(&good[..good.len() - 1])),
+        ("f", ACCESS, hex(&acl_blob(&[(0x01, 6, u32::MAX)]))),
+        // well formed, but its owner and mask disagree with the mode 0640
+        ("f", ACCESS, hex(&ext_acl(7, (NAMED_UID, 7), 7, 7, 7))),
+        // a default ACL belongs to directories
+        ("f", DEFAULT, hex(&good)),
+        ("d", DEFAULT, "nothex".to_owned()),
+    ];
+
+    fs::remove_file(ws.join("victim")).unwrap();
+    let now = fx.capture(1);
+    for (path, name, value) in forgeries {
+        let mut forged = base.clone();
+        for e in &mut forged.entries {
+            if e.path == path {
+                e.xattrs.insert(name.to_owned(), value.clone());
+            }
+        }
+        let p = plan(&now, &forged);
+        let err = apply(&fx.ws_fd(), &fx.store_fd(), &forged, &p).unwrap_err();
+        assert!(
+            matches!(err, RestoreError::Store(StoreError::InvalidManifest { .. })),
+            "{path} {name}: {err}"
+        );
+        // the removal the plan starts with did not run, and nothing was written
+        assert!(!ws.join("victim").exists(), "{path} {name}");
+        assert_eq!(names(ws), ["d", "f"], "{path} {name}");
+    }
+}
+
+#[test]
+fn an_acl_only_change_on_an_entry_owned_by_someone_else_fails_in_preflight() {
+    let fx = Fixture::new();
+    fs::write(fx.ws.join("f"), b"file").unwrap();
+    if !try_set_acl(
+        &fx.ws.join("f"),
+        ACCESS,
+        &ext_acl(6, (NAMED_UID, 4), 4, 4, 0),
+    ) {
+        return;
+    }
+    let base = fx.capture(0);
+    if root_refused(&fx, &base) {
+        return;
+    }
+    let me = RestoreContext::from_process().unwrap();
+    let ctx = RestoreContext {
+        euid: me.euid.wrapping_add(1).max(1),
+        egid: me.egid,
+        groups: me.groups.clone(),
+    };
+    // same mode, same everything else: only the named user of the ACL differs
+    let changed = ext_acl(6, (OTHER_UID, 4), 4, 4, 0);
+    assert!(try_set_acl(&fx.ws.join("f"), ACCESS, &changed));
+    let now = fx.capture(1);
+    let p = plan(&now, &base);
+    assert!(!p.is_empty());
+    let err = apply_with_context(&fx.ws_fd(), &fx.store_fd(), &base, &p, &ctx).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::NotOwner { path, .. } if path == "f"),
+        "{err}"
+    );
+    assert_eq!(get_xattr(&fx.ws.join("f"), ACCESS), Some(changed));
 }
