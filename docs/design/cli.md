@@ -160,7 +160,7 @@ The order of checks, each before any write to the workspace:
    The committed steps are derived from the `step` events of the trace (`store::committed_steps_from_trace`), never from the manifests on disk.
    A `step` event followed by `capture_failed` with phase `step_event` for the same step is not committed.
    The trace is untrusted input, read once through a handle by the same streaming reader that `diff` uses, so the two agree on the committed steps.
-   It is capped at 1 GiB and 1 MiB per line, and only one line is held in memory at a time.
+   It has no whole-file size limit: at most its size at open is read, each line is at most 1 MiB, there are at most 1,000,000 step events, and only one line is held in memory at a time.
    An empty line refuses, because the recorder never writes one.
    A final line without a newline (a crash mid-write) is ignored; any other malformed line refuses.
    The first event must be a `run_start` that agrees with `meta.json`.

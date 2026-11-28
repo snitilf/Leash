@@ -26,7 +26,7 @@ use leash::recorder::{Attendance, Mode, RunMeta, SnapshotMechanism, TRACE_SCHEMA
 use leash::rewind::{RewindError, RewindHooks, RewindRequest, RewindTarget, run_rewind_with_hooks};
 use leash::runs::META_READ_CAP;
 use leash::snapshot::restore::{RestoreContext, recompute_chain};
-use leash::snapshot::store::{Limits, TRACE_READ_CAP, capture, load_manifest};
+use leash::snapshot::store::{Limits, capture, load_manifest};
 use leash::supervisor::run_cgroup::{
     CgroupParent, RunCgroup, RunCgroupState, RunLock, run_cgroup_gone,
 };
@@ -1259,7 +1259,7 @@ fn a_fifo_trace_or_meta_is_refused_without_blocking() {
 }
 
 #[test]
-fn an_oversized_trace_or_meta_is_refused_unread() {
+fn a_huge_sparse_trace_and_an_oversized_meta_are_refused_unread() {
     let Some(f) = edited_fixture() else { return };
     let before = tree_state(&f.ws);
     let trace = f.run_dir.join("trace.jsonl");
@@ -1267,10 +1267,10 @@ fn an_oversized_trace_or_meta_is_refused_unread() {
     // sparse: nothing is written, and the size alone must refuse it
     File::create(&trace)
         .unwrap()
-        .set_len(TRACE_READ_CAP + 1)
+        .set_len(2 * 1024 * 1024 * 1024)
         .unwrap();
     let out = f.rewind(&[]);
-    assert_refused(&out, 125, "read cap");
+    assert_refused(&out, 125, "longer than");
     assert_eq!(tree_state(&f.ws), before);
     fs::remove_file(&trace).unwrap();
     f.flush_trace();
