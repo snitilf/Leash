@@ -1727,3 +1727,87 @@ fn run_cgroup_gone_walks_missing_parent_under_cgroup2_but_marks_non_cgroup2_unkn
         RunCgroupState::Unknown
     );
 }
+
+/// make a cgroup directory look as old as one a crashed probe left behind, so the leftover
+/// age check passes.
+fn backdate(dir: &Path) {
+    std::fs::File::open(dir)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(120))
+        .unwrap();
+}
+
+/// removes an empty directory when dropped, for the probe-leftover tests that must not leak
+/// one if an assertion fails.
+struct EmptyCgroupGuard(PathBuf);
+
+impl Drop for EmptyCgroupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+#[test]
+fn an_empty_leftover_probe_cgroup_is_removed_at_the_next_run() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("probe_leftover_removed") {
+        return;
+    }
+    let session = Session::new();
+    let parent = CgroupParent::locate().unwrap();
+    let leftover = parent.path().join("leash-probe-x");
+    std::fs::create_dir(&leftover).unwrap();
+    let _cleanup = EmptyCgroupGuard(leftover.clone());
+    backdate(&leftover);
+
+    let run = session.run(&["/bin/true"]).unwrap();
+    run.assert_exit_zero();
+
+    assert!(!leftover.exists(), "the empty leftover probe cgroup stays");
+    assert!(
+        run.of_type("cgroup_kill").is_empty(),
+        "removing an empty probe cgroup records nothing: {:?}",
+        run.events
+    );
+}
+
+#[test]
+fn a_young_empty_probe_cgroup_may_be_a_running_probe_and_is_left_alone() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("probe_young_untouched") {
+        return;
+    }
+    let session = Session::new();
+    let parent = CgroupParent::locate().unwrap();
+    let young = parent.path().join("leash-probe-young");
+    std::fs::create_dir(&young).unwrap();
+    let _cleanup = EmptyCgroupGuard(young.clone());
+
+    let run = session.run(&["/bin/true"]).unwrap();
+    run.assert_exit_zero();
+
+    assert!(young.exists(), "a probe in progress was removed");
+}
+
+#[test]
+fn a_populated_leftover_probe_cgroup_is_never_killed_or_removed() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("probe_populated_untouched") {
+        return;
+    }
+    let session = Session::new();
+    let parent = CgroupParent::locate().unwrap();
+    let mut populated = Leftover::new_unbound(&parent, "leash-probe-busy");
+    backdate(&populated.cgroup);
+
+    let run = session.run(&["/bin/true"]).unwrap();
+    run.assert_exit_zero();
+
+    assert!(populated.cgroup.exists(), "the populated cgroup was removed");
+    assert!(populated.sleeper_alive(), "a process in it was killed");
+    assert!(
+        run.of_type("cgroup_kill").is_empty(),
+        "nothing named leash-probe is cleaned while populated: {:?}",
+        run.events
+    );
+}
