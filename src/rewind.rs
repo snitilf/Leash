@@ -82,29 +82,54 @@ pub fn undo_dir_name(n: u64) -> String {
 /// `$'...'` with every control character escaped, so a path can never inject a line break
 /// or a terminal escape into the output.
 pub fn shell_quote(text: &str) -> String {
-    let plain = |c: char| c.is_ascii_alphanumeric() || "_-./:@%+=,".contains(c);
-    if !text.is_empty() && text.chars().all(plain) {
-        return text.to_string();
+    shell_quote_bytes(text.as_bytes())
+}
+
+/// `shell_quote` for a path, from its raw bytes: a name that is not UTF-8 is not rewritten
+/// with replacement characters, which would name a different path, but written with each
+/// invalid byte as `\xHH` inside `$'...'`. that form is bash, zsh and ksh syntax, not POSIX
+/// `sh`; a path made of valid UTF-8 without control characters is quoted for any shell.
+pub fn shell_quote_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    shell_quote_bytes(path.as_os_str().as_bytes())
+}
+
+fn shell_quote_bytes(bytes: &[u8]) -> String {
+    let plain = |b: &u8| b.is_ascii_alphanumeric() || b"_-./:@%+=,".contains(b);
+    if !bytes.is_empty() && bytes.iter().all(plain) {
+        return String::from_utf8_lossy(bytes).into_owned();
     }
-    if text.chars().any(char::is_control) {
+    let needs_escapes = bytes
+        .utf8_chunks()
+        .any(|chunk| !chunk.invalid().is_empty() || chunk.valid().chars().any(char::is_control));
+    if needs_escapes {
         let mut quoted = String::from("$'");
-        for c in text.chars() {
-            match c {
-                '\\' => quoted.push_str("\\\\"),
-                '\'' => quoted.push_str("\\'"),
-                c if c.is_control() => {
-                    let mut buf = [0u8; 4];
-                    for byte in c.encode_utf8(&mut buf).bytes() {
-                        quoted.push_str(&format!("\\x{byte:02x}"));
+        for chunk in bytes.utf8_chunks() {
+            for c in chunk.valid().chars() {
+                match c {
+                    '\\' => quoted.push_str("\\\\"),
+                    '\'' => quoted.push_str("\\'"),
+                    c if c.is_control() => {
+                        let mut buf = [0u8; 4];
+                        for byte in c.encode_utf8(&mut buf).bytes() {
+                            quoted.push_str(&format!("\\x{byte:02x}"));
+                        }
                     }
+                    c => quoted.push(c),
                 }
-                c => quoted.push(c),
+            }
+            for byte in chunk.invalid() {
+                quoted.push_str(&format!("\\x{byte:02x}"));
             }
         }
         quoted.push('\'');
         return quoted;
     }
-    format!("'{}'", text.replace('\'', "'\\''"))
+    // valid UTF-8 with no control character, so the lossy conversion changes nothing
+    format!(
+        "'{}'",
+        String::from_utf8_lossy(bytes).replace('\'', "'\\''")
+    )
 }
 
 /// the command that restores safety snapshot `n` of `run_id`, checked against the manifest
@@ -119,8 +144,8 @@ pub fn undo_command(
     format!(
         "leash rewind {} --undo {n} --expect {digest} --workspace {} --state-dir {}",
         shell_quote(run_id),
-        shell_quote(&workspace.to_string_lossy()),
-        shell_quote(&state_root.to_string_lossy()),
+        shell_quote_path(workspace),
+        shell_quote_path(state_root),
     )
 }
 
@@ -132,8 +157,8 @@ pub fn rewind_hint(run_id: &str, chain_head: &str, workspace: &Path, state_root:
     format!(
         "leash: to undo this run: leash rewind {} --expect {chain_head} --workspace {} --state-dir {}",
         shell_quote(run_id),
-        shell_quote(&workspace.to_string_lossy()),
-        shell_quote(&state_root.to_string_lossy()),
+        shell_quote_path(workspace),
+        shell_quote_path(state_root),
     )
 }
 
@@ -1076,6 +1101,34 @@ mod tests {
                 "cd".repeat(32)
             )
         );
+    }
+
+    #[test]
+    fn a_path_that_is_not_utf8_is_quoted_from_its_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/w/caf\xe9 dir"));
+        assert_eq!(shell_quote_path(path), "$'/w/caf\\xe9 dir'");
+        let hint = rewind_hint("id", &"0".repeat(64), path, Path::new("/s"));
+        assert!(hint.contains("--workspace $'/w/caf\\xe9 dir' "), "{hint}");
+        assert!(!hint.contains('\u{fffd}'), "{hint}");
+    }
+
+    #[test]
+    fn a_valid_utf8_path_is_quoted_the_same_as_its_text() {
+        for text in [
+            "/w/plain",
+            "/w/a b",
+            "/w/it's",
+            "/w/caf\u{e9}",
+            "/w/a\nb",
+            "",
+        ] {
+            assert_eq!(
+                shell_quote_path(Path::new(text)),
+                shell_quote(text),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

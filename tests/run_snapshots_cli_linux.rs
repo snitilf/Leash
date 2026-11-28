@@ -137,6 +137,11 @@ const AGENT: &str = "set -e; \
 /// run the printed command the way the shell would, with `leash` on the path and from a
 /// directory that is not the workspace.
 fn run_printed(command: &str) -> Output {
+    run_printed_with("sh", command)
+}
+
+/// `run_printed` through the named shell.
+fn run_printed_with(shell: &str, command: &str) -> Output {
     let bin_dir = tempfile::tempdir().unwrap();
     symlink(leash_bin(), bin_dir.path().join("leash")).unwrap();
     let path = format!(
@@ -145,7 +150,7 @@ fn run_printed(command: &str) -> Output {
         std::env::var("PATH").unwrap_or_default()
     );
     let elsewhere = tempfile::tempdir().unwrap();
-    Command::new("sh")
+    Command::new(shell)
         .args(["-c", command])
         .env("PATH", path)
         .current_dir(elsewhere.path())
@@ -370,6 +375,63 @@ fn a_snapshot_run_passes_the_childs_exit_code_through_and_still_prints_the_comma
     let rewind = run_printed(&hint["leash: to undo this run: ".len()..]);
     assert_eq!(rewind.status.code(), Some(0), "{}", stderr(&rewind));
     assert_eq!(tree_state(&ws), original);
+}
+
+/// the printed command quotes a workspace path with a space and a single quote, so it can be
+/// pasted as printed. the plain form is POSIX `sh`; a path with a control character or invalid
+/// UTF-8 would use `$'...'`, which needs bash, so this case runs the line through bash too.
+#[test]
+fn the_printed_command_survives_a_workspace_path_with_a_space_and_a_quote() {
+    if !common::delegated_cgroup_or_skip("snapshot_run_quoted_path") {
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::Builder::new()
+        .prefix("it's a work space ")
+        .tempdir()
+        .unwrap();
+    let ws = parent.path().canonicalize().unwrap();
+    strip_default_acl(&ws);
+    populate(&ws);
+    let original = tree_state(&ws);
+    let policy = state.path().join("policy.toml");
+    fs::write(&policy, workspace_policy(&ws)).unwrap();
+    let out = run_leash(
+        &[
+            "run",
+            "--snapshots",
+            "--state-dir",
+            &state.path().to_string_lossy(),
+            "--policy",
+            &policy.to_string_lossy(),
+            "--",
+            "sh",
+            "-c",
+            "echo oops > a.txt",
+        ],
+        &ws,
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let err = stderr(&out);
+    let hint = err.lines().last().unwrap();
+    let command = &hint["leash: to undo this run: ".len()..];
+    assert!(
+        command.contains("'\\''"),
+        "the single quote is escaped in the printed command: {command}"
+    );
+    assert_ne!(tree_state(&ws), original);
+    for shell in ["sh", "bash"] {
+        let rewind = run_printed_with(shell, command);
+        assert_eq!(
+            rewind.status.code(),
+            Some(0),
+            "{shell}: {}",
+            stderr(&rewind)
+        );
+        assert_eq!(tree_state(&ws), original, "{shell} rewound to step 0");
+        // put the agent's edit back for the second shell
+        fs::write(ws.join("a.txt"), "oops\n").unwrap();
+    }
 }
 
 #[test]

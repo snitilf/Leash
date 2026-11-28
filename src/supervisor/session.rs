@@ -875,13 +875,13 @@ mod linux {
             },
         )?;
         writer.sync()?;
+        if let Some(head) = outcome.chain_head.as_deref() {
+            eprintln!("leash: snapshot chain head {head}");
+        }
 
         // step 9: the report is rendered from the trace on disk, never from live state
         let trace = std::fs::read_to_string(run_dir.path.join("trace.jsonl"))
             .map_err(SessionError::Report)?;
-        if let Some(head) = outcome.chain_head.as_deref() {
-            eprintln!("leash: snapshot chain head {head}");
-        }
         let report = crate::recorder::report::render_report(&trace)?;
         let report_path = run_dir.path.join("report.txt");
         let mut file = std::fs::File::create_new(&report_path).map_err(SessionError::Report)?;
