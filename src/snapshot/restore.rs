@@ -440,7 +440,7 @@ fn meta_change(current: &ManifestEntry, target: &ManifestEntry) -> MetaChange {
 /// target. entries absent from `target` are removed deepest first, missing directories are
 /// created shallowest first, files whose content or hard-link grouping differs are written
 /// (the first member of a group from the store, the others hard linked from it), symlinks
-/// whose target differs are recreated, and entries that differ only in mode, mtime, owner
+/// whose target differs are recreated, and entries that differ only in mode, mtime, owner,
 /// user xattrs or ACLs get a metadata fix. a kind change is a removal followed by a creation.
 /// directory metadata is applied last, deepest first.
 pub fn plan(current: &Manifest, target: &Manifest) -> RestorePlan {
