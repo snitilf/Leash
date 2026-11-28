@@ -17,14 +17,14 @@ is announced and torn down, and what the shell sees when it finishes. Terms in *
 The `run` command starts a supervised run:
 
 ```
-leash run [--unattended] [--state-dir <dir>] [--policy <path>] [--ask-timeout <seconds>] -- <command...>
+leash run [--unattended] [--state-dir <dir>] [--policy <path> [--snapshots]] [--ask-timeout <seconds>] -- <command...>
 ```
 
 The `--` separator is required. Everything after it is the child command and passes to the child
 verbatim, including arguments that look like flags: `leash run -- rm -rf ./build` runs `rm` with
 `-rf ./build`, and the `-rf` is never parsed by Leash. Both `--state-dir <dir>` and
 `--state-dir=<dir>` forms are accepted. Both `--policy <path>` and `--policy=<path>` forms are
-accepted. `--unattended` takes no value. `--ask-timeout <seconds>` sets the FR-10 attended-ask
+accepted. `--unattended` takes no value. `--snapshots` takes no value and is described in the snapshots section below. `--ask-timeout <seconds>` sets the FR-10 attended-ask
 timeout (both `--ask-timeout <n>` and `--ask-timeout=<n>` forms; whole seconds in 1..=3600,
 default 60).
 
@@ -46,7 +46,8 @@ normative set:
 | unknown subcommand or flag | a subcommand that is not `run`, `runs`, `diff` or `rewind`, or a flag the subcommand does not accept |
 | `run` without `--` | `run` invoked with no `--` separator |
 | empty command after `--` | `--` present but nothing follows it |
-| a flag given twice | `--unattended`, `--state-dir`, `--policy`, or `--ask-timeout` repeated |
+| a flag given twice | `--unattended`, `--state-dir`, `--policy`, `--snapshots`, or `--ask-timeout` repeated |
+| `--snapshots` without `--policy` | `--snapshots` given and no `--policy` (snapshots are enforce mode only, FR-22) |
 | `--state-dir` missing its value | `--state-dir` is the last token before `--`, or is immediately followed by `--` |
 | `--policy` missing its value | `--policy` is the last token before `--`, is immediately followed by `--`, or is given as `--policy=` |
 | `--ask-timeout` missing its value | `--ask-timeout` is immediately followed by `--`, or is given as `--ask-timeout=` |
@@ -212,17 +213,16 @@ An unused safety snapshot is removed again: after a refusal, or when the plan is
 When the apply fails, the error names the safety snapshot and prints the `--undo` command that restores it.
 On macOS, `rewind` exits 125 with a message that it requires linux.
 
-### Snapshots (specified by ADR-0024, not yet implemented)
-
-The `run --snapshots` flag below is specified and not yet implemented; `run` does not accept it.
-`diff` and `rewind` are implemented; see their sections above.
+### `run --snapshots` (implemented, ADR-0024)
 
 ```
 leash run --snapshots [--unattended] [--state-dir <dir>] --policy <path> [--ask-timeout <seconds>] -- <command...>
 ```
 
-`--snapshots` is available in enforce mode only.
-`--snapshots` without `--policy` is a usage error that exits 2 (FR-22), not a supervisor failure.
+`--snapshots` is available in enforce mode only, and it takes no value.
+`--snapshots` without `--policy` is a usage error that exits 2 (FR-22), not a supervisor failure, so a record-only snapshot run cannot be asked for.
+The flag sets the run's `snapshot_integrity` stamp, which turns on everything ADR-0024 puts behind it: the run cgroup and run lock, the workspace lock, the implicit cgroup2 and state-root denies, the capture barrier with step 0 before the agent starts and a final step after it ends, and the chain head.
+`diff` and `rewind` read what such a run leaves; see their sections above.
 It refuses before spawn, as a supervisor failure with the message on stderr and no run directory created, in these cases:
 
 - the host has no writable, delegated cgroup v2 with working `cgroup.freeze` and `cgroup.kill`; the message names the hint `systemd-run --user --scope -p Delegate=yes`, which is unverified until a CI leg runs it;
@@ -233,8 +233,19 @@ The refusals come in this order: the Landlock ABI and the grant overlaps, then t
 A failure to create the run cgroup, or any later failure before the run directory exists, is a supervisor failure with no run directory created, and removes the cgroup.
 Taking or binding the run lock happens once the run directory exists, so a failure there leaves a run directory with `run_start`, a `cgroup_kill` event with reason `abort` that names the error, and no `run_end`, and exits 125 with the empty cgroup removed.
 
-The session already applies all three refusals and the implicit `implicit:cgroup` deny when its `snapshot_integrity` field is set.
-What is still missing is the `--snapshots` flag that sets it, which the capture slice adds.
+When the run ends, stderr carries the steps and how to undo the run, after the child's own output and before the exit:
+
+```
+leash: step 0 digest: <64 hex>
+leash: step <N> digest: <64 hex>
+leash: snapshot chain head <64 hex>
+leash: run <run-id> recorded; report: <state-root>/runs/<run-id>/report.txt
+leash: to undo this run: leash rewind <run-id> --expect <chain head> --workspace <dir> --state-dir <dir>
+```
+
+The step lines list every committed step in order, and the chain head is the one `rewind --expect` checks.
+The last line is shell-quoted so it can be pasted, and it carries the workspace and state directory so it works from any directory.
+Keep the chain head outside the state root: without it, `rewind` can only check the store against the trace beside it.
 
 ## 2. Mode selection
 

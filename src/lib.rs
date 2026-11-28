@@ -9,6 +9,7 @@ pub mod policy;
 pub mod recorder;
 pub mod rewind;
 pub mod run_diff;
+pub mod run_summary;
 pub mod runs;
 pub mod sandbox;
 pub mod snapshot;
