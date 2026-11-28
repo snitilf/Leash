@@ -3,8 +3,9 @@
 //!
 //! a snapshot run puts the agent's whole process tree in a cgroup named `leash-<run-id>`,
 //! a child of Leash's own cgroup, with no controllers enabled. the supervisor and the
-//! broker stay in their own cgroup. the cgroup is created before spawn, bound to its run
-//! lock through the `user.leash.lock` xattr, entered atomically through
+//! broker stay in their own cgroup. the cgroup is created first, before the run directory and
+//! the broker exist, so a setup failure leaves neither behind; it is bound to its run
+//! lock through the `user.leash.lock` xattr once the run directory exists, entered atomically through
 //! `clone3(CLONE_INTO_CGROUP)` (see `spawn`), and killed and removed depth-first when the
 //! run ends or aborts.
 //!
@@ -30,6 +31,13 @@ use crate::supervisor::cgroup::{self, Cgroup};
 
 /// the prefix of every run cgroup name.
 const NAME_PREFIX: &str = "leash-";
+/// the prefix of the sacrificial cgroup the setup probe creates (`cgroup::probe_delegation`).
+const PROBE_PREFIX: &str = "leash-probe-";
+/// an empty probe cgroup, or an empty run cgroup with no lock bound yet, newer than this may
+/// belong to a Leash that is setting up right now under the same parent, so cleanup leaves
+/// it alone. a whole probe is a few bounded steps of `PROBE_TIMEOUT` each, and a run binds
+/// its lock within milliseconds of creating its cgroup, both well inside this.
+const PROBE_LEFTOVER_AGE: Duration = Duration::from_secs(30);
 /// the bound on each freeze, thaw and kill confirmation in the setup probe.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// the bound on waiting for `populated 0` after `cgroup.kill`.
@@ -95,7 +103,7 @@ pub enum RunCgroupError {
         #[source]
         source: io::Error,
     },
-    /// a snapshot run reached spawn without a recorded run cgroup.
+    /// a snapshot run reached its run lifecycle without a created or recorded run cgroup.
     #[error("a snapshot run needs a run cgroup path in its metadata")]
     MissingPath,
     /// the created cgroup is not the one the run metadata names.
@@ -251,6 +259,8 @@ impl CgroupParent {
 
     /// pin the cgroup directory at `path`, which must be on a cgroup2 filesystem, and
     /// require that it is writable: creating, killing and removing children all need it.
+    /// `leash rewind` opens the recorded parent of a dead run's cgroup this way to run
+    /// stale cleanup; a run itself uses `locate`.
     pub fn open_writable(path: &Path) -> Result<Self, RunCgroupError> {
         let parent = Self::open(path).map_err(|source| RunCgroupError::Create {
             path: path.to_path_buf(),
@@ -616,6 +626,11 @@ impl Drop for RunCgroup {
 /// `<st_dev>:<st_ino>` matches the cgroup's `user.leash.lock` xattr. a held lock, a missing
 /// lock file, a mismatched or absent xattr, an invalid name, and `skip` (the caller's own
 /// run) are never touched. returns one event per cleaned or errored cgroup for the trace.
+///
+/// it also removes, without ever killing, the empty cgroups that a supervisor killed during
+/// setup leaves behind (`remove_leftover_empty`): a `leash-probe-*` cgroup, which records
+/// nothing unless removal fails, and a `leash-<valid run id>` cgroup that never got its
+/// `user.leash.lock` xattr, which records a `stale_cleanup` event with `processes` 0.
 pub fn cleanup_stale(
     parent: &CgroupParent,
     state_root: &Path,
@@ -642,8 +657,33 @@ pub fn cleanup_stale(
         let Some(id) = name.strip_prefix(NAME_PREFIX) else {
             continue;
         };
+        if name.starts_with(PROBE_PREFIX) {
+            if let LeftoverOutcome::Failed(event) =
+                remove_leftover_empty(&parent.dir, &cname, &name, false)
+            {
+                events.push(event);
+            }
+            continue;
+        }
         if !is_valid_run_id(id) || skip == Some(id) {
             continue;
+        }
+        match remove_leftover_empty(&parent.dir, &cname, &name, true) {
+            LeftoverOutcome::Removed => {
+                events.push(CgroupKillEvent {
+                    reason: CgroupKillReason::StaleCleanup,
+                    cgroup: name,
+                    processes: Some(0),
+                    error: None,
+                    removal_error: None,
+                });
+                continue;
+            }
+            LeftoverOutcome::Failed(event) => {
+                events.push(event);
+                continue;
+            }
+            LeftoverOutcome::Kept => {}
         }
         let lock = match RunLock::try_existing_in(&state_dir, id) {
             Ok(Some(lock)) => lock,
@@ -716,6 +756,75 @@ pub fn cleanup_stale(
         events.push(event);
     }
     Ok(events)
+}
+
+/// what `remove_leftover_empty` did to one cgroup.
+enum LeftoverOutcome {
+    /// the empty cgroup was removed
+    Removed,
+    /// the cgroup was left alone: populated, young, bound, nested, or already gone
+    Kept,
+    /// an unexpected error, reported in the trace
+    Failed(CgroupKillEvent),
+}
+
+/// remove the leftover cgroup `cname` of a supervisor that died during setup, and only that:
+/// it must hold no process (`populated 0`) and be older than `PROBE_LEFTOVER_AGE`, and with
+/// `unbound_only` (a run cgroup) it must also have no `user.leash.lock` xattr. nothing is
+/// ever killed. a populated, young, bound, nested or unremovable one is left alone, because
+/// the next run tries again; only an unexpected error is reported.
+fn remove_leftover_empty(
+    parent: &File,
+    cname: &CStr,
+    name: &str,
+    unbound_only: bool,
+) -> LeftoverOutcome {
+    let failed = |e: io::Error| {
+        LeftoverOutcome::Failed(CgroupKillEvent {
+            reason: CgroupKillReason::StaleCleanup,
+            cgroup: name.to_string(),
+            processes: None,
+            error: None,
+            removal_error: Some(e.to_string()),
+        })
+    };
+    let group = match Cgroup::open_child(parent, cname) {
+        Ok(group) => group,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return LeftoverOutcome::Kept,
+        Err(e) => return failed(e),
+    };
+    // a bound cgroup, or one whose xattr cannot be read, goes through the lock-based path
+    if unbound_only && !matches!(group.lock_identity(), Ok(None)) {
+        return LeftoverOutcome::Kept;
+    }
+    let age = group
+        .dir()
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .map(|modified| modified.elapsed().unwrap_or(Duration::ZERO));
+    match age {
+        Ok(age) if age >= PROBE_LEFTOVER_AGE => {}
+        Ok(_) => return LeftoverOutcome::Kept,
+        Err(e) => return failed(e),
+    }
+    match (group.is_populated(), group.members()) {
+        (Ok(false), Ok(pids)) if pids.is_empty() => {}
+        (Ok(_), Ok(_)) => return LeftoverOutcome::Kept,
+        (Err(e), _) | (_, Err(e)) => return failed(e),
+    }
+    drop(group);
+    match cgroup::rmdir_child(parent, cname) {
+        Ok(()) => LeftoverOutcome::Removed,
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::ENOENT | libc::EBUSY | libc::ENOTEMPTY)
+            ) =>
+        {
+            LeftoverOutcome::Kept
+        }
+        Err(e) => failed(e),
+    }
 }
 
 /// check whether the run cgroup recorded for `run_id` is gone, still present, or
