@@ -1109,6 +1109,51 @@ fn a_write_grant_on_a_missing_top_level_path_is_anchored_at_the_root_and_refused
 }
 
 #[test]
+fn a_write_grant_on_a_bind_mount_alias_of_the_state_roots_parent_is_refused() {
+    // the alias is a different path, so no path comparison sees it; its (device, inode) is
+    // the state root's parent's, so the identity comparison does
+    let _guard = spawn_lock();
+    if !sudo_works() {
+        assert!(
+            std::env::var("LEASH_REQUIRE_FREEZER").as_deref() != Ok("1"),
+            "LEASH_REQUIRE_FREEZER=1 but passwordless sudo is not available"
+        );
+        eprintln!("skipping bind_mount_alias: no passwordless sudo to mount with");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("p");
+    let alias = tmp.path().join("alias");
+    std::fs::create_dir_all(&alias).unwrap();
+    let session = Session::nested(tmp, parent.join("leash"));
+    let bound = std::process::Command::new("sudo")
+        .args(["-n", "mount", "--bind"])
+        .arg(&parent)
+        .arg(&alias)
+        .status()
+        .is_ok_and(|s| s.success());
+    let _unmount = Unmount(alias.clone());
+    if !bound {
+        assert!(
+            std::env::var("LEASH_REQUIRE_FREEZER").as_deref() != Ok("1"),
+            "LEASH_REQUIRE_FREEZER=1 but the bind mount could not be made"
+        );
+        eprintln!("skipping bind_mount_alias: mount --bind failed here");
+        return;
+    }
+    session.write_policy(&format!(
+        "{POLICY}[[fs]]\npath=\"{}/**\"\nmode=[\"write\"]\naction=\"allow\"\n",
+        alias.display()
+    ));
+    let message = overlap_refusal(session.run(&["/bin/true"]));
+    assert!(
+        message.contains(&format!("state root \"{}\"", session.state_dir.display())),
+        "{message}"
+    );
+    session.assert_no_run_directory();
+}
+
+#[test]
 fn a_write_grant_on_a_missing_path_anchored_elsewhere_is_not_refused() {
     let _guard = spawn_lock();
     if !delegated("missing_grant_elsewhere") {
