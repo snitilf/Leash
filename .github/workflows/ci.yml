@@ -49,7 +49,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: build cgroup tests
-        run: cargo test --no-run --test run_cgroup_linux --test snapshot_run_filter_linux --test snapshot_integrity_linux --test capture_barrier_linux
+        run: cargo test --no-run --test run_cgroup_linux --test snapshot_run_filter_linux --test snapshot_integrity_linux --test capture_barrier_linux --test rewind_cli_linux
       - name: cgroup tests in a delegated cgroup
         env:
           LEASH_REQUIRE_FREEZER: "1"
@@ -61,4 +61,4 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" "$cgroup"
           echo $$ | sudo tee "$cgroup/cgroup.procs" > /dev/null
           echo "cgroup of this step: $(cat /proc/self/cgroup)"
-          cargo test --test run_cgroup_linux --test snapshot_run_filter_linux --test snapshot_integrity_linux --test capture_barrier_linux -- --nocapture
+          cargo test --test run_cgroup_linux --test snapshot_run_filter_linux --test snapshot_integrity_linux --test capture_barrier_linux --test rewind_cli_linux -- --nocapture
