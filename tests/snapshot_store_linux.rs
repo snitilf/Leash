@@ -14,7 +14,8 @@ use std::path::Path;
 
 use leash::snapshot::store::{
     DEFAULT_MAX_FILE_SIZE, EntryKind, Limits, StoreError, TRACE_LINE_CAP, TRACE_STEP_CAP, capture,
-    capture_gated, committed_steps_from_trace, load_manifest, published_steps, verify_object,
+    capture_gated, committed_steps_from_trace, load_manifest, published_steps, read_trace,
+    read_trace_capped, verify_object,
 };
 
 fn open_dir(path: &Path) -> File {
@@ -833,6 +834,130 @@ fn a_missing_trace_is_a_not_found_error() {
     let err = committed_steps_from_trace(&open_dir(dir.path())).unwrap_err();
     assert!(
         matches!(&err, StoreError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound),
+        "{err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// one streaming, capped pass over the trace: committed steps, digests and run_start
+// ---------------------------------------------------------------------------------------
+
+fn start_line(workspace: &str) -> String {
+    format!(
+        r#"{{"seq":0,"ts":1,"type":"run_start","workspace":"{workspace}","run_cgroup":"/cg/leash-x"}}"#
+    )
+}
+
+#[test]
+fn read_trace_returns_the_committed_steps_their_digests_and_the_run_start() {
+    let (_dir, run) = trace_dir(&[
+        start_line("/w"),
+        step_line(1, 0),
+        r#"{"seq":2,"ts":1,"type":"syscall","decision":"allow"}"#.into(),
+        step_line(3, 1),
+        r#"{"seq":4,"ts":1,"type":"step","step":2}"#.into(),
+    ]);
+    let trace = read_trace(&run).unwrap();
+    assert_eq!(trace.committed, vec![0, 1, 2]);
+    assert_eq!(trace.events, 5);
+    assert_eq!(
+        trace.digests.keys().copied().collect::<Vec<_>>(),
+        vec![0, 1],
+        "a step event without a digest binds no snapshot"
+    );
+    assert_eq!(trace.digests[&0], "ab".repeat(32));
+    let start = trace.run_start.unwrap();
+    assert_eq!(start.workspace.as_deref(), Some(Path::new("/w")));
+    assert_eq!(start.run_cgroup.as_deref(), Some(Path::new("/cg/leash-x")));
+    // the one parser: the committed list is the committed list of read_trace
+    assert_eq!(committed_steps_from_trace(&run).unwrap(), vec![0, 1, 2]);
+}
+
+#[test]
+fn a_step_event_that_failed_to_commit_takes_its_digest_with_it() {
+    let (_dir, run) = trace_dir(&[
+        start_line("/w"),
+        step_line(1, 0),
+        step_line(2, 1),
+        failed_line(3, 1, "step_event"),
+    ]);
+    let trace = read_trace(&run).unwrap();
+    assert_eq!(trace.committed, vec![0]);
+    assert_eq!(trace.digests.keys().copied().collect::<Vec<_>>(), vec![0]);
+}
+
+#[test]
+fn a_trace_that_does_not_start_with_run_start_reports_none() {
+    let (_dir, run) = trace_dir(&[step_line(0, 0)]);
+    let trace = read_trace(&run).unwrap();
+    assert!(trace.run_start.is_none());
+    assert_eq!(trace.events, 1);
+}
+
+#[test]
+fn an_empty_line_a_second_run_start_and_a_bad_digest_are_invalid() {
+    for (lines, needle) in [
+        (
+            vec![start_line("/w"), String::new(), step_line(2, 0)],
+            "empty",
+        ),
+        (vec![start_line("/w"), start_line("/w")], "second run_start"),
+        (
+            vec![
+                start_line("/w"),
+                format!(
+                    r#"{{"seq":1,"type":"step","step":0,"manifest_digest":"{}"}}"#,
+                    "AB".repeat(32)
+                ),
+            ],
+            "64 lowercase hex",
+        ),
+        (
+            vec![
+                start_line("/w"),
+                r#"{"seq":1,"type":"step","step":0,"manifest_digest":"abc"}"#.into(),
+            ],
+            "64 lowercase hex",
+        ),
+    ] {
+        let (_dir, run) = trace_dir(&lines);
+        let err = read_trace(&run).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::InvalidTrace { reason } if reason.contains(needle)),
+            "{lines:?}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn a_trace_of_only_newlines_is_refused_at_its_first_line() {
+    // the recorder never writes an empty line, so a file of newlines is refused at once
+    // instead of being split into millions of lines
+    let dir = tempfile::tempdir().unwrap();
+    let size = 8 * 1024 * 1024;
+    fs::write(dir.path().join("trace.jsonl"), vec![b'\n'; size]).unwrap();
+    let err = read_trace(&open_dir(dir.path())).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidTrace { reason } if reason.contains("line 1 is empty")),
+        "{err:?}"
+    );
+    // with the line cap lowered, the answer is the same
+    let err = read_trace_capped(&open_dir(dir.path()), 1024).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidTrace { reason } if reason.contains("line 1 is empty")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn one_oversized_line_is_refused_without_buffering_it() {
+    let dir = tempfile::tempdir().unwrap();
+    // no newline at all: the line is cut at the line cap, not read to its end
+    let size = 4 * 1024 * 1024;
+    fs::write(dir.path().join("trace.jsonl"), vec![b'x'; size]).unwrap();
+    let err = read_trace_capped(&open_dir(dir.path()), 64 * 1024).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidTrace { reason } if reason.contains("longer than 65536")),
         "{err:?}"
     );
 }

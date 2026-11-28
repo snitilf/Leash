@@ -36,6 +36,30 @@ pub const TRACE_LINE_CAP: usize = 1024 * 1024;
 /// the most `step` events that `committed_steps_from_trace` accepts.
 pub const TRACE_STEP_CAP: usize = 1_000_000;
 
+/// what one pass over `trace.jsonl` found (`read_trace`).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TraceRead {
+    /// the committed steps, ascending
+    pub committed: Vec<u64>,
+    /// the manifest digest of each committed step whose step event carries one
+    pub digests: BTreeMap<u64, String>,
+    /// the `run_start` facts when the first event is a `run_start`, otherwise `None`
+    pub run_start: Option<TraceRunStart>,
+    /// how many complete events the trace holds
+    pub events: u64,
+}
+
+/// the `run_start` fields a reader cross-checks against `meta.json`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceRunStart {
+    /// the workspace the run recorded
+    pub workspace: Option<std::path::PathBuf>,
+    /// the run cgroup the run recorded
+    pub run_cgroup: Option<std::path::PathBuf>,
+}
+
 /// provisional default maximum number of entries in a single capture.
 ///
 /// provisional: chosen as a safe initial upper bound until measured against real
@@ -234,7 +258,7 @@ pub enum StoreError {
     #[error("random source failed: {0}")]
     Random(String),
     /// `trace.jsonl` could not be trusted to name the committed steps: a symlink, a file that
-    /// is not regular, over the read cap, or malformed.
+    /// is not regular, or malformed.
     #[error("invalid trace: {reason}")]
     InvalidTrace {
         /// why the trace was rejected.
@@ -724,8 +748,8 @@ pub(crate) fn step_manifest_filename(step: u64) -> String {
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    capture, capture_gated, committed_steps_from_trace, load_manifest, published_steps,
-    scan_current, verify_object,
+    capture, capture_gated, committed_steps_from_trace, load_manifest, published_steps, read_trace,
+    read_trace_capped, scan_current, verify_object,
 };
 
 #[cfg(target_os = "linux")]
@@ -741,9 +765,9 @@ mod linux {
     use super::{
         CaptureStats, EntryKind, FileFingerprint, Limits, MANIFEST_READ_CAP,
         MANIFEST_SCHEMA_VERSION, Manifest, ManifestEntry, ManifestTotals, Published, RefusedEntry,
-        StoreError, TRACE_LINE_CAP, TRACE_STEP_CAP, UNCAPTURED_SHA256, XattrAction,
-        check_file_unchanged, classify_xattr, hex_encode, is_valid_sha256_hex, manifest_digest,
-        parse_manifest, parse_step_filename, step_manifest_filename,
+        StoreError, TRACE_LINE_CAP, TRACE_STEP_CAP, TraceRead, TraceRunStart, UNCAPTURED_SHA256,
+        XattrAction, check_file_unchanged, classify_xattr, hex_encode, is_valid_sha256_hex,
+        manifest_digest, parse_manifest, parse_step_filename, step_manifest_filename,
     };
 
     const COPY_BUF_LEN: usize = 64 * 1024;
@@ -2333,23 +2357,38 @@ mod linux {
     }
 
     /// the committed steps of a run, derived from the `step` events in its `trace.jsonl`,
-    /// ascending (ADR-0024 decision 16; trace.md section 2).
+    /// ascending (ADR-0024 decision 16; trace.md section 2). this is the committed list of
+    /// [`read_trace`]: there is one parser of the trace, so every command that asks which
+    /// steps are committed gets the same answer.
+    pub fn committed_steps_from_trace(run_dir: &File) -> Result<Vec<u64>, StoreError> {
+        read_trace(run_dir).map(|trace| trace.committed)
+    }
+
+    /// the one streaming, capped pass over a run's `trace.jsonl`: the committed steps, the
+    /// manifest digest each committed step event carries, and the `run_start` facts.
     ///
     /// a step is committed when its `step` event is durable, so a manifest is neither
     /// necessary nor sufficient: an orphan manifest has no event, and an event followed by
     /// `capture_failed` with phase `step_event` for the same step could not be made durable,
-    /// so that step is excluded. digests still come from the manifests, never the trace.
+    /// so that step is excluded. the digests are for the caller to compare with the
+    /// manifests, never to trust over them.
     ///
     /// `run_dir` is a handle on the run directory. the trace is untrusted input: the file is
     /// opened `O_NOFOLLOW | O_NONBLOCK` and must be a regular file. it has no size cap, because
     /// it grows with agent activity and a cap would make an honest run un-diffable. the read
     /// stops at the size the file had when it was opened, so a file that keeps growing cannot
-    /// extend it. each line is at most `TRACE_LINE_CAP` bytes, and at most `TRACE_STEP_CAP`
-    /// step events are accepted. a final line without a newline is a write
-    /// torn by a crash and is ignored. `step` events must ascend; any other malformed line
-    /// that could be one is `StoreError::InvalidTrace`. a missing trace is an `Io` error with
-    /// kind `NotFound`.
-    pub fn committed_steps_from_trace(run_dir: &File) -> Result<Vec<u64>, StoreError> {
+    /// extend it. each line is at most `TRACE_LINE_CAP` bytes, an empty line is refused (the
+    /// recorder never writes one), and at most `TRACE_STEP_CAP` step events are accepted.
+    /// memory use is bounded by one line, whatever the file holds. a final line without a
+    /// newline is a write torn by a crash and is ignored. `step` events must ascend; any other
+    /// malformed line that could be one is `StoreError::InvalidTrace`. a missing trace is an
+    /// `Io` error with kind `NotFound`.
+    pub fn read_trace(run_dir: &File) -> Result<TraceRead, StoreError> {
+        read_trace_capped(run_dir, TRACE_LINE_CAP)
+    }
+
+    /// `read_trace` with the line cap as a parameter, so a test can reach it with a small file.
+    pub fn read_trace_capped(run_dir: &File, line_cap: usize) -> Result<TraceRead, StoreError> {
         const OP: &str = "read trace";
         const TRACE: &str = "trace.jsonl";
         let invalid = |reason: String| StoreError::InvalidTrace { reason };
@@ -2381,14 +2420,14 @@ mod linux {
         // the size at open bounds the read, so a file that grows while it is read is not
         // followed past it. the per-line and step-count caps bound what the content can cost
         let mut reader = BufReader::new(file.take(size));
-        let mut steps: Vec<u64> = Vec::new();
+        let mut trace = TraceRead::default();
         let mut line: Vec<u8> = Vec::new();
         let mut line_no = 0u64;
         loop {
             line.clear();
             let read = reader
                 .by_ref()
-                .take(TRACE_LINE_CAP as u64 + 1)
+                .take(line_cap as u64 + 1)
                 .read_until(b'\n', &mut line)
                 .map_err(|e| io_err(OP, TRACE, e))?;
             if read == 0 {
@@ -2396,55 +2435,86 @@ mod linux {
             }
             line_no += 1;
             if line.last() != Some(&b'\n') {
-                if line.len() > TRACE_LINE_CAP {
+                if line.len() > line_cap {
                     return Err(invalid(format!(
-                        "line {line_no} is longer than {TRACE_LINE_CAP} bytes"
+                        "line {line_no} is longer than {line_cap} bytes"
                     )));
                 }
                 // a final line with no newline: a write torn by a crash, never committed
                 break;
             }
             line.pop();
-            if line.len() > TRACE_LINE_CAP {
+            if line.len() > line_cap {
                 return Err(invalid(format!(
-                    "line {line_no} is longer than {TRACE_LINE_CAP} bytes"
+                    "line {line_no} is longer than {line_cap} bytes"
                 )));
             }
-            // only the two event kinds that decide commitment are parsed. a bare quote in
+            if line.iter().all(u8::is_ascii_whitespace) {
+                return Err(invalid(format!("line {line_no} is empty")));
+            }
+            let first = trace.events == 0;
+            trace.events += 1;
+            // the first event is always parsed, to learn whether it is run_start. after
+            // that only the event kinds that decide commitment are parsed. a bare quote in
             // the pattern cannot occur inside a JSON string, so a path an agent controls
             // cannot make an event look like one of these
-            if !contains(&line, br#""type":"step""#)
+            if !first
+                && !contains(&line, br#""type":"step""#)
                 && !contains(&line, br#""type":"capture_failed""#)
+                && !contains(&line, br#""type":"run_start""#)
             {
                 continue;
             }
             let event: TraceEvent = serde_json::from_slice(&line)
                 .map_err(|e| invalid(format!("line {line_no} is not a valid event: {e}")))?;
             match event.kind.as_str() {
+                "run_start" => {
+                    if !first {
+                        return Err(invalid(format!("line {line_no}: a second run_start")));
+                    }
+                    trace.run_start = Some(TraceRunStart {
+                        workspace: event.workspace,
+                        run_cgroup: event.run_cgroup,
+                    });
+                }
                 "step" => {
                     let step = event.step.ok_or_else(|| {
                         invalid(format!("line {line_no}: a step event has no step"))
                     })?;
-                    if steps.last().is_some_and(|last| step <= *last) {
+                    if trace.committed.last().is_some_and(|last| step <= *last) {
                         return Err(invalid(format!(
                             "line {line_no}: step {step} does not ascend from the previous step event"
                         )));
                     }
-                    if steps.len() >= TRACE_STEP_CAP {
+                    if trace.committed.len() >= TRACE_STEP_CAP {
                         return Err(invalid(format!("more than {TRACE_STEP_CAP} step events")));
                     }
-                    steps.push(step);
+                    // a step event without a digest binds no snapshot
+                    if let Some(digest) = event.manifest_digest {
+                        if !is_valid_sha256_hex(&digest) {
+                            return Err(invalid(format!(
+                                "line {line_no}: the digest of step {step} is not 64 lowercase hex digits"
+                            )));
+                        }
+                        trace.digests.insert(step, digest);
+                    }
+                    trace.committed.push(step);
                 }
                 "capture_failed" if event.phase.as_deref() == Some("step_event") => {
                     // the step event could not be made durable, so the step is not committed
-                    if steps.last().is_some() && steps.last().copied() == event.step {
-                        steps.pop();
+                    if trace.committed.last().is_some()
+                        && trace.committed.last().copied() == event.step
+                    {
+                        trace.committed.pop();
+                        if let Some(step) = event.step {
+                            trace.digests.remove(&step);
+                        }
                     }
                 }
                 _ => {}
             }
         }
-        Ok(steps)
+        Ok(trace)
     }
 
     /// the fields of a trace line that decide whether a step is committed.
@@ -2454,6 +2524,9 @@ mod linux {
         kind: String,
         step: Option<u64>,
         phase: Option<String>,
+        manifest_digest: Option<String>,
+        workspace: Option<std::path::PathBuf>,
+        run_cgroup: Option<std::path::PathBuf>,
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
