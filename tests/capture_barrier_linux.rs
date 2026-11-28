@@ -35,17 +35,18 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use leash::cli::session_exit_code;
-use leash::recorder::{AskResolution, Attendance, CapturePhase, Mode};
+use leash::recorder::{AskResolution, Attendance, CapturePhase, FailNthSync, Mode};
 use leash::snapshot::restore::recompute_chain;
 use leash::snapshot::store::{
-    EntryKind, Limits, committed_steps_from_trace, load_manifest, published_steps, verify_object,
+    EntryKind, Limits, StoreError, committed_steps_from_trace, load_manifest, published_steps,
+    verify_object,
 };
 use leash::supervisor::barrier::BarrierOps;
 use leash::supervisor::cgroup::Cgroup;
 use leash::supervisor::run::RunError;
 use leash::supervisor::session::{
     ExitDisposition, SessionError, SessionHooks, SessionOutcome, SessionSpec,
-    run_session_with_hooks,
+    run_session_with_hooks, run_session_with_trace_sink,
 };
 use leash::supervisor::workspace_lock::WorkspaceLockError;
 use serde_json::Value;
@@ -1331,6 +1332,169 @@ fn a_thaw_that_does_not_complete_aborts_closed_after_the_step_is_committed() {
     // not. the agent was still frozen when the cgroup was killed
     assert_eq!(step_numbers(&events), vec![0, 1]);
     assert_agent_dead(&harness);
+}
+
+#[test]
+fn a_step_event_that_cannot_be_made_durable_leaves_the_tree_frozen_until_killed() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("step_event_sync") {
+        return;
+    }
+    let harness = Harness::new(&[]);
+    let thaws = AtomicU64::new(0);
+    let thaw = |group: &Cgroup, timeout: Duration| -> std::io::Result<()> {
+        thaws.fetch_add(1, Ordering::SeqCst);
+        group.set_frozen(false, timeout)
+    };
+    // the trace syncs three times before the agent can be affected: run_start, the step 0
+    // event, and then the event of step 1, which is the one that fails. the event reaches the
+    // file and never becomes durable
+    let result = run_session_with_trace_sink(
+        harness.spec(&format!("{WRITE_PID}put('m0')\ntime.sleep(60)\n")),
+        SessionHooks {
+            barrier: BarrierOps {
+                thaw: &thaw,
+                ..BarrierOps::default()
+            },
+            ..SessionHooks::default()
+        },
+        |file| FailNthSync::new(file, 3),
+    );
+    let events = assert_aborted_closed(&harness, result, 1, CapturePhase::StepEvent);
+    assert_eq!(
+        thaws.load(Ordering::SeqCst),
+        0,
+        "the tree was never thawed: it stayed frozen until the cgroup kill"
+    );
+    assert_agent_dead(&harness);
+    assert_eq!(
+        step_numbers(&events),
+        vec![0, 1],
+        "the event of step 1 was written to the file"
+    );
+    let run = harness.run_dir().unwrap();
+    let store = open_store(&run);
+    assert_eq!(
+        published_steps(&store).unwrap(),
+        vec![0, 1],
+        "the manifest of step 1 was published: an orphan"
+    );
+    assert_eq!(
+        committed_of(&run),
+        vec![0],
+        "step 1 is not committed, because its event is followed by capture_failed for it"
+    );
+    let chain = recompute_chain(&store, &committed_of(&run)).unwrap();
+    assert_eq!(chain.digests.len(), 1, "the orphan is not in the chain");
+}
+
+#[test]
+fn a_publish_the_store_refuses_at_a_boundary_aborts_closed() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("publish_refused") {
+        return;
+    }
+    let harness = Harness::new(&[]);
+    let state = harness.state.path().to_path_buf();
+    let thaws = AtomicU64::new(0);
+    let thaw = |group: &Cgroup, timeout: Duration| -> std::io::Result<()> {
+        thaws.fetch_add(1, Ordering::SeqCst);
+        group.set_frozen(false, timeout)
+    };
+    // the frozen re-check runs after the whole tree is captured and immediately before the
+    // manifest is renamed into place. a manifest that appears at that moment makes the store
+    // refuse the publication, after its objects and staged manifest exist
+    let plant = |group: &Cgroup| -> std::io::Result<bool> {
+        let run = first_run(&state).unwrap();
+        std::fs::write(manifest_path(&run, 1), "planted")?;
+        group.is_frozen()
+    };
+    let result = harness.run_with(
+        &format!("{WRITE_PID}put('m0')\ntime.sleep(60)\n"),
+        SessionHooks {
+            barrier: BarrierOps {
+                is_frozen: &plant,
+                thaw: &thaw,
+                ..BarrierOps::default()
+            },
+            ..SessionHooks::default()
+        },
+    );
+    let events = assert_aborted_closed(&harness, result, 1, CapturePhase::Capture);
+    assert_eq!(step_numbers(&events), vec![0], "no step event for step 1");
+    assert!(
+        of_type(&events, "capture_failed")[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("already exists"),
+        "{events:?}"
+    );
+    assert_eq!(thaws.load(Ordering::SeqCst), 0, "the tree stayed frozen");
+    assert_agent_dead(&harness);
+    let run = harness.run_dir().unwrap();
+    assert_eq!(
+        std::fs::read(manifest_path(&run, 1)).unwrap(),
+        b"planted",
+        "the store did not replace what was there"
+    );
+    assert_eq!(
+        std::fs::read_dir(run.join("snapshots/staging"))
+            .unwrap()
+            .count(),
+        0,
+        "the staged manifest of the refused publication was removed"
+    );
+    assert_eq!(committed_of(&run), vec![0]);
+}
+
+#[test]
+fn a_chain_head_that_cannot_be_computed_after_the_final_commit_is_recorded_and_aborts_closed() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("chain_head_error") {
+        return;
+    }
+    let harness = Harness::new(&[]);
+    let broken = |_: &[(u64, String)]| -> Result<String, StoreError> {
+        Err(StoreError::InvalidChain {
+            reason: "injected chain failure".into(),
+        })
+    };
+    let result = harness.run_with(
+        "put('a1', '1')\n",
+        SessionHooks {
+            chain_head: &broken,
+            ..SessionHooks::default()
+        },
+    );
+    match &result {
+        Err(SessionError::Run(RunError::ChainHead(_))) => {}
+        other => panic!("expected a chain head failure, got {other:?}"),
+    }
+    assert_eq!(session_exit_code(result), ExitCode::from(125));
+    let run = harness.run_dir().unwrap();
+    let events = events_of(&run);
+    let final_step = *step_numbers(&events).last().unwrap();
+    assert!(final_step >= 1, "the final step was committed: {events:?}");
+    assert_eq!(committed_of(&run).last(), Some(&final_step));
+    let failed = of_type(&events, "capture_failed");
+    assert_eq!(failed.len(), 1, "the failure is recorded: {events:?}");
+    assert_eq!(failed[0]["phase"], "chain_head");
+    assert_eq!(failed[0]["step"], final_step);
+    assert!(
+        failed[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("injected chain failure")
+    );
+    let final_seq = of_type(&events, "step").last().unwrap()["seq"]
+        .as_u64()
+        .unwrap();
+    assert!(failed[0]["seq"].as_u64().unwrap() > final_seq);
+    assert!(
+        of_type(&events, "run_end").is_empty(),
+        "no run_end without a chain head: {events:?}"
+    );
+    assert!(!run.join("report.txt").exists());
 }
 
 // ---------------------------------------------------------------------------------------
