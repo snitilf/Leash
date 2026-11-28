@@ -2,7 +2,7 @@
 
 - Status: architecture revised 2026-11-01 by ADR-0022.
   Snapshot scope, protected storage and rewind rules revised 2026-11-24 by ADR-0024 (enforce-mode snapshots without a custodian).
-  The ADR-0024 capture barrier, workspace lock, step digests and chain head (sections 2 and 3) are implemented; the rewind controls of section 5 are specified, not yet implemented.
+  The ADR-0024 capture barrier, workspace lock, step digests and chain head (sections 2 and 3), the restore engine and the `leash rewind` command (section 5) are implemented.
   Exact-capture implementation and adversarial validation pending.
   The historical M0 results below do not prove concurrent capture correctness.
 - Governs: FR-11, FR-12, FR-13, FR-17, FR-21; ADR-0005, ADR-0009, ADR-0022, ADR-0024, ADR-0026.
@@ -204,14 +204,22 @@ Rewind and diff follow ADR-0024 rules 17-22.
 
 Rewind requires the run's cgroup to be gone, not a `run_end` event, so a crashed run can be rewound.
 The cgroup-gone check returns a tri-state (`Gone`, `Present`, `Unknown`) by pinning the recorded parent directory on a cgroup2 mount first, or walking up to the nearest existing ancestor when opening the parent returns `ENOENT`, so a vanished transient scope under a cgroup2 mount reports `Gone` while a non-cgroup2, inaccessible, or unresolvable path never fails open as `Gone`.
-Rewind must treat `Unknown` as not gone and must also acquire `<run_dir>/run.lock` before modifying the workspace.
-Every snapshot `leash run` and `leash rewind` kills and removes stale run cgroups under its current parent cgroup that run metadata names; non-snapshot runs do not clean stale cgroups.
-A run cgroup is stale when its run lock can be taken and its `user.leash.lock` xattr matches that lock file's `<st_dev>:<st_ino>`.
-Only a Leash-named child of Leash's own cgroup is killed; a name from metadata is validated first.
+Rewind treats `Unknown` as not gone and also takes `<run_dir>/run.lock` before modifying the workspace.
+It takes the run lock first, so a held lock means a live run, then checks the cgroup.
+When the cgroup is `Present` and the lock was free, it releases the lock, runs the stale cleanup against the recorded parent, and takes the lock again before it checks once more.
+`leash rewind` is the command; its grammar, checks, output and exit codes are in [`cli.md`](cli.md) section 1.
+It also takes the workspace lock (both flocks, ADR-0026) for the whole rewind, and restores through the locked directory handle.
+Every snapshot `leash run` kills and removes stale run cgroups under its current parent cgroup; non-snapshot runs do not clean stale cgroups.
+`leash rewind` cannot reach a dead run's cgroup any other way, so it runs the same cleanup on the parent that the run's `meta.json` records for its run cgroup, and with no cgroup skipped.
+That cleanup may therefore kill and remove every stale Leash cgroup under the recorded parent, not only the rewound run's.
+A run cgroup is stale when its name is a valid Leash run name, its run lock under this state root can be taken, and its `user.leash.lock` xattr matches that lock file's `<st_dev>:<st_ino>`; a name from metadata is validated first, and nothing else is killed.
 Under per-run `systemd-run --scope` launches, a crashed run's cgroup lives in its own earlier scope, so a later run's parent-cgroup scan does not reach it (unverified, as systemd is absent in the codespace).
 Rewind also requires exclusive workspace ownership, and no live overlay mount or remaining references that could mutate the restored state.
 It targets only steps with a committed step event.
 The committed steps come from the trace (section 2), and the chain is recomputed over them (`restore::recompute_chain` takes the committed step list), so an orphan manifest is neither a target nor part of the chain.
+The trace is read as untrusted input.
+Before any write, the recomputed digest of the target manifest must equal the digest in its step event, and `--expect` must match the chain head or that digest.
+Every store object the plan writes is verified before the first write.
 Without `--step`, it restores step 0, the workspace as it was before the agent started.
 It takes the workspace from the working directory or a flag, and refuses when that differs from the run metadata.
 
@@ -232,6 +240,10 @@ It fsyncs each directory it changed before it applies directory metadata.
 `--expect <digest>` refuses a store whose digest does not match.
 
 Rewind first snapshots the current workspace, so every rewind can be undone.
+The safety snapshot is a complete store of its own at `<run_dir>/rewind/undo-<n>/`, with its own `objects/` and `manifests/step-000000.json`.
+It is outside `snapshots/`, so it is never part of the chain, never a step, and never reachable by `--step`.
+Rewind prints where it went and the `leash rewind <run-id> --undo <n>` command that restores it.
+`--undo <n>` takes a new safety snapshot first, so an undo can itself be undone.
 The agent can plant an entry that capture refuses, for example `mknod(S_IFSOCK)`, a mode-000 file, or a cap overrun.
 If that snapshot cannot be taken, rewind refuses and names `--no-undo`, which skips it.
 With `--no-undo`, rewind plans from a tolerant scan of the workspace instead (`scan_current`).
