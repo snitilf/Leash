@@ -1330,7 +1330,13 @@ fn prepare_parent(
     Ok((parent_fd, basename))
 }
 
-fn openat2(dirfd: RawFd, path: &CStr, flags: u64, mode: u64, resolve: u64) -> io::Result<OwnedFd> {
+pub(crate) fn openat2(
+    dirfd: RawFd,
+    path: &CStr,
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+) -> io::Result<OwnedFd> {
     let how = OpenHow {
         flags,
         mode,

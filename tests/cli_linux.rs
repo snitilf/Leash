@@ -927,9 +927,12 @@ fn enforce_openat2_rejects_nonzero_extensions_and_resolve_flags() {
                   how=(ctypes.c_ulonglong*4)(0,0,0,1)\n\
                   rc=libc.syscall(437,-100,b'target',ctypes.byref(how),32)\n\
                   assert rc == -1 and ctypes.get_errno() == errno.E2BIG, (rc,ctypes.get_errno())\n\
-                  how=(ctypes.c_ulonglong*4)(0,0,4,0)\n\
+                  how=(ctypes.c_ulonglong*4)(0,0,0x10,0)\n\
                   rc=libc.syscall(437,-100,b'target',ctypes.byref(how),24)\n\
-                  assert rc == -1 and ctypes.get_errno() == errno.EOPNOTSUPP, (rc,ctypes.get_errno())";
+                  assert rc == -1 and ctypes.get_errno() == errno.EOPNOTSUPP, (rc,ctypes.get_errno())\n\
+                  how=(ctypes.c_ulonglong*4)(0,0,0x40,0)\n\
+                  rc=libc.syscall(437,-100,b'target',ctypes.byref(how),24)\n\
+                  assert rc == -1 and ctypes.get_errno() == errno.EINVAL, (rc,ctypes.get_errno())";
 
     let opened = run_leash(
         &[
@@ -958,8 +961,93 @@ fn enforce_openat2_rejects_nonzero_extensions_and_resolve_flags() {
             .iter()
             .filter(|event| event["syscall"] == "openat2")
             .count(),
-        2
+        3
     );
+}
+
+/// the caller's own `resolve` restrictions narrow how its spelling may resolve, and Leash
+/// answers them as the kernel does: modern `tar` opens each directory it extracts into with
+/// `RESOLVE_BENEATH`, and a refusal that the restriction causes is recorded.
+#[test]
+fn enforce_openat2_honors_the_callers_beneath_and_no_symlinks_restrictions() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join("target"), b"target").unwrap();
+    std::fs::create_dir(ws.path().join("d")).unwrap();
+    std::fs::write(ws.path().join("d/f"), b"f").unwrap();
+    std::os::unix::fs::symlink("f", ws.path().join("d/link")).unwrap();
+    std::os::unix::fs::symlink("..", ws.path().join("d/up")).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let policy_path = state.path().join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        "schema_version = 1\n\
+         [[fs]]\npath=\"/**\"\nmode=[\"read\"]\naction=\"allow\"\n\
+         [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+    )
+    .unwrap();
+    let script = format!(
+        "import ctypes, errno, os\n\
+         libc=ctypes.CDLL(None,use_errno=True)\n\
+         P=os.O_PATH|os.O_CLOEXEC\n\
+         def oa(dirfd, path, flags, resolve):\n\
+        \x20   how=(ctypes.c_ulonglong*3)(flags,0,resolve)\n\
+        \x20   ctypes.set_errno(0)\n\
+        \x20   rc=libc.syscall(437,dirfd,path,ctypes.byref(how),24)\n\
+        \x20   return rc if rc >= 0 else -ctypes.get_errno()\n\
+         d=os.open('d',os.O_RDONLY|os.O_DIRECTORY)\n\
+         BENEATH,NO_SYMLINKS=0x08,0x04\n\
+         cases=[\n\
+        \x20 ('beneath, inside', oa(d,b'f',P,BENEATH), 'fd'),\n\
+        \x20 ('beneath, dot-dot out', oa(d,b'../target',P,BENEATH), -errno.EXDEV),\n\
+        \x20 ('beneath, absolute', oa(d,{target:?}.encode(),P,BENEATH), -errno.EXDEV),\n\
+        \x20 ('beneath, symlink out', oa(d,b'up/target',P,BENEATH), -errno.EXDEV),\n\
+        \x20 ('beneath, from the cwd', oa(-100,b'target',P,BENEATH), 'fd'),\n\
+        \x20 ('beneath, cwd dot-dot', oa(-100,b'../target',P,BENEATH), -errno.EXDEV),\n\
+        \x20 ('no symlinks, plain', oa(d,b'f',P,NO_SYMLINKS), 'fd'),\n\
+        \x20 ('no symlinks, followed', oa(d,b'link',P,NO_SYMLINKS), -errno.ELOOP),\n\
+        \x20 ('no symlinks, not followed', oa(d,b'link',P|os.O_NOFOLLOW,NO_SYMLINKS), 'fd'),\n\
+        \x20 ('no restriction, symlink out', oa(d,b'up/target',P,0), 'fd'),\n\
+         ]\n\
+         for name, got, want in cases:\n\
+        \x20   ok = got >= 0 if want == 'fd' else got == want\n\
+        \x20   assert ok, (name, got, want)\n",
+        target = ws.path().join("target").display(),
+    );
+
+    let opened = run_leash(
+        &[
+            "run",
+            "--unattended",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            &script,
+        ],
+        ws.path(),
+    );
+    assert_eq!(
+        opened.status.code(),
+        Some(0),
+        "each restriction must be answered as the kernel does: {}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    let events = trace_events(&only_run_dir(state.path()));
+    let refused = |errno: &str| {
+        events
+            .iter()
+            .filter(|event| {
+                event["syscall"] == "openat2"
+                    && event["matched_rule"] == "failsafe:realization"
+                    && event["errno"] == errno
+            })
+            .count()
+    };
+    assert_eq!(refused("EXDEV"), 4, "{events:#?}");
+    assert_eq!(refused("ELOOP"), 1, "{events:#?}");
 }
 
 #[test]

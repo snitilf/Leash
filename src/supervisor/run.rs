@@ -57,12 +57,41 @@ const CLONE_ARGS_MIN_SIZE: u64 = 8;
 const CLONE_ARGS_MAX_SIZE: u64 = 88;
 const OPEN_HOW_SIZE: usize = 24;
 
+/// the `RESOLVE_*` bits of `openat2(2)`.
+const RESOLVE_NO_XDEV: u64 = 0x01;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_IN_ROOT: u64 = 0x10;
+const RESOLVE_CACHED: u64 = 0x20;
+/// the bits the kernel accepts at all; any other is `EINVAL`.
+const RESOLVE_VALID: u64 = 0x3f;
+/// the bits Leash honors for the caller: they only restrict how the caller's own spelling of
+/// the path may resolve, so Leash checks the spelling against them and still opens the object
+/// the policy judged. `RESOLVE_IN_ROOT` changes what the spelling means and `RESOLVE_CACHED`
+/// changes whether the call may block, and neither is honored.
+const RESOLVE_HONORED: u64 =
+    RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH;
+
+/// the restrictions an `openat2` caller put on how its path may resolve, and what they apply to.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct ChildResolve {
+    /// the honored `RESOLVE_*` bits; zero when the caller asked for none
+    bits: u64,
+    /// the directory a relative `given` starts from; `None` when it could not be read
+    dir: Option<PathBuf>,
+    /// the path as the caller spelled it, before it was anchored
+    given: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 enum FsInvocation {
     Open {
         flags: u64,
         mode: u32,
         unsupported_errno: Option<i32>,
+        resolve: ChildResolve,
     },
     Mutation(MutationInvocation),
 }
@@ -1083,12 +1112,13 @@ fn handle_fs<N: Notifier, S: TraceSink>(
         ),
         GatherError,
     > = (|| {
-        let (path, empty_path) = read_anchored_with(
+        let anchored = read_anchored_parts(
             kernel,
             notif,
             &shape.path,
             empty_path_allowed(sys_nr, notif),
         )?;
+        let (path, empty_path) = (anchored.path.clone(), anchored.empty);
         let dest = match &shape.dest {
             Some(arg) => Some(read_anchored(kernel, notif, arg)?),
             None => None,
@@ -1120,6 +1150,7 @@ fn handle_fs<N: Notifier, S: TraceSink>(
                         flags,
                         mode: open_mode(sys_nr, notif),
                         unsupported_errno: None,
+                        resolve: ChildResolve::default(),
                     },
                 )
             }
@@ -1145,7 +1176,12 @@ fn handle_fs<N: Notifier, S: TraceSink>(
                     // openat2(2) refuses O_PATH with a bit O_PATH does not honor, where the
                     // legacy calls ignore it. nothing is opened, so the raw access stands
                     Some(libc::EINVAL)
-                } else if resolve != 0 {
+                } else if resolve & !RESOLVE_VALID != 0
+                    || resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT)
+                        == RESOLVE_BENEATH | RESOLVE_IN_ROOT
+                {
+                    Some(libc::EINVAL)
+                } else if resolve & (RESOLVE_IN_ROOT | RESOLVE_CACHED) != 0 {
                     Some(libc::EOPNOTSUPP)
                 } else {
                     None
@@ -1156,6 +1192,11 @@ fn handle_fs<N: Notifier, S: TraceSink>(
                         flags,
                         mode: u32::try_from(mode).unwrap_or(u32::MAX),
                         unsupported_errno,
+                        resolve: ChildResolve {
+                            bits: resolve & RESOLVE_HONORED,
+                            dir: anchored.dir,
+                            given: anchored.given,
+                        },
                     },
                 )
             }
@@ -1444,14 +1485,20 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
     // set only when the broker realized an O_PATH open, so an errno the supervisor chose
     // for an unsupported openat2 request is never mistaken for the substitute's refusal
     let mut o_path = false;
+    let mut resolve_refused = false;
     let result = match invocation {
         FsInvocation::Open {
             flags,
             mode,
             unsupported_errno,
+            resolve,
         } => {
             if let Some(errno) = unsupported_errno {
                 broker.borrow_mut().release(primary)?;
+                BrokerResult::Errno(errno)
+            } else if let Some(errno) = child_resolve_refusal(&resolve, flags) {
+                broker.borrow_mut().release(primary)?;
+                resolve_refused = true;
                 BrokerResult::Errno(errno)
             } else {
                 o_path = flags & crate::supervisor::fact::flags::O_PATH != 0;
@@ -1480,9 +1527,85 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
         result,
         Realization {
             o_path,
+            resolve_refused,
             newfd_flags: close_on_exec,
         },
     )
+}
+
+/// the errno an `openat2` caller's own `resolve` restrictions give the path it spelled, or
+/// `None` when they allow it (or there are none).
+///
+/// the restrictions only narrow how the caller's spelling may resolve, so the object opened is
+/// still the one the policy judged, pinned by the broker. they are checked by resolving the
+/// spelling once more, without opening anything, from the directory it starts from with the
+/// caller's own bits. only the answers the restrictions themselves cause are returned,
+/// `EXDEV` and `ELOOP`; any other failure is left to the real open, which answers it. a
+/// spelling that cannot be checked at all is refused `EOPNOTSUPP`, as every `resolve` was
+/// before they were honored.
+#[cfg(target_os = "linux")]
+fn child_resolve_refusal(check: &ChildResolve, flags: u64) -> Option<i32> {
+    use std::ffi::CString;
+    if check.bits == 0 {
+        return None;
+    }
+    let base_dir = if check.given.is_absolute() {
+        std::path::Path::new("/")
+    } else if let Some(dir) = check.dir.as_deref() {
+        dir
+    } else {
+        return Some(libc::EOPNOTSUPP);
+    };
+    let Ok(base_path) = CString::new(base_dir.as_os_str().as_bytes()) else {
+        return Some(libc::EOPNOTSUPP);
+    };
+    // SAFETY: base_path is a nul-terminated path and the flags are a fixed valid set.
+    let base_fd = unsafe {
+        libc::open(
+            base_path.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if base_fd < 0 {
+        return Some(libc::EOPNOTSUPP);
+    }
+    // SAFETY: base_fd was just returned by open and nothing else owns it.
+    let base = unsafe { OwnedFd::from_raw_fd(base_fd) };
+    let probe = |spelling: &std::path::Path, extra: i32| -> Result<(), i32> {
+        let Ok(spelling) = CString::new(spelling.as_os_str().as_bytes()) else {
+            return Ok(());
+        };
+        crate::supervisor::broker::openat2(
+            base.as_raw_fd(),
+            &spelling,
+            u64::try_from(libc::O_PATH | libc::O_CLOEXEC | extra).unwrap_or_default(),
+            0,
+            check.bits,
+        )
+        .map(drop)
+        .map_err(|error| error.raw_os_error().unwrap_or(0))
+    };
+    let honored =
+        i32::try_from(flags & (libc::O_NOFOLLOW | libc::O_DIRECTORY) as u64).unwrap_or_default();
+    let refusal = |errno: i32| matches!(errno, libc::EXDEV | libc::ELOOP).then_some(errno);
+    match probe(&check.given, honored) {
+        Ok(()) => None,
+        // a create names something that does not exist yet: its directory is what resolves
+        Err(libc::ENOENT) if flags & libc::O_CREAT as u64 != 0 => {
+            let parent = match check.given.parent() {
+                Some(parent) if parent.as_os_str().is_empty() => std::path::Path::new("."),
+                Some(parent) => parent,
+                None => return None,
+            };
+            probe(parent, libc::O_DIRECTORY).err().and_then(refusal)
+        }
+        Err(errno) => refusal(errno),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn child_resolve_refusal(_check: &ChildResolve, _flags: u64) -> Option<i32> {
+    None
 }
 
 /// how an allowed filesystem syscall's broker result is to be delivered.
@@ -1493,6 +1616,9 @@ struct Realization {
     /// kind) or EACCES (the file mode refuses its read-only reopen) is a realization
     /// failure, not an answer the kernel would have given
     o_path: bool,
+    /// the caller's own `openat2` `resolve` restrictions refuse the path it spelled, which
+    /// the allow already recorded did not take into account
+    resolve_refused: bool,
     /// the `newfd_flags` an injected descriptor is installed with
     newfd_flags: u32,
 }
@@ -1525,6 +1651,7 @@ fn deliver_realization<N: Notifier, S: TraceSink>(
         BrokerResult::Errno(errno @ (libc::EOPNOTSUPP | libc::EACCES)) if realization.o_path => {
             Delivery::Refused { errno }
         }
+        BrokerResult::Errno(errno) if realization.resolve_refused => Delivery::Refused { errno },
         result => respond_broker_result(kernel, notif.id, result, realization.newfd_flags)?,
     };
     if let Delivery::Refused { errno } = delivery {
@@ -2255,11 +2382,39 @@ fn read_anchored_with<N: Notifier>(
     arg: &PathArg,
     allow_empty: bool,
 ) -> Result<(PathBuf, bool), MemReadError> {
+    read_anchored_parts(kernel, notif, arg, allow_empty)
+        .map(|anchored| (anchored.path, anchored.empty))
+}
+
+/// a path operand as anchored, with the parts it was built from.
+struct Anchored {
+    /// the operand the policy judges
+    path: PathBuf,
+    /// the path was empty and `path` is the anchor itself
+    empty: bool,
+    /// the directory a relative spelling starts from, when it was read
+    dir: Option<PathBuf>,
+    /// the spelling the caller gave
+    given: PathBuf,
+}
+
+fn read_anchored_parts<N: Notifier>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    arg: &PathArg,
+    allow_empty: bool,
+) -> Result<Anchored, MemReadError> {
     let bytes = kernel.read_path(notif.pid, notif.data.args[arg.path_arg])?;
     let empty = allow_empty && bytes.is_empty();
-    let path = bytes_to_path(bytes);
-    if path.is_absolute() || !arg.anchor {
-        return Ok((path, false));
+    let given = bytes_to_path(bytes);
+    let unanchored = |given: PathBuf| Anchored {
+        path: given.clone(),
+        empty: false,
+        dir: None,
+        given,
+    };
+    if given.is_absolute() || !arg.anchor {
+        return Ok(unanchored(given));
     }
     let anchor = match arg.dirfd_arg {
         Some(i) if u64::from(notif.data.args[i] as u32) != flags::AT_FDCWD => {
@@ -2268,9 +2423,19 @@ fn read_anchored_with<N: Notifier>(
         _ => DirAnchor::Cwd,
     };
     match kernel.dir_prefix(notif.pid, anchor) {
-        Ok(prefix) if empty => Ok((prefix, true)),
-        Ok(prefix) => Ok((prefix.join(path), false)),
-        Err(_) => Ok((path, false)),
+        Ok(prefix) if empty => Ok(Anchored {
+            path: prefix.clone(),
+            empty: true,
+            dir: Some(prefix),
+            given,
+        }),
+        Ok(prefix) => Ok(Anchored {
+            path: prefix.join(&given),
+            empty: false,
+            dir: Some(prefix),
+            given,
+        }),
+        Err(_) => Ok(unanchored(given)),
     }
 }
 
@@ -3336,6 +3501,7 @@ mod tests {
             result,
             Realization {
                 o_path,
+                resolve_refused: false,
                 newfd_flags: 0,
             },
         )

@@ -327,7 +327,14 @@ denied.
 For a child `openat2`, v1 accepts the base `open_how` layout plus zero-filled extension bytes.
 Nonzero extension bytes return `E2BIG`.
 `O_PATH` with any flag outside `O_DIRECTORY`, `O_NOFOLLOW`, and `O_CLOEXEC` (an access mode, `O_CREAT`, `O_TRUNC`) returns `EINVAL`, as the kernel's `openat2` does, and nothing is opened or created; when several apply, `E2BIG` takes precedence, then `EINVAL`, then `EOPNOTSUPP`.
-Nonzero caller `resolve` flags return `EOPNOTSUPP` until their exact interaction with the broker's mandatory resolution flags is specified and tested.
+The caller's `resolve` flags `RESOLVE_NO_XDEV`, `RESOLVE_NO_MAGICLINKS`, `RESOLVE_NO_SYMLINKS`, and `RESOLVE_BENEATH` only narrow how the caller's own spelling of the path may resolve, so they add no authority and do not change the object the policy judged.
+After the policy allows the open, the supervisor resolves the spelling once more without opening anything, from the directory the spelling starts from and with the caller's bits, and answers the `EXDEV` or `ELOOP` the kernel would give.
+The refusal is recorded as a second event under `failsafe:realization` with the errno, like any other failure after a recorded allow.
+Any other outcome of that check is left to the real open, which answers it.
+A spelling that cannot be checked, because its directory cannot be read back, returns `EOPNOTSUPP`.
+Modern `tar` opens each directory it extracts into with `RESOLVE_BENEATH`, so refusing these flags broke extraction on hosts whose `tar` does that.
+`RESOLVE_IN_ROOT` and `RESOLVE_CACHED` return `EOPNOTSUPP`, because the first changes what the spelling means and the second changes whether the call may block, and neither is checked by the same second resolution.
+A bit outside the six the kernel defines, and `RESOLVE_BENEATH` with `RESOLVE_IN_ROOT`, return `EINVAL`, as the kernel does.
 
 ## 5. The denied-and-recorded set
 
