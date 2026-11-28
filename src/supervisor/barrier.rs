@@ -13,11 +13,17 @@
 //! 1. the current notification has been answered (the loop is synchronous)
 //! 2. stop receiving
 //! 3. write `cgroup.freeze=1` and wait boundedly for `frozen=1`
-//! 4. capture into the store, which publishes the manifest durably
-//! 5. re-read `cgroup.events` and require `frozen=1` still
-//! 6. write the step event and sync the trace
+//! 4. capture into the store, staging the manifest
+//! 5. re-read `cgroup.events` and require `frozen=1` still, before anything is published
+//! 6. publish the manifest durably, then write the step event and sync the trace
 //! 7. write `cgroup.freeze=0` and wait boundedly for `frozen=0`
 //! 8. resume receiving
+//!
+//! step 5 runs inside the store's capture, as its `before_publish` check, so a cgroup that
+//! thawed during the capture leaves no manifest for the step at all. a manifest that exists
+//! for a step was captured and published under an unbroken freeze. the only published
+//! manifest that can lack a step event is one whose event could not be made durable
+//! (`capture_failed` phase `step_event`), which `committed_steps_from_trace` excludes.
 //!
 //! any failure aborts the run closed: the failure is recorded when the recorder still
 //! works, the whole run cgroup is killed, and the run exits 125 with no `run_end`.
@@ -115,8 +121,18 @@ impl StoreCapture {
 }
 
 impl BoundaryCapture for StoreCapture {
-    fn capture(&self, step: u64) -> Result<Published, StoreError> {
-        store::capture(&self.workspace, &self.store, step, &self.limits)
+    fn capture_gated(
+        &self,
+        step: u64,
+        before_publish: &mut dyn FnMut() -> Result<(), StoreError>,
+    ) -> Result<Published, StoreError> {
+        store::capture_gated(
+            &self.workspace,
+            &self.store,
+            step,
+            &self.limits,
+            before_publish,
+        )
     }
 
     fn committed(&self, step: u64, manifest_digest: &str) {

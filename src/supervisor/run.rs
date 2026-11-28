@@ -2991,30 +2991,32 @@ mod linux {
         let froze_at = Instant::now();
         (ops.freeze)(cgroup, ops.freeze_timeout)
             .map_err(|e| fail_boundary(writer, now_ms(), step, CapturePhase::Freeze, e))?;
-        let published = capture
-            .capture(step)
-            .map_err(|e| fail_boundary(writer, now_ms(), step, CapturePhase::Capture, e))?;
-        match (ops.is_frozen)(cgroup) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(fail_boundary(
-                    writer,
-                    now_ms(),
-                    step,
-                    CapturePhase::FrozenCheck,
-                    "the run cgroup was no longer frozen after the capture",
-                ));
-            }
+        // the frozen re-check runs inside the store's capture, after the whole tree is read
+        // and before the manifest is published (ADR-0024 decision 10): a failed check leaves
+        // no manifest for the step. the check's own error is kept apart from a capture
+        // error, because the two are different phases of the failure event.
+        let mut frozen_failure: Option<String> = None;
+        let mut check_frozen = || -> Result<(), crate::snapshot::store::StoreError> {
+            let reason = match (ops.is_frozen)(cgroup) {
+                Ok(true) => return Ok(()),
+                Ok(false) => "the run cgroup was no longer frozen after the capture".to_string(),
+                Err(e) => e.to_string(),
+            };
+            frozen_failure = Some(reason.clone());
+            Err(crate::snapshot::store::StoreError::PublishRefused { reason })
+        };
+        let captured = capture.capture_gated(step, &mut check_frozen);
+        let published = match captured {
+            Ok(published) => published,
             Err(e) => {
-                return Err(fail_boundary(
-                    writer,
-                    now_ms(),
-                    step,
-                    CapturePhase::FrozenCheck,
-                    e,
-                ));
+                let phase = if frozen_failure.is_some() {
+                    CapturePhase::FrozenCheck
+                } else {
+                    CapturePhase::Capture
+                };
+                return Err(fail_boundary(writer, now_ms(), step, phase, e));
             }
-        }
+        };
         // the event must be durable before the thaw, so the pause it records ends here
         let pause = froze_at.elapsed();
         commit_step(writer, now_ms(), capture, step, &published, pause)
@@ -3099,9 +3101,10 @@ mod tests {
     /// a capture target that must never be called: these tests only exercise validation.
     struct Capture;
     impl crate::snapshot::BoundaryCapture for Capture {
-        fn capture(
+        fn capture_gated(
             &self,
             _: u64,
+            _: &mut dyn FnMut() -> Result<(), crate::snapshot::store::StoreError>,
         ) -> Result<crate::snapshot::store::Published, crate::snapshot::store::StoreError> {
             panic!("capture must not run")
         }

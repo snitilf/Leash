@@ -189,8 +189,21 @@ impl StepClock {
 /// would be a lie.
 pub trait BoundaryCapture {
     /// capture the workspace state as the snapshot for `step` and publish it durably.
-    /// returns the digest and statistics the store returned.
-    fn capture(&self, step: u64) -> Result<store::Published, store::StoreError>;
+    /// `before_publish` runs after the capture and immediately before the manifest is
+    /// published, and an `Err` from it publishes nothing (ADR-0024 decision 10: the
+    /// barrier re-reads `frozen=1` there). returns the digest and statistics the store
+    /// returned.
+    fn capture_gated(
+        &self,
+        step: u64,
+        before_publish: &mut dyn FnMut() -> Result<(), store::StoreError>,
+    ) -> Result<store::Published, store::StoreError>;
+
+    /// capture with no check before publication: step 0 and the final step, where no
+    /// process of the agent's tree exists.
+    fn capture(&self, step: u64) -> Result<store::Published, store::StoreError> {
+        self.capture_gated(step, &mut || Ok(()))
+    }
 
     /// the step event for `step` is durable: the step is committed and joins the chain.
     fn committed(&self, step: u64, manifest_digest: &str);

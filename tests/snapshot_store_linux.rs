@@ -13,8 +13,8 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 
 use leash::snapshot::store::{
-    DEFAULT_MAX_FILE_SIZE, EntryKind, Limits, StoreError, capture, committed_steps, load_manifest,
-    verify_object,
+    DEFAULT_MAX_FILE_SIZE, EntryKind, Limits, StoreError, capture, capture_gated, committed_steps,
+    load_manifest, verify_object,
 };
 
 fn open_dir(path: &Path) -> File {
@@ -545,5 +545,69 @@ fn failed_capture_leaves_committed_steps_unchanged() {
 
     let err = capture(&ws_fd, &store_fd, 1, &Limits::default()).unwrap_err();
     assert!(matches!(err, StoreError::UnsupportedEntry { .. }));
+    assert_eq!(committed_steps(&store_fd).unwrap(), vec![0]);
+}
+
+#[test]
+fn a_before_publish_check_runs_after_the_objects_and_before_the_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_path = tmp.path().join("ws");
+    let store_path = tmp.path().join("store");
+    create_workspace_dir(&ws_path);
+    fs::create_dir(&store_path).unwrap();
+    fs::write(ws_path.join("a.txt"), b"alpha").unwrap();
+    let ws_fd = open_dir(&ws_path);
+    let store_fd = open_dir(&store_path);
+
+    let mut calls = 0;
+    let published = capture_gated(&ws_fd, &store_fd, 0, &Limits::default(), &mut || {
+        calls += 1;
+        assert!(
+            !store_path.join("manifests/step-000000.json").exists(),
+            "no manifest exists when the check runs"
+        );
+        let objects = fs::read_dir(store_path.join("objects")).unwrap().count();
+        assert!(objects > 0, "the objects are already placed");
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(committed_steps(&store_fd).unwrap(), vec![0]);
+    assert_eq!(
+        load_manifest(&store_fd, 0).unwrap().1,
+        published.manifest_digest
+    );
+}
+
+#[test]
+fn a_refused_before_publish_check_publishes_no_manifest_and_leaves_no_staging_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_path = tmp.path().join("ws");
+    let store_path = tmp.path().join("store");
+    create_workspace_dir(&ws_path);
+    fs::create_dir(&store_path).unwrap();
+    fs::write(ws_path.join("a.txt"), b"alpha").unwrap();
+    let ws_fd = open_dir(&ws_path);
+    let store_fd = open_dir(&store_path);
+
+    let err = capture_gated(&ws_fd, &store_fd, 0, &Limits::default(), &mut || {
+        Err(StoreError::PublishRefused {
+            reason: "thawed".into(),
+        })
+    })
+    .unwrap_err();
+    assert!(
+        matches!(err, StoreError::PublishRefused { ref reason } if reason == "thawed"),
+        "{err:?}"
+    );
+    assert!(committed_steps(&store_fd).unwrap().is_empty());
+    assert!(!store_path.join("manifests/step-000000.json").exists());
+    assert_eq!(
+        fs::read_dir(store_path.join("staging")).unwrap().count(),
+        0,
+        "the staged manifest was removed"
+    );
+    // the refused step can be captured again: nothing was left behind to collide with
+    capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
     assert_eq!(committed_steps(&store_fd).unwrap(), vec![0]);
 }

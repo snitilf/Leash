@@ -227,6 +227,13 @@ pub enum StoreError {
     /// the OS random generator failed when creating a staging filename.
     #[error("random source failed: {0}")]
     Random(String),
+    /// the caller's `before_publish` check refused the capture, so no manifest was
+    /// published (the barrier's frozen re-check, ADR-0024 decision 10).
+    #[error("publication refused: {reason}")]
+    PublishRefused {
+        /// why the caller refused.
+        reason: String,
+    },
 }
 
 /// supported entry kinds in a snapshot manifest.
@@ -703,7 +710,9 @@ pub(crate) fn step_manifest_filename(step: u64) -> String {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{capture, committed_steps, load_manifest, scan_current, verify_object};
+pub use linux::{
+    capture, capture_gated, committed_steps, load_manifest, scan_current, verify_object,
+};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -1221,6 +1230,23 @@ mod linux {
         step: u64,
         limits: &Limits,
     ) -> Result<Published, StoreError> {
+        capture_gated(workspace, store, step, limits, &mut || Ok(()))
+    }
+
+    /// `capture` with a check that runs after the whole workspace is captured and its
+    /// manifest is staged, immediately before the manifest is renamed into place.
+    ///
+    /// the barrier uses it to re-read `frozen=1` after the capture and before anything is
+    /// published (ADR-0024 decision 10). an `Err` from `before_publish` discards the staged
+    /// manifest and is returned, so no manifest for `step` exists. objects already placed
+    /// stay in the store: they are content-addressed and unreferenced, never a snapshot.
+    pub fn capture_gated(
+        workspace: &File,
+        store: &File,
+        step: u64,
+        limits: &Limits,
+        before_publish: &mut dyn FnMut() -> Result<(), StoreError>,
+    ) -> Result<Published, StoreError> {
         let ws_stat = fstat_fd(workspace.as_raw_fd(), "fstat", "<workspace>")?;
         if !is_dir_mode(ws_stat.st_mode) {
             return Err(StoreError::InvalidRoot);
@@ -1510,6 +1536,11 @@ mod linux {
             ));
         }
         drop(staged_manifest);
+
+        if let Err(err) = before_publish() {
+            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+            return Err(err);
+        }
 
         let placed = match rename_noreplace(
             staging_dir.as_raw_fd(),
