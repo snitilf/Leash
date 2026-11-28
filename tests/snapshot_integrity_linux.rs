@@ -194,16 +194,22 @@ impl Run {
         })
     }
 
-    /// the denies whose path or destination is `dir` or beneath it. a run also holds the
-    /// loader's probes for libraries that do not exist, which are not denials of the agent's.
+    /// the denies whose path or destination is `dir` or beneath it. a run also holds probes
+    /// for names that do not exist, which are not refusals of the agent.
     fn denies_under(&self, dir: &Path) -> Vec<&serde_json::Value> {
         let beneath = |field: &serde_json::Value| {
             field
                 .as_str()
                 .is_some_and(|p| Path::new(p).starts_with(dir))
         };
+        // a probe for a name that does not exist is answered ENOENT as the kernel would,
+        // and recorded as a realization deny; it is not a refusal of the agent
+        let missing = |e: &serde_json::Value| {
+            e["matched_rule"] == "failsafe:realization" && e["errno"] == "ENOENT"
+        };
         self.denies_seen()
             .into_iter()
+            .filter(|e| !missing(e))
             .filter(|e| beneath(&e["fact"]["path"]) || beneath(&e["fact"]["dest"]))
             .collect()
     }
