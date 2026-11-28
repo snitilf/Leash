@@ -31,7 +31,7 @@ access to it (FR-21, FR-3).
 Measurement 0003 question 1 found the traces readable under the example policy, and writable under a broad write grant, before this deny existed.
 An implicit, first-ranked seccomp deny (`implicit:state_root`, ADR-0024) now refuses every access to the state root, reads included, and the moving, replacing or altering of its ancestors, before any policy rule.
 Landlock backs it up only where no policy grant overlaps the root, and where none overlaps it denies reads as well as writes.
-A snapshot run will refuse before spawn when a write-class grant overlaps the state root (ADR-0024, not yet implemented).
+A snapshot run refuses before spawn when a write-class grant overlaps the state root (ADR-0024).
 An escape test confirms the child cannot open `trace.jsonl` under any path,
 including `/proc` self-reference ([`escapes.md`](escapes.md), I2).
 

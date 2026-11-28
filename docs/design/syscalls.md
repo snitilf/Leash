@@ -338,7 +338,7 @@ The refusal is recorded as a second event under `failsafe:realization` with the 
 Any other outcome of that check is left to the real open, which answers it.
 A spelling that cannot be checked, because its directory cannot be opened, returns `EOPNOTSUPP`.
 The check and the open are separate resolutions of the spelling, so the caller's guarantee is best-effort under a concurrent swap of a path component, and the object the policy judged is still the one that is opened.
-The check runs in the supervisor, outside the broker's deadline, so a hung mount on the path could stall the loop; that is tracked in a follow-up issue.
+The check runs in the supervisor, outside the broker's deadline, so a hung mount on the path could stall the loop; that is tracked in a follow-up issue (issue #62).
 Modern `tar` opens each directory it extracts into with `RESOLVE_BENEATH`, so refusing these flags broke extraction on hosts whose `tar` does that.
 `RESOLVE_IN_ROOT` and `RESOLVE_CACHED` return `EOPNOTSUPP`, because the first changes what the spelling means and the second changes whether the call may block, and neither is checked by the same second resolution.
 A bit outside the six the kernel defines, and `RESOLVE_BENEATH` with `RESOLVE_IN_ROOT`, return `EINVAL`, as the kernel does.
@@ -367,7 +367,7 @@ operator, especially in record-only, wants to see that the agent reached for the
   and not scoped by mode: refusing it is not policy enforcement, it is refusing to let the agent
   make the trace lie. The recorded id is `sr4:pidfd_getfd`, in both modes, replacing the
   earlier enforce-only `failsafe:pidfd_getfd` id.
-- Legacy AIO (`io_setup`, `io_submit`), in a snapshot run only (ADR-0024 rule 8, specified by ADR-0024, not yet implemented).
+- Legacy AIO (`io_setup`, `io_submit`), in a snapshot run only (ADR-0024 rule 8).
   The freezer stops tasks, not in-flight I/O, so an AIO write could land across a capture boundary.
   Today AIO is allowed, unmediated and unrecorded (measurement 0003 question 4).
   The denial is recorded as an event and is scoped to snapshot runs.
