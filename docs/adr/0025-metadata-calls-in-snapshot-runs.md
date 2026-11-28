@@ -31,6 +31,7 @@ Some are newer than any C library, so nothing legitimate calls them yet, and the
    The numbers are checked against `arch/x86/entry/syscalls/syscall_64.tbl` and pinned in the filter tests.
 3. `fchmod`, `fchown`, `fsetxattr`, `fremovexattr` and the descriptor forms of `utimensat` and `futimesat` (a null path, which is `futimens` and `futimes`) are judged on the descriptor's target, read from `/proc/<pid>/fd/<n>`, as a write to that path, and then continued.
    The object is the descriptor's, fixed when the agent opened it, and the only pointer left in the call is a timestamp or value the agent owns.
+   The supervisor also duplicates the descriptor with `pidfd_getfd`, reads its filesystem type and `(st_dev, st_ino)`, and closes the duplicate: an object on cgroup2 or the state root directory is denied whatever path the link spells, and a descriptor that cannot be duplicated is denied.
 4. `utimensat` and `fchmodat2` with `AT_EMPTY_PATH` and an empty path act on the object of their directory descriptor, as the kernel does.
    They are realized by the broker on the descriptor's target path, not continued, because the empty string lives in agent memory and could be rewritten before the kernel read it.
 5. A call whose own arguments the kernel would refuse before it looked at any path, such as an unknown flag or an xattr value over 65536 bytes, is answered with that errno and recorded as `failsafe:unsupported_operand`.
@@ -46,7 +47,7 @@ A `user.` name gets `EPERM`, which is what the kernel answers for that namespace
 Another namespace gets `EOPNOTSUPP`.
 
 The descriptor forms keep one residual.
-A sibling thread can `dup2` another descriptor onto `<n>` between the supervisor's read of `/proc/<pid>/fd/<n>` and the `CONTINUE`.
+A sibling thread can `dup2` another descriptor onto `<n>` between the supervisor's read of `/proc/<pid>/fd/<n>`, its duplicate of the descriptor, and the `CONTINUE`.
 The judged object and the acted-on object can then differ.
 The residual is bounded by what the agent can hold: no descriptor on a protected file can be opened from inside the tree, because the open is denied, so the only descriptors the agent can swap in are on files it may already write.
 A descriptor on a protected file could still arrive through `open_tree`, which yields an `O_PATH` descriptor that these calls refuse with `EBADF` (unverified on Linux 6.13 and later), or through an out-of-tree helper that passes one over a socket.
