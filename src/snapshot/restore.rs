@@ -24,8 +24,9 @@ pub use super::store::{RefusedEntry, UNCAPTURED_SHA256, scan_current};
 
 use super::diff::display_path;
 use super::store::{
-    EntryKind, Limits, Manifest, ManifestEntry, StoreError, capture, committed_steps, hex_encode,
-    is_valid_sha256_hex, load_manifest, validate_manifest, validate_relative_path, verify_object,
+    EntryKind, Limits, Manifest, ManifestEntry, StoreError, capture, hex_encode,
+    is_valid_sha256_hex, load_manifest, published_steps, validate_manifest, validate_relative_path,
+    verify_object,
 };
 
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
@@ -97,7 +98,7 @@ impl RecomputedChain {
 /// from the result instead of loading it a second time.
 pub fn recompute_chain(store: &File) -> Result<RecomputedChain, StoreError> {
     let mut digests = Vec::new();
-    for (expected, step) in committed_steps(store)?.into_iter().enumerate() {
+    for (expected, step) in published_steps(store)?.into_iter().enumerate() {
         let expected = expected as u64;
         if step != expected {
             return Err(StoreError::InvalidChain {

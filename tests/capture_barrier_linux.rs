@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use leash::cli::session_exit_code;
 use leash::recorder::{AskResolution, Attendance, CapturePhase, Mode};
 use leash::snapshot::restore::recompute_chain;
-use leash::snapshot::store::{EntryKind, Limits, committed_steps, load_manifest, verify_object};
+use leash::snapshot::store::{EntryKind, Limits, load_manifest, published_steps, verify_object};
 use leash::supervisor::barrier::BarrierOps;
 use leash::supervisor::cgroup::Cgroup;
 use leash::supervisor::run::RunError;
@@ -256,7 +256,7 @@ fn assert_digests_and_chain(run: &Path, events: &[Value]) {
             "the step event of {step} carries the store's manifest digest"
         );
     }
-    assert_eq!(step_numbers(events), committed_steps(&store).unwrap());
+    assert_eq!(step_numbers(events), published_steps(&store).unwrap());
     assert_eq!(step_numbers(events)[0], 0, "step 0 is the first step event");
     let chain = recompute_chain(&store).unwrap();
     let end = of_type(events, "run_end");
@@ -1292,7 +1292,7 @@ fn a_cgroup_that_thaws_during_the_capture_aborts_closed_and_publishes_no_manifes
         !manifest_path(&run, 1).exists(),
         "a failed frozen re-check publishes no manifest"
     );
-    assert_eq!(committed_steps(&open_store(&run)).unwrap(), vec![0]);
+    assert_eq!(published_steps(&open_store(&run)).unwrap(), vec![0]);
     assert_agent_dead(&harness);
 }
 

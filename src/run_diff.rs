@@ -106,7 +106,7 @@ fn load_side(
     state_root: &Path,
     side: &RunRef,
 ) -> Result<crate::snapshot::store::Manifest, DiffRunError> {
-    use crate::snapshot::store::{committed_steps, load_manifest};
+    use crate::snapshot::store::{load_manifest, published_steps};
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -131,7 +131,7 @@ fn load_side(
     let run_dir = open_dir_at(Some(&runs), &id_c, false).map_err(|_| unknown())?;
     let store = open_dir_at(Some(&run_dir), c"snapshots", false).map_err(|_| no_store())?;
 
-    let steps = committed_steps(&store)
+    let steps = published_steps(&store)
         .map_err(|e| DiffRunError::Failure(format!("run '{label}': {e}")))?;
     let step = match side.step {
         Some(s) if steps.contains(&s) => s,

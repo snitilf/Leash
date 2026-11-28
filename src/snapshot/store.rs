@@ -711,7 +711,7 @@ pub(crate) fn step_manifest_filename(step: u64) -> String {
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    capture, capture_gated, committed_steps, load_manifest, scan_current, verify_object,
+    capture, capture_gated, load_manifest, published_steps, scan_current, verify_object,
 };
 
 #[cfg(target_os = "linux")]
@@ -2274,11 +2274,15 @@ mod linux {
         Ok(file)
     }
 
-    /// list all committed step numbers present in `manifests/`, sorted ascending.
+    /// list every step number with a published manifest in `manifests/`, sorted ascending.
+    ///
+    /// this is the set of manifests on disk, not the set of committed steps: a manifest
+    /// whose step event never became durable is an orphan and is listed here too. use
+    /// `committed_steps_from_trace` for the committed set (ADR-0024 decision 16).
     ///
     /// returns an empty list if `manifests/` does not exist yet. ignores any entry whose
     /// filename does not match `parse_step_filename`.
-    pub fn committed_steps(store: &File) -> Result<Vec<u64>, StoreError> {
+    pub fn published_steps(store: &File) -> Result<Vec<u64>, StoreError> {
         let store_stat = fstat_fd(store.as_raw_fd(), "fstat", "<store>")?;
         if !is_dir_mode(store_stat.st_mode) {
             return Err(StoreError::InvalidStore);

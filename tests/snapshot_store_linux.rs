@@ -13,8 +13,8 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 
 use leash::snapshot::store::{
-    DEFAULT_MAX_FILE_SIZE, EntryKind, Limits, StoreError, capture, capture_gated, committed_steps,
-    load_manifest, verify_object,
+    DEFAULT_MAX_FILE_SIZE, EntryKind, Limits, StoreError, capture, capture_gated, load_manifest,
+    published_steps, verify_object,
 };
 
 fn open_dir(path: &Path) -> File {
@@ -119,7 +119,7 @@ fn exact_round_trip_preserves_content_metadata_symlink_empty_dir_and_xattr() {
     assert_eq!(published.stats.total_bytes, (content.len() + 4) as u64);
     assert_eq!(published.stats.store_growth, (content.len() + 4) as u64);
 
-    assert_eq!(committed_steps(&store_fd).unwrap(), vec![0]);
+    assert_eq!(published_steps(&store_fd).unwrap(), vec![0]);
 
     let (manifest, digest) = load_manifest(&store_fd, 0).unwrap();
     assert_eq!(digest, published.manifest_digest);
@@ -298,7 +298,7 @@ fn fifo_and_unix_socket_are_refused() {
         matches!(err, StoreError::UnsupportedEntry { kind: "socket", .. }),
         "expected socket refusal, got {err:?}"
     );
-    assert!(committed_steps(&store_fd).unwrap().is_empty());
+    assert!(published_steps(&store_fd).unwrap().is_empty());
 }
 
 #[test]
@@ -418,7 +418,7 @@ fn second_capture_of_unchanged_tree_writes_zero_new_objects() {
     assert_eq!(second.stats.new_objects, 0);
     assert_eq!(second.stats.reused_objects, 2);
     assert_eq!(second.stats.store_growth, 0);
-    assert_eq!(committed_steps(&store_fd).unwrap(), vec![0, 1]);
+    assert_eq!(published_steps(&store_fd).unwrap(), vec![0, 1]);
 }
 
 #[test]
@@ -524,7 +524,7 @@ fn capturing_same_step_twice_returns_manifest_exists() {
 }
 
 #[test]
-fn failed_capture_leaves_committed_steps_unchanged() {
+fn failed_capture_leaves_published_steps_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
     let ws_path = tmp.path().join("ws");
     let store_path = tmp.path().join("store");
@@ -536,7 +536,7 @@ fn failed_capture_leaves_committed_steps_unchanged() {
     let store_fd = open_dir(&store_path);
 
     capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
-    assert_eq!(committed_steps(&store_fd).unwrap(), vec![0]);
+    assert_eq!(published_steps(&store_fd).unwrap(), vec![0]);
 
     let fifo_path = ws_path.join("bad-fifo");
     let c_fifo = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
@@ -545,7 +545,7 @@ fn failed_capture_leaves_committed_steps_unchanged() {
 
     let err = capture(&ws_fd, &store_fd, 1, &Limits::default()).unwrap_err();
     assert!(matches!(err, StoreError::UnsupportedEntry { .. }));
-    assert_eq!(committed_steps(&store_fd).unwrap(), vec![0]);
+    assert_eq!(published_steps(&store_fd).unwrap(), vec![0]);
 }
 
 #[test]
@@ -572,7 +572,7 @@ fn a_before_publish_check_runs_after_the_objects_and_before_the_manifest() {
     })
     .unwrap();
     assert_eq!(calls, 1);
-    assert_eq!(committed_steps(&store_fd).unwrap(), vec![0]);
+    assert_eq!(published_steps(&store_fd).unwrap(), vec![0]);
     assert_eq!(
         load_manifest(&store_fd, 0).unwrap().1,
         published.manifest_digest
@@ -600,7 +600,7 @@ fn a_refused_before_publish_check_publishes_no_manifest_and_leaves_no_staging_fi
         matches!(err, StoreError::PublishRefused { ref reason } if reason == "thawed"),
         "{err:?}"
     );
-    assert!(committed_steps(&store_fd).unwrap().is_empty());
+    assert!(published_steps(&store_fd).unwrap().is_empty());
     assert!(!store_path.join("manifests/step-000000.json").exists());
     assert_eq!(
         fs::read_dir(store_path.join("staging")).unwrap().count(),
@@ -609,5 +609,5 @@ fn a_refused_before_publish_check_publishes_no_manifest_and_leaves_no_staging_fi
     );
     // the refused step can be captured again: nothing was left behind to collide with
     capture(&ws_fd, &store_fd, 0, &Limits::default()).unwrap();
-    assert_eq!(committed_steps(&store_fd).unwrap(), vec![0]);
+    assert_eq!(published_steps(&store_fd).unwrap(), vec![0]);
 }
