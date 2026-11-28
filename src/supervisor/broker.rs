@@ -1034,6 +1034,11 @@ fn rename_held(source: &HeldPath, destination: &HeldPath, flags: u32) -> io::Res
 }
 
 fn mkdir_held(path: &HeldPath, mode: u32) -> io::Result<i64> {
+    // an anchor root has no parent or name, and it exists: the kernel answers a mkdir of any
+    // existing path `EEXIST`, which is what `tar -x -C <root>` expects of `.`
+    if path.parent.is_none() && path.target.is_some() {
+        return Err(io::Error::from_raw_os_error(libc::EEXIST));
+    }
     let (parent, name) = required_parent_name(path)?;
     // SAFETY: name is retained and parent is a live directory descriptor.
     rc_zero(unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) })
