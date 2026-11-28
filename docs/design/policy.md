@@ -183,7 +183,7 @@ confusing.
 
 The policy-derived Landlock ruleset is the kernel backstop in **enforce** mode (ADR-0003).
 **Record-only** applies no general policy ruleset (ADR-0010).
-Snapshots exist only in enforce mode (ADR-0024), and their implicit state-root deny is implemented (`implicit:state_root`, ADR-0024), while the cgroup denies are specified by ADR-0024, not yet implemented.
+Snapshots exist only in enforce mode (ADR-0024), and their implicit state-root and cgroup denies are implemented (`implicit:state_root`, `implicit:cgroup`, ADR-0024).
 This section describes only the policy derivation.
 It is derived from the
 same policy so the two enforcing layers cannot silently disagree. The derivation is a coarsening, and

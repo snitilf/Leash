@@ -2,7 +2,7 @@
 
 - Status: architecture revised 2026-11-01 by ADR-0022.
   Snapshot scope, protected storage and rewind rules revised 2026-11-24 by ADR-0024 (enforce-mode snapshots without a custodian).
-  The ADR-0024 capture barrier, workspace lock, step digests and chain head (sections 2 and 3) are implemented; the other ADR-0024 controls in sections 2, 3 and 5 are specified, not yet implemented.
+  The ADR-0024 capture barrier, workspace lock, step digests and chain head (sections 2 and 3) are implemented; the rewind controls of section 5 are specified, not yet implemented.
   Exact-capture implementation and adversarial validation pending.
   The historical M0 results below do not prove concurrent capture correctness.
 - Governs: FR-11, FR-12, FR-13, FR-17, FR-21; ADR-0005, ADR-0009, ADR-0022, ADR-0024, ADR-0026.
