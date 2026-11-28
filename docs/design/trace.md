@@ -112,6 +112,8 @@ In a run with no policy, `matched_rule` carries a fixed base id naming what deci
 `sr4:io_uring`, `sr4:pidfd_getfd`, and `sr3:foreign_abi` (the denied-and-recorded set), and
 `failsafe:memory_read` (a case-C deny), and `failsafe:realization` (an enforce-mode path preparation failure, or a realization failure recorded as a second event after the allow, either with its `errno`).
 An enforce run with a policy adds `implicit:state_root`, the implicit deny of the state root and of moving, replacing or altering its ancestors, and `implicit:supervisor_proc`, the implicit deny of the supervisor's and broker's `/proc/<pid>/` trees; both rank before every policy rule (FR-21, ADR-0024).
+A snapshot run (`snapshot_integrity`) adds `implicit:cgroup`, the implicit deny of every cgroup2 mount and of moving, replacing or altering its ancestors, ranked the same way (ADR-0024 decision 4), and `snapshot:metadata`, which only a seccomp filter and run flag that disagree can produce.
+Its `landlock_residuals` also carry `landlock:snapshot_store_read_overlap` when a read-only grant overlaps the state root or a cgroup2 mount (ADR-0024 decision 5).
 These are trace vocabulary, not policy rules; a loaded policy's rule ids never
 collide with them because they carry a `:` and rule ids are plain names.
 

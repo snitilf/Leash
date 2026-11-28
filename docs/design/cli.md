@@ -130,7 +130,10 @@ It refuses before spawn, as a supervisor failure with the message on stderr and 
 
 - the host has no writable, delegated cgroup v2 with working `cgroup.freeze` and `cgroup.kill`; the message names the hint `systemd-run --user --scope -p Delegate=yes`, which is unverified until a CI leg runs it;
 - the Landlock ABI is below 3, a refusal tested through an injected probe because no available host has an ABI below 3;
-- a Landlock grant with write, truncate, make, remove or refer rights overlaps the state root or any cgroup2 mount, as an ancestor or a descendant.
+- a Landlock grant with write, truncate, make, remove or refer rights overlaps the state root or any cgroup2 mount, as an ancestor or a descendant; the message names the rule, the grant path, the rights and the protected path.
+
+The session already applies all three refusals and the implicit `implicit:cgroup` deny when its `snapshot_integrity` field is set.
+What is still missing is the `--snapshots` flag that sets it, which the capture slice adds.
 
 `rewind` restores the workspace to step `N` of the run, or to step 0 (the workspace as it was before the agent started) when `--step` is omitted.
 It exits 2 for an unknown run or an unknown step.

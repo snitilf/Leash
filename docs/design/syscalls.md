@@ -120,7 +120,7 @@ for write). It is above the kernel floor (ABI 3 is Linux 6.2, floor is ABI 2), s
 ABI lacks it the seccomp layer mediates `truncate` and the missing backstop is stamped as a residual,
 per the degrade table in [`architecture.md`](architecture.md) section 5.1 (ADR-0012, ADR-0013).
 
-`ftruncate`, `fchmod`, `fchown` act on an fd already decided at open and are pass-through, as are
+`ftruncate`, `fchmod`, `fchown` act on an fd already decided at open and are pass-through (in a snapshot run `fchmod` and `fchown` are decided on the descriptor's target, see the end of section 3.3), as are
 `chdir` and `fchdir`, which change the process's cwd and mutate nothing (traversal is governed by
 Landlock reachability regardless). Their metadata-mutating path cousins `chmod`, `chown`, `fchmodat`,
 `fchownat` are mediated and decided as a **write** to the target path against the existing `fs`
@@ -160,6 +160,16 @@ The denial is recorded with the rule id `snapshot:clone3`.
 `ENOSYS` matches the `io_uring` denial and tells a caller the facility is absent, which is how libaio and glibc already handle a kernel without AIO.
 The freezer stops tasks, not in-flight I/O, so no AIO context may exist.
 `io_getevents`, `io_pgetevents`, `io_cancel` and `io_destroy` need a context and fail with `EINVAL` on their own.
+
+A snapshot run also traps the metadata calls Landlock has no right for (ADR-0024 decision 4), and only that run: the filter of a run without snapshots is byte for byte unchanged.
+The path forms are `setxattr`, `lsetxattr`, `removexattr`, `lremovexattr`, `utimensat`, `utimes`, `utime`, `futimesat`, `fchmodat2` and `lchown`.
+They go through the same path as `chmod`: the broker resolves the path on a retained handle, the access is a write to the resolved identity, the implicit denies (`implicit:state_root`, `implicit:cgroup`) rank before policy, and an allow is realized by the broker, never by `CONTINUE`.
+The legacy time calls become one `utimensat` on the handle, and `fchmodat2` with only `AT_SYMLINK_NOFOLLOW` is refused `EOPNOTSUPP` for a symlink; any other `fchmodat2` flag is refused.
+The descriptor forms are `fchmod`, `fchown`, `fsetxattr`, `fremovexattr` and `utimensat` or `futimesat` with a null path (`futimens`).
+Their target is read back from `/proc/<pid>/fd/<n>`, judged as a write to that path, and an allow continues.
+That is not a pointer re-read: the object is the descriptor's, and a descriptor on a state-root or cgroup2 file cannot be obtained because the open is denied.
+A target that cannot be read is denied as `failsafe:memory_read`.
+The filter and the run flag are checked at the start of the loop, and a trapped metadata call that reaches a run without the flag is denied and recorded as `snapshot:metadata`.
 A run without snapshots keeps the filter and the trace unchanged: the AIO numbers are not in its filter.
 
 ### 3.4 Cross-process control
