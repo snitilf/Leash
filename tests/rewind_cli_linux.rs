@@ -640,6 +640,47 @@ fn an_orphan_manifest_is_not_a_target() {
 }
 
 #[test]
+fn a_step_event_followed_by_a_failed_step_event_boundary_is_not_committed() {
+    let Some(mut f) = Fixture::gone() else { return };
+    populate(&f);
+    f.commit_step(0);
+    agent_edits(&f);
+    f.commit_step(1);
+    // the step event reached the trace, but the barrier then reported that it could not be
+    // made durable, so the boundary did not commit
+    let seq = f.trace.len();
+    f.trace.push(
+        json!({
+            "seq": seq, "ts": 3, "type": "capture_failed", "step": 1,
+            "phase": "step_event", "error": "disk full",
+        })
+        .to_string(),
+    );
+    f.flush_trace();
+    let before = tree_state(&f.ws);
+
+    let out = f.rewind(&["--step", "1"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("no committed step event"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(tree_state(&f.ws), before);
+    // a failed thaw happens after the step event was durable, so that step stays committed
+    f.trace.pop();
+    f.trace.push(
+        json!({
+            "seq": seq, "ts": 3, "type": "capture_failed", "step": 1,
+            "phase": "thaw", "error": "stuck",
+        })
+        .to_string(),
+    );
+    f.flush_trace();
+    assert_success_notice(&f.rewind(&["--step", "1"]));
+}
+
+#[test]
 fn a_workspace_that_is_not_the_runs_is_refused() {
     let Some(mut f) = Fixture::gone() else { return };
     populate(&f);

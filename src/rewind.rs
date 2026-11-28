@@ -627,6 +627,12 @@ mod linux {
     }
 
     #[derive(Deserialize)]
+    struct FailedEvent {
+        step: u64,
+        phase: String,
+    }
+
+    #[derive(Deserialize)]
     struct StartEvent {
         workspace: PathBuf,
         run_cgroup: Option<PathBuf>,
@@ -672,6 +678,18 @@ mod linux {
                     }
                 }
                 _ if events == 0 => return Err(bad("the first event is not run_start".into())),
+                "capture_failed" => {
+                    let failed: FailedEvent = match serde_json::from_str(line) {
+                        Ok(failed) => failed,
+                        Err(_) if torn_tail => continue,
+                        Err(e) => return Err(bad(format!("line {at}: {e}"))),
+                    };
+                    // the step event of this boundary could not be made durable, so the
+                    // step is not committed even when its event reached the trace
+                    if failed.phase == "step_event" {
+                        steps.remove(&failed.step);
+                    }
+                }
                 "step" => {
                     let step: StepEvent = match serde_json::from_str(line) {
                         Ok(step) => step,
