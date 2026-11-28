@@ -89,6 +89,13 @@ impl Session {
         }
     }
 
+    /// the same session with its workspace on tmpfs, where `user.` xattrs reach 64 KiB, or
+    /// none when `/dev/shm` is not writable here.
+    fn on_tmpfs() -> Option<Self> {
+        let ws = tempfile::tempdir_in("/dev/shm").ok()?;
+        Some(Self { ws, ..Self::new() })
+    }
+
     /// the same session without snapshot integrity, as a plain enforce run.
     fn plain() -> Self {
         Self {
@@ -902,6 +909,69 @@ check(sc(280, AT_FDCWD, path, 0, 0x4000), errno.EINVAL, 'utimensat with an unkno
 }
 
 #[test]
+fn a_setxattr_value_of_exactly_the_kernel_maximum_is_stored_whole() {
+    let _guard = spawn_lock();
+    if !delegated("xattr_value_maximum") {
+        return;
+    }
+    let Some(session) = Session::on_tmpfs() else {
+        eprintln!("skipped: /dev/shm is not writable");
+        return;
+    };
+    let ws = session.ws();
+    let script = format!(
+        "{RAW_SYSCALL}{}",
+        r#"
+import errno, os, sys
+f = @WS@ + '/f'
+open(f, 'w').write('x')
+name = 'user.leash.big'
+value = bytes(range(256)) * 256
+assert len(value) == 65536
+try:
+    os.setxattr(f, name, value)
+except OSError as e:
+    if e.errno == errno.ENOTSUP:
+        sys.exit(77)
+    raise
+stored = os.getxattr(f, name)
+assert len(stored) == 65536, ('stored length', len(stored))
+assert stored == value, 'the stored value differs from the one written'
+over = ctypes.create_string_buffer(65537)
+result = sc(188, ctypes.c_char_p(f.encode()), ctypes.c_char_p(name.encode()),
+            ctypes.cast(over, ctypes.c_void_p), 65537, 0)
+assert result == (-1, errno.E2BIG), ('65537 bytes', result)
+assert os.getxattr(f, name) == value, 'a refused call leaves the old value'
+"#
+        .replace("@WS@", &format!("{:?}", ws.to_string_lossy()))
+    );
+    let run = session.python(&script).unwrap();
+    if matches!(run.exit, ExitDisposition::Exited(77)) {
+        eprintln!("skipped: tmpfs here does not take user xattrs");
+        return;
+    }
+    run.assert_exit_zero();
+    let file = ws.join("f");
+    assert!(
+        run.events.iter().any(|e| e["syscall"] == "setxattr"
+            && e["decision"] == "allow"
+            && e["fact"]["path"] == file.to_string_lossy().as_ref()),
+        "the 65536-byte setxattr is allowed: {:#?}",
+        run.events
+    );
+    let refused = run.rule_events("failsafe:unsupported_operand");
+    assert_eq!(refused.len(), 1, "{refused:#?}");
+    assert_eq!(refused[0]["syscall"], "setxattr");
+    assert_eq!(refused[0]["errno"], "E2BIG");
+    assert_eq!(refused[0]["decision"], "deny");
+    assert!(
+        run.rule_events("failsafe:memory_read").is_empty(),
+        "no value was cut short by a failed read: {:#?}",
+        run.events
+    );
+}
+
+#[test]
 fn tar_extracts_and_cp_copies_a_tree_with_links_and_times_in_a_snapshot_run() {
     let _guard = spawn_lock();
     if !delegated("tar_and_cp") {
@@ -981,6 +1051,155 @@ fn tar_extracts_and_cp_copies_a_tree_with_links_and_times_in_a_snapshot_run() {
             .iter()
             .any(|e| e["syscall"] == "utimensat" && e["decision"] == "allow"),
         "the time restoration went through the mediated utimensat"
+    );
+}
+
+// --- the anchor root as the target of a no-follow metadata call ---
+
+fn mtime_secs(path: &Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).unwrap().mtime()
+}
+
+const ANCHOR_STAMP: i64 = 1_000_000_000;
+
+#[test]
+fn touch_h_on_the_workspace_root_sets_its_time() {
+    let _guard = spawn_lock();
+    if !delegated("anchor_root_touch_h") {
+        return;
+    }
+    let session = Session::new();
+    let ws = session.ws();
+    let script = format!("/usr/bin/touch -h -d @{ANCHOR_STAMP} {}", ws.display());
+    let run = session.run(&["/bin/sh", "-c", &script]).unwrap();
+    run.assert_exit_zero();
+    assert_eq!(mtime_secs(&ws), ANCHOR_STAMP, "the root's time is set");
+    assert!(
+        run.denies_under(&ws).is_empty(),
+        "{:#?}",
+        run.denies_under(&ws)
+    );
+}
+
+#[test]
+fn utimensat_with_at_empty_path_on_the_workspace_root_sets_its_time() {
+    let _guard = spawn_lock();
+    if !delegated("anchor_root_empty_path") {
+        return;
+    }
+    let session = Session::new();
+    let ws = session.ws();
+    let script = format!(
+        "{RAW_SYSCALL}{}",
+        r#"
+import errno, os
+EMPTY = 0x1000
+dfd = os.open(@WS@, os.O_RDONLY | os.O_DIRECTORY)
+times = (ctypes.c_long * 4)(5, 0, 1000000000, 0)
+result = sc(280, dfd, ctypes.c_char_p(b''), ctypes.cast(times, ctypes.c_void_p), EMPTY)
+assert result == (0, 0), (result, errno.errorcode.get(result[1]))
+assert os.stat(@WS@).st_mtime == 1000000000
+"#
+        .replace("@WS@", &format!("{:?}", ws.to_string_lossy()))
+    );
+    let run = session.python(&script).unwrap();
+    run.assert_exit_zero();
+    assert_eq!(mtime_secs(&ws), ANCHOR_STAMP, "the root's time is set");
+    assert!(
+        run.denies_under(&ws).is_empty(),
+        "{:#?}",
+        run.denies_under(&ws)
+    );
+}
+
+#[test]
+fn lchown_on_the_workspace_root_to_the_callers_own_ids_succeeds() {
+    let _guard = spawn_lock();
+    if !delegated("anchor_root_lchown") {
+        return;
+    }
+    let session = Session::new();
+    let ws = session.ws();
+    let script = format!(
+        "{RAW_SYSCALL}{}",
+        r#"
+import errno, os
+ws = @WS@
+uid, gid = os.getuid(), os.getgid()
+os.lchown(ws, uid, gid)
+result = sc(260, -100, ctypes.c_char_p(ws.encode()), uid, gid, 0x100)
+assert result == (0, 0), ('fchownat nofollow', result, errno.errorcode.get(result[1]))
+# a supplementary group is a change an unprivileged caller can make and observe
+others = [g for g in os.getgroups() if g != gid]
+if others:
+    os.lchown(ws, -1, others[0])
+    assert os.lstat(ws).st_gid == others[0], 'the group of the root changed'
+    os.lchown(ws, -1, gid)
+    assert os.lstat(ws).st_gid == gid
+"#
+        .replace("@WS@", &format!("{:?}", ws.to_string_lossy()))
+    );
+    let run = session.python(&script).unwrap();
+    run.assert_exit_zero();
+    assert!(
+        run.denies_under(&ws).is_empty(),
+        "{:#?}",
+        run.denies_under(&ws)
+    );
+    for syscall in ["lchown", "fchownat"] {
+        assert!(
+            run.events.iter().any(|e| e["syscall"] == syscall
+                && e["decision"] == "allow"
+                && e["fact"]["path"] == ws.to_string_lossy().as_ref()),
+            "no allow event for {syscall} on the root: {:#?}",
+            run.events
+        );
+    }
+}
+
+#[test]
+fn tar_extracting_into_the_workspace_root_restores_the_time_of_dot() {
+    let _guard = spawn_lock();
+    if !delegated("anchor_root_tar") {
+        return;
+    }
+    let session = Session::new();
+    let ws = session.ws();
+    let holder = tempfile::tempdir().unwrap();
+    let src = holder.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    let status = std::process::Command::new("touch")
+        .args(["-d", "2001-02-03 04:05:06 UTC"])
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let stamp = mtime_secs(&src);
+    let archive = holder.path().join("a.tar");
+    let status = std::process::Command::new("tar")
+        .arg("-cf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&src)
+        .arg(".")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let script = format!("/usr/bin/tar -xf {} -C {}", archive.display(), ws.display());
+    let run = session.run(&["/bin/sh", "-c", &script]).unwrap();
+    run.assert_exit_zero();
+    assert_eq!(std::fs::read(ws.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(
+        mtime_secs(&ws),
+        stamp,
+        "the time of . is restored on the root"
+    );
+    assert!(
+        run.denies_under(&ws).is_empty(),
+        "{:#?}",
+        run.denies_under(&ws)
     );
 }
 
