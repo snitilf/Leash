@@ -66,6 +66,21 @@ fn store_dir(state: &Path, run: &str) -> std::path::PathBuf {
     dir
 }
 
+/// write the `trace.jsonl` of `run` with one `step` event per committed step, and any raw lines
+/// after them. a step is committed when its event is in the trace (ADR-0024 decision 16), not
+/// when its manifest exists.
+fn write_trace(state: &Path, run: &str, committed: &[u64], extra: &[&str]) {
+    let mut lines: Vec<String> = committed
+        .iter()
+        .enumerate()
+        .map(|(seq, step)| format!(r#"{{"seq":{seq},"ts":0,"type":"step","step":{step}}}"#))
+        .collect();
+    lines.extend(extra.iter().map(|l| (*l).to_string()));
+    let dir = state.join("runs").join(run);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("trace.jsonl"), lines.join("\n") + "\n").unwrap();
+}
+
 /// run-a: step 0 is the starting tree, step 1 the tree after the agent worked.
 /// run-b: one step, identical to run-a step 0 except for one file.
 fn fixture(state: &Path, scratch: &Path) {
@@ -96,6 +111,8 @@ fn fixture(state: &Path, scratch: &Path) {
     symlink("c.txt", ws.join("l")).unwrap();
     set_mtime(&ws.join("d"), 2_000_000_000);
     capture(&open_dir(&ws), &open_dir(&a), 1, &Limits::default()).unwrap();
+    write_trace(state, "run-a", &[0, 1], &[]);
+    write_trace(state, "run-b", &[0], &[]);
 }
 
 const A_STEP0_TO_STEP1: &str = "\
@@ -235,4 +252,75 @@ fn corrupt_manifest_fails_with_the_reason() {
     assert_eq!(stdout(&out), "");
     let err = stderr(&out);
     assert!(err.contains("run 'run-b' step 0"), "{err}");
+}
+
+/// a manifest newer than the last committed step: published, but its step event never became
+/// durable, so the default step of `leash diff` must not be it.
+fn plant_orphan(state: &Path, scratch: &Path) {
+    let ws = scratch.join("ws");
+    fs::write(ws.join("orphan.txt"), "late").unwrap();
+    let a = state.join("runs/run-a/snapshots");
+    capture(&open_dir(&ws), &open_dir(&a), 2, &Limits::default()).unwrap();
+}
+
+#[test]
+fn an_orphan_manifest_is_never_the_default_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    fixture(&state, tmp.path());
+    plant_orphan(&state, tmp.path());
+
+    // the final committed step is 1, although a manifest for step 2 exists
+    let out = leash(&state, &["run-a:0", "run-a"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), A_STEP0_TO_STEP1);
+
+    // and the orphan cannot be named either
+    let out = leash(&state, &["run-a:0", "run-a:2"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("no committed step 2 (committed: 0, 1)"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_step_event_followed_by_its_own_step_event_failure_is_not_committed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    fixture(&state, tmp.path());
+    // the event for step 1 was written but could not be made durable: the run recorded
+    // capture_failed for that step and aborted
+    write_trace(
+        &state,
+        "run-a",
+        &[0, 1],
+        &[
+            r#"{"seq":2,"ts":0,"type":"capture_failed","step":1,"phase":"step_event","error":"sync"}"#,
+        ],
+    );
+
+    let out = leash(&state, &["run-a:0", "run-a"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "no differences\n", "the default is step 0");
+    let out = leash(&state, &["run-a:0", "run-a:1"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("no committed step 1 (committed: 0)"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_run_without_a_trace_has_no_committed_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    fixture(&state, tmp.path());
+    fs::remove_file(state.join("runs/run-a/trace.jsonl")).unwrap();
+
+    let out = leash(&state, &["run-b", "run-a"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("no trace.jsonl"), "{}", stderr(&out));
 }
