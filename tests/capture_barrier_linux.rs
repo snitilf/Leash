@@ -430,145 +430,273 @@ fn a_write_pattern_yields_the_expected_steps_and_each_manifest_matches_its_momen
 // consistency: writes that tick no mediated event
 // ---------------------------------------------------------------------------------------
 
-#[test]
-fn a_persistent_fd_writer_is_never_captured_torn() {
+/// the two writers that tick no mediated event after setup. each stores the counter `i` in the
+/// last unit of its file and then in the first, forever, from a forked process, so the file is
+/// never inconsistent in a way the supervisor could see by watching events.
+///
+/// a capture of a frozen tree reads a moment at which the writer is stopped between or
+/// after its two stores, so `tail - head` is 0 or 1. a copy of a running tree reads the head,
+/// keeps reading while the writer advances, and reads the tail much later: the difference is
+/// the number of iterations that ran meanwhile, in the tens of thousands for these sizes. the
+/// negative-control tests below prove that difference shows, so these positive tests can fail.
+#[derive(Clone, Copy)]
+enum Workload {
+    /// a `MAP_SHARED` file of 1 Mi words, stored through the mapping.
+    SharedMap,
+    /// a file of 2048 records of 4 KiB, written with `pwrite` through one descriptor.
+    PersistentFd,
+}
+
+impl Workload {
+    fn name(self) -> &'static str {
+        match self {
+            Self::SharedMap => "map",
+            Self::PersistentFd => "log",
+        }
+    }
+
+    /// the agent code that creates the file, forks the writer and returns in the parent.
+    fn setup(self) -> &'static str {
+        match self {
+            Self::SharedMap => {
+                r#"
+N = 1 << 20
+fd = os.open(WS + '/map', os.O_RDWR | os.O_CREAT, 0o644)
+os.ftruncate(fd, 8 * N)
+mm = mmap.mmap(fd, 8 * N, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+words = (ctypes.c_uint64 * N).from_buffer(mm)
+if os.fork() == 0:
+    i = 0
+    while True:
+        i += 1
+        words[N - 1] = i
+        words[0] = i
+"#
+            }
+            Self::PersistentFd => {
+                r#"
+R = 4096
+NREC = 2048
+fd = os.open(WS + '/log', os.O_RDWR | os.O_CREAT, 0o644)
+os.ftruncate(fd, R * NREC)
+if os.fork() == 0:
+    i = 0
+    while True:
+        i += 1
+        rec = struct.pack('<Q', i) * 512
+        os.pwrite(fd, rec, R * (NREC - 1))
+        os.pwrite(fd, rec, 0)
+"#
+            }
+        }
+    }
+
+    /// bytes per unit: a word, or a record.
+    fn unit(self) -> usize {
+        match self {
+            Self::SharedMap => 8,
+            Self::PersistentFd => 4096,
+        }
+    }
+
+    fn file_len(self) -> usize {
+        match self {
+            Self::SharedMap => 8 << 20,
+            Self::PersistentFd => 4096 * 2048,
+        }
+    }
+
+    /// the counters in the first and last unit of the captured file, or an error naming a
+    /// unit that is not one counter repeated (a torn record).
+    fn ends(self, bytes: &[u8]) -> Result<(u64, u64), String> {
+        assert_eq!(bytes.len(), self.file_len(), "the file keeps its size");
+        let unit = self.unit();
+        let read = |chunk: &[u8]| -> Result<u64, String> {
+            if chunk.chunks(8).all(|w| w == &chunk[..8]) {
+                Ok(u64::from_le_bytes(chunk[..8].try_into().unwrap()))
+            } else {
+                Err(format!("a unit is torn: {:?}", &chunk[..16]))
+            }
+        };
+        let head = read(&bytes[..unit])?;
+        let tail = read(&bytes[bytes.len() - unit..])?;
+        Ok((head, tail))
+    }
+
+    /// everything between the first and the last unit is still zero: nothing else wrote.
+    fn middle_is_untouched(self, bytes: &[u8]) -> bool {
+        let unit = self.unit();
+        bytes[unit..bytes.len() - unit].iter().all(|b| *b == 0)
+    }
+
+    /// the whole agent program: the setup, then `tail`.
+    fn body(self, tail: &str) -> String {
+        format!("{}{tail}", self.setup())
+    }
+}
+
+/// a freeze or thaw that does nothing: with `is_frozen` always satisfied, the barrier captures a
+/// running tree while believing it is frozen. this is the negative control of the consistency
+/// tests, a test of the tests and not of any production path.
+fn noop_freeze(_: &Cgroup, _: Duration) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn assert_captured_consistently(workload: Workload, run: &Path, events: &[Value]) {
+    let store = open_store(run);
+    let mut previous_head = 0u64;
+    let mut seen = 0;
+    for step in step_numbers(events) {
+        let Some(bytes) = files_at(&store, step).remove(workload.name()) else {
+            continue; // step 0 predates the file
+        };
+        seen += 1;
+        let (head, tail) = workload
+            .ends(&bytes)
+            .unwrap_or_else(|e| panic!("step {step}: {e}"));
+        assert!(
+            tail == head || tail == head + 1,
+            "step {step}: head {head} and tail {tail} differ by more than one iteration, so the file was read while its writer ran"
+        );
+        assert!(
+            workload.middle_is_untouched(&bytes),
+            "step {step}: a store landed between the first and the last unit"
+        );
+        assert!(
+            head >= previous_head,
+            "step {step}: the counter only grows ({head} after {previous_head})"
+        );
+        previous_head = head;
+    }
+    assert!(seen >= 3, "boundaries captured the file: {seen}");
+    assert!(
+        previous_head >= 10_000,
+        "the writer ran across the boundaries: counter {previous_head}"
+    );
+}
+
+fn run_consistency_test(workload: Workload, name: &str) {
     let _guard = spawn_lock();
-    if !common::delegated_cgroup_or_skip("persistent_fd") {
+    if !common::delegated_cgroup_or_skip(name) {
         return;
     }
     let harness = Harness::new(&[]);
     let releaser = harness.release(&[(1, "go1"), (2, "go2"), (3, "go3")]);
-    // the writer thread appends 4 KiB records through one descriptor with no further mediated
-    // event, 1000 times a second. only the marker files propose boundaries.
+    // only the marker files propose boundaries: the writer ticks no mediated event after its
+    // setup, and the root waits for each step to publish before it makes the next marker
     let outcome = harness
         .run(
-            "fd = os.open(WS + '/log', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)\n\
-             stop = False\n\
-             def writer():\n\
-             \x20   n = 0\n\
-             \x20   while not stop:\n\
-             \x20       os.write(fd, struct.pack('<Q', n) * 512)\n\
-             \x20       n += 1\n\
-             \x20       time.sleep(0.001)\n\
-             t = threading.Thread(target=writer)\n\
-             t.start()\n\
-             put('m0')\n\
-             wait('go1')\n\
-             put('m1')\n\
-             wait('go2')\n\
-             put('m2')\n\
-             wait('go3')\n\
-             stop = True\n\
-             t.join()\n",
+            &workload
+                .body("put('m0')\nwait('go1')\nput('m1')\nwait('go2')\nput('m2')\nwait('go3')\n"),
         )
         .unwrap();
     releaser.join().unwrap();
     assert!(matches!(outcome.exit, ExitDisposition::Exited(0)));
-
     let events = events_of(&outcome.run_path);
-    let store = open_store(&outcome.run_path);
-    let steps = step_numbers(&events);
-    assert!(steps.len() >= 5, "{steps:?}");
-    let mut previous: Vec<u8> = Vec::new();
-    for step in steps {
-        let log = files_at(&store, step).remove("log").unwrap_or_default();
-        assert_eq!(
-            log.len() % 4096,
-            0,
-            "step {step}: a whole number of records"
-        );
-        for (i, record) in log.chunks(4096).enumerate() {
-            let expected = (i as u64).to_le_bytes();
-            assert!(
-                record.chunks(8).all(|word| word == expected),
-                "step {step}: record {i} is torn"
-            );
-        }
-        assert!(
-            log.starts_with(&previous),
-            "step {step}: the log only ever grows by appending"
-        );
-        previous = log;
-    }
-    assert!(
-        previous.len() >= 4096 * 100,
-        "the writer ran across the boundaries: {} bytes",
-        previous.len()
-    );
+    assert_captured_consistently(workload, &outcome.run_path, &events);
     assert_digests_and_chain(&outcome.run_path, &events);
 }
 
 #[test]
-fn a_shared_mmap_writer_is_never_captured_torn() {
+fn a_persistent_fd_writer_is_never_captured_ahead_of_itself() {
+    run_consistency_test(Workload::PersistentFd, "persistent_fd");
+}
+
+#[test]
+fn a_shared_mmap_writer_is_never_captured_ahead_of_itself() {
+    run_consistency_test(Workload::SharedMap, "shared_mmap");
+}
+
+/// how many sessions each negative control runs. every one must show the failure.
+const NEGATIVE_CONTROL_RUNS: usize = 4;
+
+/// what an unfrozen capture of a running writer showed.
+#[derive(Debug)]
+enum Unfrozen {
+    /// the store refused the capture because the file changed under it (`capture_failed`).
+    CaptureFailed,
+    /// the capture was published, and its first and last units differ by this much.
+    Drift(u64),
+}
+
+/// run the workload with the freezer disabled and report what the mid-run capture shows.
+fn negative_control_run(workload: Workload, name: &str) -> Unfrozen {
+    let harness = Harness::new(&[]);
+    let ctl = harness.ctl.clone();
+    // the re-check runs after the capture and before publication: releasing the agent there
+    // ends the run right after the boundary, with no sleep to tune
+    let release = move |_: &Cgroup| -> std::io::Result<bool> {
+        std::fs::write(ctl.join("go1"), "1")?;
+        Ok(true)
+    };
+    let result = harness.run_with(
+        &workload.body("put('m0')\nwait('go1')\n"),
+        SessionHooks {
+            barrier: BarrierOps {
+                freeze: &noop_freeze,
+                thaw: &noop_freeze,
+                is_frozen: &release,
+                ..BarrierOps::default()
+            },
+            ..SessionHooks::default()
+        },
+    );
+    match result {
+        Err(SessionError::Run(RunError::Barrier {
+            phase: CapturePhase::Capture,
+            ..
+        })) => {
+            let run = harness.run_dir().unwrap();
+            assert_eq!(of_type(&events_of(&run), "capture_failed").len(), 1);
+            Unfrozen::CaptureFailed
+        }
+        Ok(outcome) => {
+            let events = events_of(&outcome.run_path);
+            let store = open_store(&outcome.run_path);
+            let steps = step_numbers(&events);
+            // the last step is taken after the kill, so only the mid-run steps can drift
+            let mid_run = &steps[1..steps.len() - 1];
+            assert!(!mid_run.is_empty(), "{name}: a boundary ran mid-run");
+            let mut worst = 0u64;
+            for step in mid_run {
+                let bytes = files_at(&store, *step).remove(workload.name()).unwrap();
+                worst = worst.max(match workload.ends(&bytes) {
+                    Ok((head, tail)) => tail.abs_diff(head),
+                    // a torn unit is also a copy of a running writer
+                    Err(_) => u64::MAX,
+                });
+            }
+            Unfrozen::Drift(worst)
+        }
+        other => panic!("{name}: unexpected result {other:?}"),
+    }
+}
+
+fn run_negative_control(workload: Workload, name: &str) {
     let _guard = spawn_lock();
-    if !common::delegated_cgroup_or_skip("shared_mmap") {
+    if !common::delegated_cgroup_or_skip(name) {
         return;
     }
-    let harness = Harness::new(&[]);
-    let releaser = harness.release(&[(1, "go1"), (2, "go2"), (3, "go3")]);
-    // the writer fills a MAP_SHARED file with the 8-byte word i+1 at offset 8*i, one aligned
-    // store per word, in order. nothing about it reaches the supervisor. a capture at a frozen
-    // moment sees words 1..k and then zeros, never a gap or a half-written word. a
-    // multi-word record is an application transaction and stays outside the contract
-    // (snapshot.md section 1).
-    let outcome = harness
-        .run(
-            "N = 100000\n\
-             fd = os.open(WS + '/map', os.O_RDWR | os.O_CREAT, 0o644)\n\
-             os.ftruncate(fd, 8 * N)\n\
-             mm = mmap.mmap(fd, 8 * N, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)\n\
-             words = (ctypes.c_uint64 * N).from_buffer(mm)\n\
-             stop = False\n\
-             def writer():\n\
-             \x20   for i in range(N):\n\
-             \x20       if stop:\n\
-             \x20           break\n\
-             \x20       words[i] = i + 1\n\
-             \x20       time.sleep(0.001)\n\
-             t = threading.Thread(target=writer)\n\
-             t.start()\n\
-             put('m0')\n\
-             wait('go1')\n\
-             put('m1')\n\
-             wait('go2')\n\
-             put('m2')\n\
-             wait('go3')\n\
-             stop = True\n\
-             t.join()\n",
-        )
-        .unwrap();
-    releaser.join().unwrap();
-    assert!(matches!(outcome.exit, ExitDisposition::Exited(0)));
-
-    let events = events_of(&outcome.run_path);
-    let store = open_store(&outcome.run_path);
-    let mut previous_fill = 0usize;
-    for step in step_numbers(&events) {
-        let map = files_at(&store, step).remove("map").unwrap_or_default();
-        if map.is_empty() {
-            continue; // step 0 predates the file
+    for run in 1..=NEGATIVE_CONTROL_RUNS {
+        let observed = negative_control_run(workload, name);
+        eprintln!("NEGATIVE-CONTROL {name} run {run}: {observed:?}");
+        if let Unfrozen::Drift(drift) = observed {
+            assert!(
+                drift > 1,
+                "{name} run {run}: an unfrozen capture of a running writer showed head and tail within one iteration, so the positive test could not have failed"
+            );
         }
-        assert_eq!(map.len(), 8 * 100_000);
-        let words: Vec<u64> = map
-            .chunks(8)
-            .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
-            .collect();
-        let filled = words.iter().take_while(|w| **w != 0).count();
-        for (i, word) in words[..filled].iter().enumerate() {
-            assert_eq!(*word, i as u64 + 1, "step {step}: word {i} is torn");
-        }
-        assert!(
-            words[filled..].iter().all(|w| *w == 0),
-            "step {step}: a store landed beyond a gap"
-        );
-        assert!(filled >= previous_fill, "step {step}: the fill only grows");
-        previous_fill = filled;
     }
-    assert!(
-        previous_fill >= 500,
-        "the writer ran across the boundaries: {previous_fill} words"
-    );
-    assert_digests_and_chain(&outcome.run_path, &events);
+}
+
+#[test]
+fn negative_control_an_unfrozen_capture_of_a_persistent_fd_writer_shows_drift() {
+    run_negative_control(Workload::PersistentFd, "persistent_fd_control");
+}
+
+#[test]
+fn negative_control_an_unfrozen_capture_of_a_shared_mmap_writer_shows_drift() {
+    run_negative_control(Workload::SharedMap, "shared_mmap_control");
 }
 
 // ---------------------------------------------------------------------------------------
