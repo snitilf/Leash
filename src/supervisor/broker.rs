@@ -1453,6 +1453,7 @@ fn poll_readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1478,5 +1479,63 @@ mod tests {
             anchor_resolve_flags(true, true),
             RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS
         );
+    }
+
+    /// the worst bytes for a text encoding that spells each byte as a decimal number.
+    fn heaviest(len: usize) -> Vec<u8> {
+        vec![0xff; len]
+    }
+
+    #[test]
+    fn a_maximum_xattr_value_crosses_the_broker_socket_whole() {
+        let (near, far) = seqpacket_pair().unwrap();
+        let value = heaviest(65_536);
+        send_packet(
+            near.as_raw_fd(),
+            &Request::CommitMutation {
+                primary: 1,
+                secondary: None,
+                operation: MutationOperation::Setxattr {
+                    name: b"user.big".to_vec(),
+                    value: value.clone(),
+                    flags: 0,
+                    follow: true,
+                },
+            },
+            None,
+        )
+        .expect("a 64 KiB value fits one broker packet");
+        let (request, _): (Request, _) = recv_packet(far.as_raw_fd()).unwrap();
+        match request {
+            Request::CommitMutation {
+                operation: MutationOperation::Setxattr { value: got, .. },
+                ..
+            } => assert!(got == value, "the value arrives unchanged"),
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_maximum_network_payload_crosses_the_broker_socket_whole() {
+        let (near, far) = seqpacket_pair().unwrap();
+        let payload = heaviest(65_535);
+        send_packet(
+            near.as_raw_fd(),
+            &Request::Network {
+                operation: NetworkOperation::SendTo,
+                address: vec![0xff; 128],
+                payload: payload.clone(),
+                flags: 0,
+            },
+            None,
+        )
+        .expect("a 64 KiB payload fits one broker packet");
+        let (request, _): (Request, _) = recv_packet(far.as_raw_fd()).unwrap();
+        match request {
+            Request::Network { payload: got, .. } => {
+                assert!(got == payload, "the payload arrives unchanged");
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
     }
 }
