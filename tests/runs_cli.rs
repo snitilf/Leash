@@ -45,6 +45,7 @@ fn fixture(root: &Path, seconds: u64, complete: bool) -> RunDir {
                     exit_code: Some(7),
                     signal: None,
                     final_step: 0,
+                    chain_head: None,
                 },
             )
             .unwrap();

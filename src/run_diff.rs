@@ -106,7 +106,9 @@ fn load_side(
     state_root: &Path,
     side: &RunRef,
 ) -> Result<crate::snapshot::store::Manifest, DiffRunError> {
-    use crate::snapshot::store::{committed_steps, load_manifest};
+    use crate::snapshot::store::{
+        StoreError, committed_steps_from_trace, load_manifest, published_steps,
+    };
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -131,8 +133,23 @@ fn load_side(
     let run_dir = open_dir_at(Some(&runs), &id_c, false).map_err(|_| unknown())?;
     let store = open_dir_at(Some(&run_dir), c"snapshots", false).map_err(|_| no_store())?;
 
-    let steps = committed_steps(&store)
-        .map_err(|e| DiffRunError::Failure(format!("run '{label}': {e}")))?;
+    // a snapshot directory with no manifest at all is a run without snapshots
+    if published_steps(&store)
+        .map_err(|e| DiffRunError::Failure(format!("run '{label}': {e}")))?
+        .is_empty()
+    {
+        return Err(no_store());
+    }
+    // the committed steps are the step events of the trace, not the manifests on disk: a
+    // manifest whose step event never became durable is an orphan (ADR-0024 decision 16)
+    let steps = committed_steps_from_trace(&run_dir).map_err(|e| match e {
+        StoreError::Io { ref source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+            usage(format!(
+                "run '{label}' has no trace.jsonl, so no step is known to be committed"
+            ))
+        }
+        e => DiffRunError::Failure(format!("run '{label}': {e}")),
+    })?;
     let step = match side.step {
         Some(s) if steps.contains(&s) => s,
         Some(s) => {

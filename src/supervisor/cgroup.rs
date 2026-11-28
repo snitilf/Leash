@@ -116,6 +116,12 @@ impl Cgroup {
         self.wait_event("frozen", frozen, timeout)
     }
 
+    /// whether `cgroup.events` reports `frozen 1` right now, without waiting. the capture
+    /// barrier re-reads it after the capture (ADR-0024 decision 10).
+    pub fn is_frozen(&self) -> io::Result<bool> {
+        event_value(&read_control(&self.events)?, "frozen")
+    }
+
     /// terminate the entire cgroup and wait until it has no living processes. `cgroup.kill`
     /// is written again on every poll iteration, not once: a task forked while an earlier
     /// write was walking the cgroup can survive a single write.

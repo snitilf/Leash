@@ -179,12 +179,15 @@ pub mod rule {
 }
 
 /// how the run ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
     /// raw wait status of the direct child.
     pub wait_status: i32,
     /// index of the final step boundary (FR-17); 0 when no snapshot capture was wired
     pub final_step: u64,
+    /// the chain head over every committed step digest, recomputed from the digests the
+    /// store returned (ADR-0024 decision 16); absent when no snapshot capture was wired
+    pub chain_head: Option<String>,
 }
 
 /// fatal loop errors. every one aborts the run fail-closed (I3): the notify fd is
@@ -227,13 +230,28 @@ pub enum RunError {
     #[cfg(target_os = "linux")]
     #[error("confined realization broker failed: {0}")]
     Broker(#[from] crate::supervisor::broker::BrokerError),
-    /// snapshot capture is disabled until coherent, race-safe capture is available.
-    #[error("snapshot capture is not available")]
+    /// a capture target was wired into a run that is not a snapshot-integrity run: only
+    /// an enforce run with the snapshot restrictions can take exact snapshots (ADR-0024
+    /// decision 1).
+    #[error("snapshot capture needs an enforce run with snapshot integrity")]
     CaptureUnavailable,
-    /// a step-boundary capture failed; the run aborts fail-closed rather than record a
-    /// boundary whose snapshot does not exist (snapshot.md section 6)
-    #[error("snapshot capture failed; run aborted: {0}")]
-    Snapshot(#[from] crate::snapshot::SnapshotError),
+    /// a capture target was wired into a run with no run cgroup to freeze.
+    #[error("snapshot capture needs the run cgroup")]
+    CaptureNeedsCgroup,
+    /// a capture boundary failed; the run aborts fail-closed rather than record a boundary
+    /// whose snapshot does not exist (ADR-0024 decision 10, snapshot.md section 2)
+    #[error("snapshot boundary {step} failed during {phase:?}: {message}; run aborted")]
+    Barrier {
+        /// the step the boundary would have closed
+        step: u64,
+        /// the barrier phase that failed
+        phase: crate::recorder::CapturePhase,
+        /// the error text
+        message: String,
+    },
+    /// the chain head could not be computed from the committed digests.
+    #[error("snapshot chain head failed: {0}")]
+    ChainHead(#[source] crate::snapshot::store::StoreError),
     /// the run cgroup could not be watched, killed or removed (ADR-0024 decisions 11, 12).
     #[error("run cgroup failed: {0}")]
     RunCgroup(#[source] io::Error),
@@ -256,9 +274,13 @@ pub struct RunConfig<'a> {
     /// root of the supervised process tree
     pub root_pid: u32,
     /// step-boundary capture target (FR-11). when present, the loop runs the step clock
-    /// and captures at every boundary; when absent, no steps exist and the final step
-    /// index is 0.
+    /// and runs the capture barrier at every boundary (ADR-0024 decision 10); when
+    /// absent, no steps exist and the final step index is 0. needs `snapshot_integrity`
+    /// and the run cgroup.
     pub capture: Option<&'a dyn crate::snapshot::BoundaryCapture>,
+    /// the freezer operations and timing of a capture boundary
+    #[cfg(target_os = "linux")]
+    pub barrier: crate::supervisor::barrier::BarrierOps<'a>,
     /// confined side-effect broker; required in enforce mode
     #[cfg(target_os = "linux")]
     pub broker: Option<&'a RefCell<crate::supervisor::broker::Broker>>,
@@ -301,6 +323,8 @@ impl<'a> RunConfig<'a> {
             root_pid,
             capture: None,
             #[cfg(target_os = "linux")]
+            barrier: crate::supervisor::barrier::BarrierOps::default(),
+            #[cfg(target_os = "linux")]
             broker: None,
             resolved_hosts: None,
             snapshot_integrity: false,
@@ -324,6 +348,8 @@ impl<'a> RunConfig<'a> {
             prompter: &ask::tty_prompt,
             root_pid,
             capture: None,
+            #[cfg(target_os = "linux")]
+            barrier: crate::supervisor::barrier::BarrierOps::default(),
             #[cfg(target_os = "linux")]
             broker: None,
             resolved_hosts: None,
@@ -351,6 +377,7 @@ impl<'a> RunConfig<'a> {
             prompter: &ask::tty_prompt,
             root_pid,
             capture: None,
+            barrier: crate::supervisor::barrier::BarrierOps::default(),
             broker: Some(broker),
             resolved_hosts: Some(resolved_hosts),
             snapshot_integrity: false,
@@ -380,21 +407,32 @@ impl<'a> RunConfig<'a> {
         self
     }
 
-    /// wire step-boundary capture (FR-11); the session passes the run-directory target.
+    /// wire step-boundary capture (FR-11); the session passes the run's store. the run
+    /// must also set `snapshot_integrity`, or `validate` refuses it.
     pub fn with_capture(mut self, capture: &'a dyn crate::snapshot::BoundaryCapture) -> Self {
         self.capture = Some(capture);
         self
     }
 
+    /// replace the freezer operations and timing of a capture boundary; the seam tests use
+    /// to make a freeze or thaw fail.
+    #[cfg(target_os = "linux")]
+    pub fn with_barrier_ops(mut self, barrier: crate::supervisor::barrier::BarrierOps<'a>) -> Self {
+        self.barrier = barrier;
+        self
+    }
+
     fn validate(self) -> Result<Self, RunError> {
-        if self.capture.is_some() {
-            return Err(RunError::CaptureUnavailable);
-        }
         if self.snapshot_integrity && self.mode != crate::recorder::Mode::Enforce {
             return Err(RunError::SnapshotIntegrityNeedsEnforce);
         }
         if self.snapshot_integrity && self.cgroup_mounts.is_none() {
             return Err(RunError::SnapshotIntegrityNeedsCgroupMounts);
+        }
+        // exact snapshots exist only in enforce mode with the snapshot restrictions
+        // (ADR-0024 decision 1): a capture target anywhere else is refused
+        if self.capture.is_some() && !self.snapshot_integrity {
+            return Err(RunError::CaptureUnavailable);
         }
         if self.mode == crate::recorder::Mode::Enforce && self.policy.is_none() {
             return Err(RunError::EnforceWithoutPolicy);
@@ -2586,6 +2624,10 @@ pub use linux::{run_loop, run_loop_with_cgroup_kill};
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use crate::recorder::CapturePhase;
+    use crate::supervisor::barrier::{
+        BarrierOps, commit_step, fail_boundary, fail_step_event, record_capture_failed,
+    };
     use crate::supervisor::mem::proc::ChildMem;
     use crate::supervisor::notify::NotifyFd;
     use crate::supervisor::run_cgroup::RunCgroup;
@@ -2773,11 +2815,23 @@ mod linux {
         let kernel = ProcNotifier {
             notify: &child.notify,
         };
+        // a capture target needs the run cgroup to freeze; without one a boundary would
+        // capture a tree that is still running (ADR-0024 decision 10)
+        if config.capture.is_some() && cgroup.is_none() {
+            abort_run(&child);
+            return Err(RunError::CaptureNeedsCgroup);
+        }
         // the step clock runs only when a capture target is wired (FR-11, FR-17);
         // without one there are no boundaries and the final step index stays 0.
-        let mut clock = config
-            .capture
-            .map(|_| crate::snapshot::StepClock::new(crate::snapshot::STEP_WINDOW));
+        let mut clock = config.capture.map(|_| {
+            let mut clock = crate::snapshot::StepClock::with_min_interval(
+                crate::snapshot::STEP_WINDOW,
+                config.barrier.min_interval,
+            );
+            // step 0 was captured before spawn: the minimum interval runs from here
+            clock.boundary_ended(Instant::now());
+            clock
+        });
         // a run cgroup ends the run at the root's exit: a pidfd for the root joins the poll set
         let root_pidfd = match cgroup.as_ref().map(|_| pidfd_open(child.pid)).transpose() {
             Ok(fd) => fd,
@@ -2786,25 +2840,31 @@ mod linux {
                 return Err(RunError::RunCgroup(e));
             }
         };
-
         loop {
-            // close a step boundary if activity has quiesced. capture first, then the
-            // step event, then fsync (trace.md section 4): a recorded boundary always
-            // has its snapshot on disk, and a capture failure stops the run closed.
+            // close a step boundary if activity has quiesced and the minimum interval has
+            // passed: freeze, capture, step event, thaw (barrier.rs). a recorded boundary
+            // always has its snapshot on disk, and any failure stops the run closed.
+            //
+            // this is the only place a boundary starts, and it is the top of the loop:
+            // `handle_notification` returns only after it has answered the notification it
+            // received, ask prompts included, so no notification is received but
+            // unanswered here and no ask prompt is pending. that is what lets the freeze
+            // complete (a received, unanswered notification blocks `frozen=1` under
+            // WAIT_KILLABLE_RECV, measurement 0003 question 2) and what keeps a boundary
+            // from interrupting a prompt (ADR-0024 decision 10). any change that holds a
+            // notification across loop iterations must move this check.
             if let (Some(clock), Some(capture)) = (clock.as_mut(), config.capture)
                 && let Some(step) = clock.poll(Instant::now())
             {
-                if let Err(e) = capture.capture(step) {
+                let Some(group) = cgroup.as_deref() else {
                     abort_run(&child);
-                    return Err(e.into());
-                }
-                if let Err(e) = writer
-                    .append(now_ms(), EventBody::Step { step })
-                    .and_then(|_| writer.sync())
-                {
+                    return Err(RunError::CaptureNeedsCgroup);
+                };
+                if let Err(e) = run_boundary(group, &config.barrier, capture, writer, step) {
                     abort_run(&child);
-                    return Err(e.into());
+                    return Err(e);
                 }
+                clock.boundary_ended(Instant::now());
             }
             let mut set = [
                 libc::pollfd {
@@ -2894,22 +2954,88 @@ mod linux {
                 return Err(RunError::RunCgroup(io::Error::other(error)));
             }
         }
-        // run end is always a boundary (snapshot.md section 1): the final capture lands
-        // after the tree is reaped, so no write can slip past it.
-        let final_step = match (clock.as_mut(), config.capture) {
+        // run end is always a boundary (snapshot.md section 1). the final capture needs no
+        // freeze: the run cgroup was killed and reported populated 0, so no process of the
+        // tree exists to write while it runs (ADR-0024 decision 12).
+        let (final_step, chain_head) = match (clock.as_mut(), config.capture) {
             (Some(clock), Some(capture)) => {
                 let step = clock.finish();
-                capture.capture(step)?;
-                writer.append(now_ms(), EventBody::Step { step })?;
-                writer.sync()?;
-                step
+                let published = capture
+                    .capture(step)
+                    .map_err(|e| fail_boundary(writer, now_ms(), step, CapturePhase::Capture, e))?;
+                commit_step(writer, now_ms(), capture, step, &published, Duration::ZERO)
+                    .map_err(|e| fail_step_event(writer, now_ms(), step, e))?;
+                // the final step is committed by now, so this failure is recorded as its own
+                // phase and never uncommits the step (trace.md section 2)
+                let head = capture.chain_head().map_err(|e| {
+                    record_capture_failed(
+                        writer,
+                        now_ms(),
+                        step,
+                        CapturePhase::ChainHead,
+                        &e.to_string(),
+                    );
+                    RunError::ChainHead(e)
+                })?;
+                (step, Some(head))
             }
-            _ => 0,
+            _ => (0, None),
         };
         Ok(RunOutcome {
             wait_status,
             final_step,
+            chain_head,
         })
+    }
+
+    /// one capture boundary, in the order of ADR-0024 decision 10 (see barrier.rs). the
+    /// loop has answered every notification and does not receive until this returns, so
+    /// nothing mutates the tree between the freeze and the thaw. every error is recorded
+    /// when the recorder still works and aborts the run.
+    fn run_boundary<S: TraceSink>(
+        group: &RunCgroup,
+        ops: &BarrierOps<'_>,
+        capture: &dyn crate::snapshot::BoundaryCapture,
+        writer: &mut TraceWriter<S>,
+        step: u64,
+    ) -> Result<(), RunError> {
+        let cgroup = group.cgroup();
+        let froze_at = Instant::now();
+        (ops.freeze)(cgroup, ops.freeze_timeout)
+            .map_err(|e| fail_boundary(writer, now_ms(), step, CapturePhase::Freeze, e))?;
+        // the frozen re-check runs inside the store's capture, after the whole tree is read
+        // and before the manifest is published (ADR-0024 decision 10): a failed check leaves
+        // no manifest for the step. the check's own error is kept apart from a capture
+        // error, because the two are different phases of the failure event.
+        let mut frozen_failure: Option<String> = None;
+        let mut check_frozen = || -> Result<(), crate::snapshot::store::StoreError> {
+            let reason = match (ops.is_frozen)(cgroup) {
+                Ok(true) => return Ok(()),
+                Ok(false) => "the run cgroup was no longer frozen after the capture".to_string(),
+                Err(e) => e.to_string(),
+            };
+            frozen_failure = Some(reason.clone());
+            Err(crate::snapshot::store::StoreError::PublishRefused { reason })
+        };
+        let captured = capture.capture_gated(step, &mut check_frozen);
+        let published = match captured {
+            Ok(published) => published,
+            Err(e) => {
+                let phase = if frozen_failure.is_some() {
+                    CapturePhase::FrozenCheck
+                } else {
+                    CapturePhase::Capture
+                };
+                return Err(fail_boundary(writer, now_ms(), step, phase, e));
+            }
+        };
+        // the event must be durable before the thaw, so the pause it records ends here
+        let pause = froze_at.elapsed();
+        commit_step(writer, now_ms(), capture, step, &published, pause)
+            .map_err(|e| fail_step_event(writer, now_ms(), step, e))?;
+        (ops.thaw)(cgroup, ops.thaw_timeout)
+            .map_err(|e| fail_boundary(writer, now_ms(), step, CapturePhase::Thaw, e))?;
+        Ok(())
     }
 
     /// a pidfd for `pid`, which the caller owns as an unreaped child, so the pid cannot be
@@ -2984,14 +3110,26 @@ mod linux {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    #[test]
-    fn snapshot_capture_cannot_be_activated() {
-        struct Capture;
-        impl crate::snapshot::BoundaryCapture for Capture {
-            fn capture(&self, _: u64) -> Result<(), crate::snapshot::SnapshotError> {
-                panic!("capture must not run")
-            }
+    /// a capture target that must never be called: these tests only exercise validation.
+    struct Capture;
+    impl crate::snapshot::BoundaryCapture for Capture {
+        fn capture_gated(
+            &self,
+            _: u64,
+            _: &mut dyn FnMut() -> Result<(), crate::snapshot::store::StoreError>,
+        ) -> Result<crate::snapshot::store::Published, crate::snapshot::store::StoreError> {
+            panic!("capture must not run")
         }
+        fn committed(&self, _: u64, _: &str) {
+            panic!("nothing is committed")
+        }
+        fn chain_head(&self) -> Result<String, crate::snapshot::store::StoreError> {
+            panic!("no chain")
+        }
+    }
+
+    #[test]
+    fn a_capture_target_is_refused_in_record_only() {
         let capture = Capture;
         let config = super::RunConfig::record_only(1, crate::recorder::Attendance::Unattended)
             .with_capture(&capture);
@@ -3000,6 +3138,43 @@ mod tests {
             Err(super::RunError::CaptureUnavailable)
         ));
     }
+
+    #[test]
+    fn a_capture_target_is_refused_in_an_enforce_run_without_snapshot_integrity() {
+        let capture = Capture;
+        let policy = policy("schema_version = 1\n");
+        let config = super::RunConfig::enforce(
+            1,
+            crate::recorder::Attendance::Unattended,
+            &policy,
+            test_root(),
+        )
+        .with_capture(&capture);
+        assert!(matches!(
+            config.validate(),
+            Err(super::RunError::CaptureUnavailable)
+        ));
+    }
+
+    #[test]
+    fn a_capture_target_passes_the_capture_check_in_a_snapshot_integrity_run() {
+        let capture = Capture;
+        let policy = policy("schema_version = 1\n");
+        let config = super::RunConfig::enforce(
+            1,
+            crate::recorder::Attendance::Unattended,
+            &policy,
+            test_root(),
+        )
+        .with_snapshot_integrity(true)
+        .with_capture(&capture);
+        // the run is still refused for want of a broker on linux, but never for the capture
+        assert!(!matches!(
+            config.validate(),
+            Err(super::RunError::CaptureUnavailable)
+        ));
+    }
+
     use super::*;
     use crate::supervisor::notify::SeccompData;
     use serde_json::Value;

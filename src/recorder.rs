@@ -36,6 +36,10 @@ pub enum RecorderError {
     /// the trace could not be written; the action it describes must not proceed
     #[error("trace write failed: {0}")]
     Write(#[source] io::Error),
+    /// the trace was written but could not be flushed or made durable. the event is whole in
+    /// the file, unlike after a `Write` error, which may have left a torn line
+    #[error("trace sync failed: {0}")]
+    Sync(#[source] io::Error),
     /// the per-run directory could not be established; the run does not start
     #[error("run directory setup failed: {0}")]
     Setup(#[source] io::Error),
@@ -130,6 +134,10 @@ pub enum EventBody {
     Step {
         /// the step index this boundary closes
         step: u64,
+        /// the committed snapshot of a snapshot run (ADR-0024 decisions 10, 14, 16); absent
+        /// in a run that takes no snapshots
+        #[serde(flatten)]
+        snapshot: Option<StepSnapshot>,
     },
     /// end of run
     RunEnd {
@@ -139,9 +147,71 @@ pub enum EventBody {
         signal: Option<i32>,
         /// index of the final step
         final_step: u64,
+        /// the chain head over every committed step digest of a snapshot run, recomputed
+        /// from the digests the store returned (ADR-0024 decision 16); absent otherwise
+        #[serde(skip_serializing_if = "Option::is_none")]
+        chain_head: Option<String>,
     },
     /// Leash wrote `cgroup.kill` on a run cgroup (ADR-0024 decisions 12 and 17)
     CgroupKill(CgroupKillEvent),
+    /// a capture boundary failed and the run aborts closed (ADR-0024 decision 10). the
+    /// boundary has no step event
+    CaptureFailed(CaptureFailedEvent),
+}
+
+/// what a committed step of a snapshot run carries beyond its index (trace.md section 2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StepSnapshot {
+    /// lowercase hex sha256 of the exact manifest bytes the store published
+    pub manifest_digest: String,
+    /// microseconds the agent tree was frozen: from the start of the freeze to just before
+    /// the step event is written, because the event must be durable before the thaw.
+    /// zero for step 0 and the final step, where no agent is running
+    pub capture_pause_us: u64,
+    /// what the capture stored
+    pub capture: CaptureSummary,
+}
+
+/// capture statistics of one step (trace.md section 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CaptureSummary {
+    /// entries captured: files, directories and symlinks
+    pub entries: u64,
+    /// sum of regular-file sizes
+    pub bytes: u64,
+    /// content objects this capture added to the store
+    pub new_objects: u64,
+}
+
+/// where in the barrier a boundary failed (ADR-0024 decision 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturePhase {
+    /// `cgroup.freeze=1` was written but `frozen=1` was not confirmed in time
+    Freeze,
+    /// the store could not capture or publish the snapshot, or a limit was hit
+    Capture,
+    /// the cgroup was no longer frozen after the capture
+    FrozenCheck,
+    /// the step event could not be written or made durable
+    StepEvent,
+    /// `cgroup.freeze=0` was written but `frozen=0` was not confirmed in time
+    Thaw,
+    /// the final step was committed, and the chain head over the committed digests could not
+    /// be computed, so the run has no `run_end`. the step itself stays committed.
+    ChainHead,
+}
+
+/// a failed capture boundary (trace.md section 2). written on a best-effort basis,
+/// because the trace itself may be what failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CaptureFailedEvent {
+    /// the step the boundary would have closed
+    pub step: u64,
+    /// the barrier phase that failed
+    pub phase: CapturePhase,
+    /// the error text
+    pub error: String,
 }
 
 /// why Leash killed a run cgroup.
@@ -354,6 +424,107 @@ impl TraceSink for File {
     }
 }
 
+/// a sink that fails exactly one `sync`, the Nth (counting from 1), and passes everything else
+/// through. it is the seam tests use to make an event reach the file but never become
+/// durable, which a real disk produces only on a failing device: the writes of every other
+/// call, and the syncs before and after the Nth, behave normally, so the failure path can
+/// still record what went wrong.
+pub struct FailNthSync<S: TraceSink> {
+    inner: S,
+    fail_at: u64,
+    syncs: u64,
+}
+
+impl<S: TraceSink> FailNthSync<S> {
+    /// wrap `inner` so its `fail_at`th `sync` fails. `fail_at` 0 never fails.
+    pub fn new(inner: S, fail_at: u64) -> Self {
+        Self {
+            inner,
+            fail_at,
+            syncs: 0,
+        }
+    }
+
+    /// give the wrapped sink back.
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+impl<S: TraceSink> Write for FailNthSync<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<S: TraceSink> TraceSink for FailNthSync<S> {
+    fn sync(&mut self) -> io::Result<()> {
+        self.syncs += 1;
+        if self.syncs == self.fail_at {
+            return Err(io::Error::other(format!(
+                "injected failure of sync {}",
+                self.syncs
+            )));
+        }
+        self.inner.sync()
+    }
+}
+
+/// a sink whose Nth `write` call (counting from 1) writes half of its buffer and then
+/// fails, and passes everything else through. it is the seam tests use to leave a torn,
+/// newline-less line in the trace the way a full or failing disk does. `sync` always
+/// passes through.
+pub struct FailNthWrite<S: TraceSink> {
+    inner: S,
+    fail_at: u64,
+    writes: u64,
+}
+
+impl<S: TraceSink> FailNthWrite<S> {
+    /// wrap `inner` so its `fail_at`th `write` fails after a partial write. `fail_at` 0
+    /// never fails.
+    pub fn new(inner: S, fail_at: u64) -> Self {
+        Self {
+            inner,
+            fail_at,
+            writes: 0,
+        }
+    }
+
+    /// give the wrapped sink back.
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+impl<S: TraceSink> Write for FailNthWrite<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writes += 1;
+        if self.writes == self.fail_at {
+            self.inner.write_all(&buf[..buf.len() / 2])?;
+            return Err(io::Error::other(format!(
+                "injected failure of write {}",
+                self.writes
+            )));
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<S: TraceSink> TraceSink for FailNthWrite<S> {
+    fn sync(&mut self) -> io::Result<()> {
+        self.inner.sync()
+    }
+}
+
 /// the single writer of `trace.jsonl` (I2). append-only, decision order, one json object
 /// per line. a write failure is returned, never swallowed: the caller denies the pending
 /// action and aborts the run (notify-loop.md case E).
@@ -369,7 +540,8 @@ impl<S: TraceSink> TraceWriter<S> {
     }
 
     /// append one event, assigning the next sequence number. returns the seq on success.
-    /// on any error the event did not land and the writer must not be used again.
+    /// on any error the event did not land and the writer must not be used again. a
+    /// `RecorderError::Write` may have left a torn line in the sink.
     pub fn append(&mut self, ts: u64, body: EventBody) -> Result<u64, RecorderError> {
         let seq = self.next_seq;
         let mut line = serde_json::to_vec(&Event { seq, ts, body })?;
@@ -381,8 +553,8 @@ impl<S: TraceSink> TraceWriter<S> {
 
     /// flush and fsync; called at step boundaries and run end (trace.md section 4).
     pub fn sync(&mut self) -> Result<(), RecorderError> {
-        self.sink.flush().map_err(RecorderError::Write)?;
-        self.sink.sync().map_err(RecorderError::Write)
+        self.sink.flush().map_err(RecorderError::Sync)?;
+        self.sink.sync().map_err(RecorderError::Sync)
     }
 
     /// give the sink back (used by tests to inspect what was written).
@@ -437,8 +609,13 @@ impl RunDir {
 
     /// open `trace.jsonl` for appending; fails if it already exists (single writer, I2).
     pub fn trace_writer(&self) -> Result<TraceWriter<File>, RecorderError> {
-        let file = File::create_new(self.path.join("trace.jsonl")).map_err(RecorderError::Setup)?;
-        Ok(TraceWriter::new(file))
+        Ok(TraceWriter::new(self.trace_file()?))
+    }
+
+    /// create `trace.jsonl`, failing if it already exists. the file a writer wraps; a seam
+    /// for tests that wrap it in another sink.
+    pub fn trace_file(&self) -> Result<File, RecorderError> {
+        File::create_new(self.path.join("trace.jsonl")).map_err(RecorderError::Setup)
     }
 }
 
@@ -794,7 +971,10 @@ mod tests {
         let step = Event {
             seq: 7,
             ts: 1_783_535_405_500,
-            body: EventBody::Step { step: 2 },
+            body: EventBody::Step {
+                step: 2,
+                snapshot: None,
+            },
         };
         assert_eq!(
             as_value(&step),
@@ -808,12 +988,81 @@ mod tests {
                 exit_code: Some(0),
                 signal: None,
                 final_step: 3,
+                chain_head: None,
             },
         };
         let ended = as_value(&end);
         assert_eq!(ended["type"], "run_end");
         assert_eq!(ended["exit_code"], 0);
         assert_eq!(ended["final_step"], 3);
+    }
+
+    #[test]
+    fn a_snapshot_step_event_carries_digest_pause_and_capture_stats() {
+        let digest = "ab".repeat(32);
+        let step = Event {
+            seq: 4,
+            ts: 10,
+            body: EventBody::Step {
+                step: 3,
+                snapshot: Some(StepSnapshot {
+                    manifest_digest: digest.clone(),
+                    capture_pause_us: 1234,
+                    capture: CaptureSummary {
+                        entries: 5,
+                        bytes: 99,
+                        new_objects: 2,
+                    },
+                }),
+            },
+        };
+        assert_eq!(
+            as_value(&step),
+            json!({
+                "seq": 4, "ts": 10, "type": "step", "step": 3,
+                "manifest_digest": digest, "capture_pause_us": 1234,
+                "capture": { "entries": 5, "bytes": 99, "new_objects": 2 }
+            })
+        );
+    }
+
+    #[test]
+    fn run_end_carries_a_chain_head_only_when_one_exists() {
+        let end = |chain_head| Event {
+            seq: 1,
+            ts: 1,
+            body: EventBody::RunEnd {
+                exit_code: Some(0),
+                signal: None,
+                final_step: 2,
+                chain_head,
+            },
+        };
+        assert!(as_value(&end(None)).get("chain_head").is_none());
+        assert_eq!(
+            as_value(&end(Some("cd".repeat(32))))["chain_head"],
+            "cd".repeat(32)
+        );
+    }
+
+    #[test]
+    fn a_capture_failure_names_the_step_phase_and_error() {
+        let failed = Event {
+            seq: 9,
+            ts: 2,
+            body: EventBody::CaptureFailed(CaptureFailedEvent {
+                step: 4,
+                phase: CapturePhase::FrozenCheck,
+                error: "thawed".into(),
+            }),
+        };
+        assert_eq!(
+            as_value(&failed),
+            json!({
+                "seq": 9, "ts": 2, "type": "capture_failed", "step": 4,
+                "phase": "frozen_check", "error": "thawed"
+            })
+        );
     }
 
     // --- trace writer: order, failure surfacing, sync ---
@@ -850,7 +1099,10 @@ mod tests {
     }
 
     fn step_body(step: u64) -> EventBody {
-        EventBody::Step { step }
+        EventBody::Step {
+            step,
+            snapshot: None,
+        }
     }
 
     #[test]
@@ -952,6 +1204,82 @@ mod tests {
             sink.bytes.len(),
             "sync happens after the step event's bytes reached the sink"
         );
+    }
+
+    #[test]
+    fn every_capture_phase_has_a_stable_snake_case_name() {
+        for (phase, name) in [
+            (CapturePhase::Freeze, "freeze"),
+            (CapturePhase::Capture, "capture"),
+            (CapturePhase::FrozenCheck, "frozen_check"),
+            (CapturePhase::StepEvent, "step_event"),
+            (CapturePhase::Thaw, "thaw"),
+            (CapturePhase::ChainHead, "chain_head"),
+        ] {
+            assert_eq!(serde_json::to_value(phase).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn fail_nth_sync_fails_only_that_sync_and_keeps_the_event_written() {
+        let mut writer = TraceWriter::new(FailNthSync::new(FakeSink::default(), 2));
+        writer.append(1, step_body(0)).unwrap();
+        writer.sync().unwrap();
+        writer.append(2, step_body(1)).unwrap();
+        let err = writer.sync().unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure of sync 2"),
+            "{err}"
+        );
+        // the event written before the failed sync is in the sink, and later syncs work
+        writer.append(3, step_body(2)).unwrap();
+        writer.sync().unwrap();
+        let sink = writer.into_inner();
+        assert_eq!(
+            sink.inner.syncs_at.len(),
+            2,
+            "syncs 1 and 3 reached the sink"
+        );
+        assert_eq!(
+            String::from_utf8(sink.inner.bytes).unwrap().lines().count(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_failed_write_leaves_a_torn_line_and_is_a_write_error() {
+        let mut writer = TraceWriter::new(FailNthWrite::new(FakeSink::default(), 2));
+        writer.append(1, step_body(0)).unwrap();
+        let err = writer.append(2, step_body(1)).unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure of write 2"),
+            "{err}"
+        );
+        assert!(matches!(err, RecorderError::Write(_)), "{err}");
+        // the sink holds the first line and half of the second
+        let bytes = writer.into_inner().inner.bytes;
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(!text.ends_with('\n'), "{text}");
+    }
+
+    #[test]
+    fn a_failed_sync_is_a_sync_error_and_the_event_is_whole() {
+        let mut writer = TraceWriter::new(FailNthSync::new(FakeSink::default(), 1));
+        writer.append(1, step_body(0)).unwrap();
+        let err = writer.sync().unwrap_err();
+        assert!(matches!(err, RecorderError::Sync(_)), "{err}");
+        let text = String::from_utf8(writer.into_inner().inner.bytes).unwrap();
+        assert!(text.ends_with('\n'), "{text}");
+    }
+
+    #[test]
+    fn fail_nth_sync_with_zero_never_fails() {
+        let mut writer = TraceWriter::new(FailNthSync::new(FakeSink::default(), 0));
+        for step in 0..3 {
+            writer.append(1, step_body(step)).unwrap();
+            writer.sync().unwrap();
+        }
     }
 
     // --- run directory ---

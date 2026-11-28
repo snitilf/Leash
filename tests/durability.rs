@@ -46,7 +46,15 @@ fn torture_child() {
     let mut writer = dir.trace_writer().unwrap();
     // bounded only to satisfy the lint; the parent kills this loop long before
     for i in 0..=u64::MAX {
-        writer.append(i, EventBody::Step { step: i }).unwrap();
+        writer
+            .append(
+                i,
+                EventBody::Step {
+                    step: i,
+                    snapshot: None,
+                },
+            )
+            .unwrap();
         writer.sync().unwrap();
     }
 }

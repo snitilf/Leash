@@ -24,7 +24,7 @@ pub use super::store::{RefusedEntry, UNCAPTURED_SHA256, scan_current};
 
 use super::diff::display_path;
 use super::store::{
-    EntryKind, Limits, Manifest, ManifestEntry, StoreError, capture, committed_steps, hex_encode,
+    EntryKind, Limits, Manifest, ManifestEntry, StoreError, capture, hex_encode,
     is_valid_sha256_hex, load_manifest, validate_manifest, validate_relative_path, verify_object,
 };
 
@@ -89,15 +89,19 @@ impl RecomputedChain {
     }
 }
 
-/// recompute the chain head from the manifests actually present in `store`.
+/// recompute the chain head over the committed steps of a run from the manifests in `store`.
 ///
-/// loads every committed manifest in ascending step order and uses the digest of the bytes
-/// it read from disk. the chain is never read from a trace. steps must be contiguous from
-/// 0: a gap is an error naming the missing step. callers take the target manifest's digest
-/// from the result instead of loading it a second time.
-pub fn recompute_chain(store: &File) -> Result<RecomputedChain, StoreError> {
+/// `committed` is the committed step list, ascending: the `step` events of the run's trace
+/// (`store::committed_steps_from_trace`), never the manifests on disk, so an orphan manifest
+/// (published, its step event never durable) is not in the chain (ADR-0024 decision 16).
+/// the digests are the sha256 of the manifest bytes `load_manifest` read from disk, never
+/// values from the trace. steps must be contiguous from 0: a gap is an error naming the
+/// missing step, and a committed step whose manifest is missing or invalid is the error
+/// `load_manifest` returns. callers take the target manifest's digest from the result
+/// instead of loading it a second time.
+pub fn recompute_chain(store: &File, committed: &[u64]) -> Result<RecomputedChain, StoreError> {
     let mut digests = Vec::new();
-    for (expected, step) in committed_steps(store)?.into_iter().enumerate() {
+    for (expected, step) in committed.iter().copied().enumerate() {
         let expected = expected as u64;
         if step != expected {
             return Err(StoreError::InvalidChain {

@@ -53,7 +53,7 @@ Every event shares an envelope and adds a type-specific body under `type`:
 |---|---|
 | `seq` | monotonic sequence number, the authoritative order (decision order, ADR-0011) |
 | `ts` | supervisor wall-clock timestamp at the moment of decision |
-| `type` | `run_start`, `syscall`, `step`, `cgroup_kill`, or `run_end` |
+| `type` | `run_start`, `syscall`, `step`, `cgroup_kill`, `capture_failed`, or `run_end` |
 
 A `syscall` event, the common case, adds:
 
@@ -118,12 +118,12 @@ Its `landlock_residuals` also carry `landlock:snapshot_store_read_overlap` when 
 These are trace vocabulary, not policy rules; a loaded policy's rule ids never
 collide with them because they carry a `:` and rule ids are plain names.
 
-`run_start` carries the same facts as `meta.json` so the stream is self-contained. `step` marks a
-committed **step** boundary with the step index (FR-17, [`snapshot.md`](snapshot.md)). `run_end`
-carries the exit status of the child tree and the final committed step index.
+`run_start` carries the same facts as `meta.json` so the stream is self-contained.
+`step` marks a committed **step** boundary with the step index (FR-17, [`snapshot.md`](snapshot.md)).
+`run_end` carries the exit status of the child tree and the final committed step index.
 
-A snapshot run (`snapshot_integrity`, ADR-0024) adds one optional field to `run_start` and `meta.json`, and one event type.
-Both are additive, so `schema_version` does not move, and a reader that ignores them still decodes the trace.
+A snapshot run (`snapshot_integrity`, ADR-0024) adds one optional field to `run_start` and `meta.json`, optional fields to `step` and `run_end`, and two event types.
+All are additive, so `schema_version` does not move, and a reader that ignores them still decodes the trace.
 Non-snapshot runs write neither.
 
 - `run_cgroup` is the absolute path of the run cgroup, `leash-<run-id>` under Leash's own cgroup.
@@ -146,12 +146,51 @@ captures must not be relabeled exact. A failed or unpublished capture must not p
 successful step; a published snapshot without its committed step is an orphan during recovery.
 A failed final capture must be represented as failure, not as a successful final boundary.
 
-ADR-0024 adds these fields, specified by ADR-0024, not yet implemented:
+A snapshot run also writes these (ADR-0024 decisions 10, 14 and 16), all additive and all absent from a run that takes no snapshots.
 
-- a `step` event carries the manifest digest of its snapshot and the capture pause;
-- `run_end` carries the chain head over all step manifest digests, recomputed from the manifests and never read from the trace;
-- a snapshot run records the `clone3` `ENOSYS` denial and the legacy AIO denial as events.
+- A `step` event of a snapshot run carries, besides `step`:
+  - `manifest_digest`: the lowercase hex sha256 of the exact manifest bytes the store published for the step, as `load_manifest` returns it.
+  - `capture_pause_us`: microseconds the agent tree was frozen, from the start of the freeze to just before the step event is written.
+    The event must be durable before the thaw, so the thaw wait is not included.
+    It is `0` for step 0 and the final step, where no agent is running.
+  - `capture`: `{"entries": <files, directories and symlinks captured>, "bytes": <sum of regular-file sizes>, "new_objects": <content objects this capture added to the store>}`.
+  A `step` event is written, and the trace synced, only after the cgroup is confirmed still frozen and the manifest is published, and before the thaw.
+  The frozen re-check runs after the capture and before the manifest is published, so a manifest exists only for a capture made under an unbroken freeze.
+  Step 0 is captured after the run cgroup exists and before the agent is created, so its event follows `run_start` and any `stale_cleanup` events.
+  The final step is captured after `cgroup.kill` reported `populated 0`, so its event follows the `cgroup_kill` event with reason `run_end` and precedes `run_end`.
+  Each digest is also printed to stderr as `leash: step <n> snapshot <digest>` when its step commits.
+- `run_end` carries `chain_head`: the chain head over every committed step digest, `restore::chain_head` over the `(step, digest)` pairs the store returned.
+  It is recomputed from those digests and never read back from the trace, and it is printed at run end as `leash: snapshot chain head <head>`.
+  It is absent in a run that takes no snapshots and in a run that aborted, which has no `run_end`.
+  `final_step` names the last committed step.
+- A `capture_failed` event is written, on a best-effort basis because the trace may be what failed, when a capture boundary fails and the run aborts closed.
+  It carries `step` (the step the boundary would have closed), `phase` and `error` (text).
+  `phase` is `freeze` (`frozen=1` not confirmed in time), `capture` (the store could not capture or publish, or a limit was hit), `frozen_check` (the cgroup was no longer frozen after the capture, checked before the manifest is published), `step_event` (the step event could not be written or made durable), `thaw` (`frozen=0` not confirmed in time) or `chain_head` (the final step was committed, and the chain head over the committed digests could not be computed).
+  A failed boundary has no committed step, except `thaw` and `chain_head`: after a `thaw` failure the step event was already durable, so the step is committed, and a `chain_head` failure follows a committed final step.
+  A `step_event` failure can leave an event in the file that was never made durable.
+  After a failed trace write, which may have left a torn line, no `capture_failed` is written, because it would be glued onto the torn line and make the trace unparseable.
+  After a failed sync the event is whole in the file, so `capture_failed` is written.
+  `capture_failed` with phase `step_event` for step N, after the event for step N, un-commits step N.
+  The only orphan is a `step_event` failure: the manifest was published, and no durable step event names it.
+  A `frozen_check` failure leaves no manifest, because the check runs before the manifest is published, and a `thaw` failure leaves a committed step.
+  The run then kills the whole run cgroup (a `cgroup_kill` event with reason `abort`), exits 125 and writes no `run_end`.
+  After a `chain_head` failure the end-of-run kill (reason `run_end`) has already been recorded, so no `abort` kill follows.
+  Hitting a capture limit (entries, total bytes, per-file size, store growth) is a `capture` failure, so it ends the run.
+- A snapshot run records the `clone3` `ENOSYS` denial and the legacy AIO denial as events (matched rules `snapshot:clone3` and `snapshot:aio`).
 
+The committed steps of a run are derived from its trace, not from the manifests on disk (ADR-0024 decision 16).
+A step is committed when its `step` event is in `trace.jsonl` and is not followed by `capture_failed` with phase `step_event` for the same step.
+A manifest with no such event is an orphan: published, never committed.
+`leash diff` takes its default step from the committed steps, and `restore::recompute_chain` takes the committed step list and hashes only those manifests.
+Digests still come from the manifests, never from the trace.
+The reader is `store::committed_steps_from_trace`, and `store::published_steps` lists the manifests on disk, orphans included.
+The trace is read as untrusted input.
+The file is opened without following a symlink and must be a regular file.
+It has no size cap, because the trace grows with agent activity and a cap would make an honest run un-diffable.
+The read stops at the size the file had when it was opened, so a file that keeps growing cannot extend it.
+Each line is at most 1 MiB (`TRACE_LINE_CAP`) and there are at most 1,000,000 step events (`TRACE_STEP_CAP`).
+Step events must ascend, and a malformed event that could decide commitment is an error.
+A final line with no newline is a write torn by a crash and is ignored.
 
 The `fact` is what the supervisor resolved, not what the child's memory said after the fact: the
 trace records the kernel-trusted value the decision used (I4), so the trace and the decision cannot

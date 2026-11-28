@@ -9,6 +9,8 @@
 
 pub mod ask;
 #[cfg(target_os = "linux")]
+pub mod barrier;
+#[cfg(target_os = "linux")]
 pub mod broker;
 #[cfg(target_os = "linux")]
 pub mod cgroup;
@@ -24,3 +26,4 @@ pub mod session;
 #[cfg(target_os = "linux")]
 pub mod spawn;
 pub mod state_root;
+pub mod workspace_lock;

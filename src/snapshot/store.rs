@@ -30,6 +30,12 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// maximum manifest file size accepted by `load_manifest` (256 MiB).
 pub const MANIFEST_READ_CAP: u64 = 256 * 1024 * 1024;
 
+/// the longest line of `trace.jsonl` that `committed_steps_from_trace` accepts (1 MiB).
+pub const TRACE_LINE_CAP: usize = 1024 * 1024;
+
+/// the most `step` events that `committed_steps_from_trace` accepts.
+pub const TRACE_STEP_CAP: usize = 1_000_000;
+
 /// provisional default maximum number of entries in a single capture.
 ///
 /// provisional: chosen as a safe initial upper bound until measured against real
@@ -227,6 +233,20 @@ pub enum StoreError {
     /// the OS random generator failed when creating a staging filename.
     #[error("random source failed: {0}")]
     Random(String),
+    /// `trace.jsonl` could not be trusted to name the committed steps: a symlink, a file that
+    /// is not regular, over the read cap, or malformed.
+    #[error("invalid trace: {reason}")]
+    InvalidTrace {
+        /// why the trace was rejected.
+        reason: String,
+    },
+    /// the caller's `before_publish` check refused the capture, so no manifest was
+    /// published (the barrier's frozen re-check, ADR-0024 decision 10).
+    #[error("publication refused: {reason}")]
+    PublishRefused {
+        /// why the caller refused.
+        reason: String,
+    },
 }
 
 /// supported entry kinds in a snapshot manifest.
@@ -703,14 +723,17 @@ pub(crate) fn step_manifest_filename(step: u64) -> String {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{capture, committed_steps, load_manifest, scan_current, verify_object};
+pub use linux::{
+    capture, capture_gated, committed_steps_from_trace, load_manifest, published_steps,
+    scan_current, verify_object,
+};
 
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::{BTreeMap, HashMap};
     use std::ffi::{CStr, CString};
     use std::fs::File;
-    use std::io::{self, Read, Seek, SeekFrom, Write};
+    use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
     use sha2::{Digest, Sha256};
@@ -718,9 +741,9 @@ mod linux {
     use super::{
         CaptureStats, EntryKind, FileFingerprint, Limits, MANIFEST_READ_CAP,
         MANIFEST_SCHEMA_VERSION, Manifest, ManifestEntry, ManifestTotals, Published, RefusedEntry,
-        StoreError, UNCAPTURED_SHA256, XattrAction, check_file_unchanged, classify_xattr,
-        hex_encode, is_valid_sha256_hex, manifest_digest, parse_manifest, parse_step_filename,
-        step_manifest_filename,
+        StoreError, TRACE_LINE_CAP, TRACE_STEP_CAP, UNCAPTURED_SHA256, XattrAction,
+        check_file_unchanged, classify_xattr, hex_encode, is_valid_sha256_hex, manifest_digest,
+        parse_manifest, parse_step_filename, step_manifest_filename,
     };
 
     const COPY_BUF_LEN: usize = 64 * 1024;
@@ -1221,6 +1244,23 @@ mod linux {
         step: u64,
         limits: &Limits,
     ) -> Result<Published, StoreError> {
+        capture_gated(workspace, store, step, limits, &mut || Ok(()))
+    }
+
+    /// `capture` with a check that runs after the whole workspace is captured and its
+    /// manifest is staged, immediately before the manifest is renamed into place.
+    ///
+    /// the barrier uses it to re-read `frozen=1` after the capture and before anything is
+    /// published (ADR-0024 decision 10). an `Err` from `before_publish` discards the staged
+    /// manifest and is returned, so no manifest for `step` exists. objects already placed
+    /// stay in the store: they are content-addressed and unreferenced, never a snapshot.
+    pub fn capture_gated(
+        workspace: &File,
+        store: &File,
+        step: u64,
+        limits: &Limits,
+        before_publish: &mut dyn FnMut() -> Result<(), StoreError>,
+    ) -> Result<Published, StoreError> {
         let ws_stat = fstat_fd(workspace.as_raw_fd(), "fstat", "<workspace>")?;
         if !is_dir_mode(ws_stat.st_mode) {
             return Err(StoreError::InvalidRoot);
@@ -1510,6 +1550,11 @@ mod linux {
             ));
         }
         drop(staged_manifest);
+
+        if let Err(err) = before_publish() {
+            unlink_best_effort(staging_dir.as_raw_fd(), &staged_name);
+            return Err(err);
+        }
 
         let placed = match rename_noreplace(
             staging_dir.as_raw_fd(),
@@ -2243,11 +2288,15 @@ mod linux {
         Ok(file)
     }
 
-    /// list all committed step numbers present in `manifests/`, sorted ascending.
+    /// list every step number with a published manifest in `manifests/`, sorted ascending.
+    ///
+    /// this is the set of manifests on disk, not the set of committed steps: a manifest
+    /// whose step event never became durable is an orphan and is listed here too. use
+    /// `committed_steps_from_trace` for the committed set (ADR-0024 decision 16).
     ///
     /// returns an empty list if `manifests/` does not exist yet. ignores any entry whose
     /// filename does not match `parse_step_filename`.
-    pub fn committed_steps(store: &File) -> Result<Vec<u64>, StoreError> {
+    pub fn published_steps(store: &File) -> Result<Vec<u64>, StoreError> {
         let store_stat = fstat_fd(store.as_raw_fd(), "fstat", "<store>")?;
         if !is_dir_mode(store_stat.st_mode) {
             return Err(StoreError::InvalidStore);
@@ -2281,6 +2330,134 @@ mod linux {
         }
         steps.sort_unstable();
         Ok(steps)
+    }
+
+    /// the committed steps of a run, derived from the `step` events in its `trace.jsonl`,
+    /// ascending (ADR-0024 decision 16; trace.md section 2).
+    ///
+    /// a step is committed when its `step` event is durable, so a manifest is neither
+    /// necessary nor sufficient: an orphan manifest has no event, and an event followed by
+    /// `capture_failed` with phase `step_event` for the same step could not be made durable,
+    /// so that step is excluded. digests still come from the manifests, never the trace.
+    ///
+    /// `run_dir` is a handle on the run directory. the trace is untrusted input: the file is
+    /// opened `O_NOFOLLOW | O_NONBLOCK` and must be a regular file. it has no size cap, because
+    /// it grows with agent activity and a cap would make an honest run un-diffable. the read
+    /// stops at the size the file had when it was opened, so a file that keeps growing cannot
+    /// extend it. each line is at most `TRACE_LINE_CAP` bytes, and at most `TRACE_STEP_CAP`
+    /// step events are accepted. a final line without a newline is a write
+    /// torn by a crash and is ignored. `step` events must ascend; any other malformed line
+    /// that could be one is `StoreError::InvalidTrace`. a missing trace is an `Io` error with
+    /// kind `NotFound`.
+    pub fn committed_steps_from_trace(run_dir: &File) -> Result<Vec<u64>, StoreError> {
+        const OP: &str = "read trace";
+        const TRACE: &str = "trace.jsonl";
+        let invalid = |reason: String| StoreError::InvalidTrace { reason };
+
+        // SAFETY: run_dir is a live descriptor and the name is a NUL-terminated literal;
+        // O_NOFOLLOW refuses a symlink and O_NONBLOCK keeps a FIFO from blocking the open.
+        let fd = unsafe {
+            libc::openat(
+                run_dir.as_raw_fd(),
+                c"trace.jsonl".as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                return Err(invalid(format!("{TRACE} is a symlink")));
+            }
+            return Err(io_err("openat", TRACE, err));
+        }
+        // SAFETY: fd was just returned by openat and nothing else owns it.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let st = fstat_fd(file.as_raw_fd(), "fstat", TRACE)?;
+        if !is_reg_mode(st.st_mode) {
+            return Err(invalid(format!("{TRACE} is not a regular file")));
+        }
+        let size = stat_size(&st, TRACE)?;
+
+        // the size at open bounds the read, so a file that grows while it is read is not
+        // followed past it. the per-line and step-count caps bound what the content can cost
+        let mut reader = BufReader::new(file.take(size));
+        let mut steps: Vec<u64> = Vec::new();
+        let mut line: Vec<u8> = Vec::new();
+        let mut line_no = 0u64;
+        loop {
+            line.clear();
+            let read = reader
+                .by_ref()
+                .take(TRACE_LINE_CAP as u64 + 1)
+                .read_until(b'\n', &mut line)
+                .map_err(|e| io_err(OP, TRACE, e))?;
+            if read == 0 {
+                break;
+            }
+            line_no += 1;
+            if line.last() != Some(&b'\n') {
+                if line.len() > TRACE_LINE_CAP {
+                    return Err(invalid(format!(
+                        "line {line_no} is longer than {TRACE_LINE_CAP} bytes"
+                    )));
+                }
+                // a final line with no newline: a write torn by a crash, never committed
+                break;
+            }
+            line.pop();
+            if line.len() > TRACE_LINE_CAP {
+                return Err(invalid(format!(
+                    "line {line_no} is longer than {TRACE_LINE_CAP} bytes"
+                )));
+            }
+            // only the two event kinds that decide commitment are parsed. a bare quote in
+            // the pattern cannot occur inside a JSON string, so a path an agent controls
+            // cannot make an event look like one of these
+            if !contains(&line, br#""type":"step""#)
+                && !contains(&line, br#""type":"capture_failed""#)
+            {
+                continue;
+            }
+            let event: TraceEvent = serde_json::from_slice(&line)
+                .map_err(|e| invalid(format!("line {line_no} is not a valid event: {e}")))?;
+            match event.kind.as_str() {
+                "step" => {
+                    let step = event.step.ok_or_else(|| {
+                        invalid(format!("line {line_no}: a step event has no step"))
+                    })?;
+                    if steps.last().is_some_and(|last| step <= *last) {
+                        return Err(invalid(format!(
+                            "line {line_no}: step {step} does not ascend from the previous step event"
+                        )));
+                    }
+                    if steps.len() >= TRACE_STEP_CAP {
+                        return Err(invalid(format!("more than {TRACE_STEP_CAP} step events")));
+                    }
+                    steps.push(step);
+                }
+                "capture_failed" if event.phase.as_deref() == Some("step_event") => {
+                    // the step event could not be made durable, so the step is not committed
+                    if steps.last().is_some() && steps.last().copied() == event.step {
+                        steps.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(steps)
+    }
+
+    /// the fields of a trace line that decide whether a step is committed.
+    #[derive(serde::Deserialize)]
+    struct TraceEvent {
+        #[serde(rename = "type")]
+        kind: String,
+        step: Option<u64>,
+        phase: Option<String>,
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 }
 

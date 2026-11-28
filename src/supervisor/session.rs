@@ -200,6 +200,15 @@ pub enum SessionError {
     #[cfg(target_os = "linux")]
     #[error("run cgroup: {0}")]
     RunCgroup(#[from] crate::supervisor::run_cgroup::RunCgroupError),
+    /// another run or rewind owns the workspace, or its lock could not be set up
+    /// (ADR-0024 decision 13).
+    #[cfg(target_os = "linux")]
+    #[error("{0}")]
+    WorkspaceLock(#[from] crate::supervisor::workspace_lock::WorkspaceLockError),
+    /// the workspace or the run's snapshot store could not be opened as a pinned handle.
+    #[cfg(target_os = "linux")]
+    #[error("snapshot store could not be opened: {0}")]
+    SnapshotStore(#[source] std::io::Error),
     /// the confined realization broker could not be established or served.
     #[cfg(target_os = "linux")]
     #[error("broker failed: {0}")]
@@ -216,7 +225,10 @@ pub enum SessionError {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{SessionHooks, run_session, run_session_with_hooks, run_session_with_writer};
+pub use linux::{
+    SessionHooks, run_session, run_session_with_hooks, run_session_with_trace_sink,
+    run_session_with_writer,
+};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -227,6 +239,11 @@ mod linux {
     };
     use crate::sandbox::landlock::{
         self, LandlockHull, PreparedRuleset, ProtectedStore, StoreKind,
+    };
+    use crate::snapshot::BoundaryCapture;
+    use crate::snapshot::store::Limits;
+    use crate::supervisor::barrier::{
+        BarrierOps, StoreCapture, commit_step, fail_boundary, fail_step_event,
     };
     use crate::supervisor::broker::Broker;
     use crate::supervisor::cgroup;
@@ -245,6 +262,9 @@ mod linux {
     use std::path::Path;
     use std::time::{Duration, SystemTime};
 
+    use crate::recorder::CapturePhase;
+    use crate::supervisor::workspace_lock::WorkspaceLock;
+
     /// injectable seams for a session, used by tests to exercise cgroup probe refusal,
     /// `cgroup.kill` timeout, and attended-ask flows without test-only branches in production
     /// code.
@@ -261,6 +281,14 @@ mod linux {
         /// ADR-0024 decision 6 refusal.
         pub capabilities:
             &'a dyn Fn() -> Result<preflight::Capabilities, preflight::PreflightError>,
+        /// the freezer operations and timing of a capture boundary: tests make a freeze or
+        /// thaw fail, which no agent can cause on a real kernel.
+        pub barrier: BarrierOps<'a>,
+        /// the hard caps of every capture of a snapshot run (ADR-0024 decision 14).
+        pub limits: Limits,
+        /// computes the chain head over the committed digests at run end; tests make it fail,
+        /// which a store of valid digests never does.
+        pub chain_head: crate::supervisor::barrier::ChainHeadFn<'a>,
     }
 
     impl Default for SessionHooks<'_> {
@@ -270,6 +298,9 @@ mod linux {
                 kill: &RunCgroup::kill_all,
                 prompter: &crate::supervisor::ask::tty_prompt,
                 capabilities: &preflight::probe,
+                barrier: BarrierOps::default(),
+                limits: Limits::default(),
+                chain_head: &crate::snapshot::restore::chain_head,
             }
         }
     }
@@ -296,6 +327,17 @@ mod linux {
     pub fn run_session_with_hooks(
         spec: SessionSpec,
         hooks: SessionHooks<'_>,
+    ) -> Result<SessionOutcome, SessionError> {
+        run_session_with_trace_sink(spec, hooks, |file| file)
+    }
+
+    /// `run_session_with_hooks` with the trace file wrapped before the run writes to it: the
+    /// seam tests use to make a sync fail (`recorder::FailNthSync`) at a point no agent can
+    /// reach. a real run passes the file through unchanged.
+    pub fn run_session_with_trace_sink<S: TraceSink>(
+        spec: SessionSpec,
+        hooks: SessionHooks<'_>,
+        wrap_trace: impl FnOnce(std::fs::File) -> S,
     ) -> Result<SessionOutcome, SessionError> {
         refuse_snapshot_integrity_outside_enforce(&spec)?;
         // first, before any run directory, broker or child exists (ADR-0024 decision 9)
@@ -337,6 +379,31 @@ mod linux {
             (None, None, None)
         };
 
+        // a snapshot run owns its workspace for the whole run (ADR-0024 decision 13,
+        // ADR-0026): an flock on the workspace directory handle and one on a file under the
+        // state root. both are taken before any run directory exists, so a refused run leaves
+        // nothing behind. the broker does not hold them because broker_child calls
+        // close_all_except as its first act (broker.rs), and the agent child closes every
+        // descriptor above 2 before execve, so neither inherits the lock. the directory
+        // handle is reused for every capture of the run.
+        let workspace_lock = if spec.snapshot_integrity {
+            std::fs::create_dir_all(&spec.state_root).map_err(SessionError::StateRoot)?;
+            Some(WorkspaceLock::acquire(&spec.state_root, &spec.workspace)?)
+        } else {
+            None
+        };
+
+        // a snapshot run always uses the copy backend: overlay stays gated (ADR-0009,
+        // ADR-0022), so the stamp must not name a mechanism the run does not use
+        let (mechanism, mechanism_reason) = if spec.snapshot_integrity {
+            (
+                crate::recorder::SnapshotMechanism::Copy,
+                "snapshot run: copy backend; overlay is gated by ADR-0009 and ADR-0022".to_string(),
+            )
+        } else {
+            (mechanism, mechanism_reason)
+        };
+
         let meta = RunMeta {
             schema_version: TRACE_SCHEMA_VERSION,
             mode: spec.mode,
@@ -356,7 +423,7 @@ mod linux {
             Some(id) => RunDir::create_with_id(&spec.state_root, &meta, id)?,
             None => RunDir::create(&spec.state_root, &meta, SystemTime::now())?,
         };
-        let mut writer = run_dir.trace_writer()?;
+        let mut writer = TraceWriter::new(wrap_trace(run_dir.trace_file()?));
         run_session_with_writer_and_ruleset(
             &spec,
             meta,
@@ -367,6 +434,7 @@ mod linux {
             &enforcement.resolved_hosts,
             located_parent.as_ref(),
             cgroup_mounts.as_ref(),
+            workspace_lock.as_ref(),
             &hooks,
         )
     }
@@ -575,6 +643,7 @@ mod linux {
             &HashMap::new(),
             None,
             None,
+            None,
             &SessionHooks::default(),
         )
     }
@@ -590,6 +659,7 @@ mod linux {
         resolved_hosts: &HashMap<String, Vec<IpAddr>>,
         located_parent: Option<&CgroupParent>,
         cgroup_mounts: Option<&CgroupMounts>,
+        workspace_lock: Option<&WorkspaceLock>,
         hooks: &SessionHooks<'_>,
     ) -> Result<SessionOutcome, SessionError> {
         refuse_snapshot_integrity_outside_enforce(spec)?;
@@ -659,6 +729,46 @@ mod linux {
             writer,
         )?;
 
+        // step 0: the workspace as it was before the agent started, captured with the run
+        // cgroup in place and before `clone3` creates the agent, so no process of the tree
+        // exists to write while it is captured (ADR-0024 decision 10). its digest is
+        // committed in a step event before the agent exists.
+        let capture = if spec.snapshot_integrity {
+            // capture goes through a duplicate of the handle the workspace lock holds, so the
+            // locked directory is the captured directory (ADR-0026)
+            let workspace_dir = workspace_lock
+                .ok_or_else(|| {
+                    SessionError::SnapshotStore(std::io::Error::other(
+                        "a snapshot run needs the workspace lock",
+                    ))
+                })?
+                .workspace_dir()
+                .try_clone()
+                .map_err(SessionError::SnapshotStore)?;
+            let capture = StoreCapture::with_workspace(
+                workspace_dir,
+                &run_dir.path.join("snapshots"),
+                hooks.limits,
+            )
+            .map_err(SessionError::SnapshotStore)?
+            .with_chain_head(hooks.chain_head);
+            let published = capture.capture(0).map_err(|e| {
+                SessionError::Run(fail_boundary(
+                    writer,
+                    now_ms().unwrap_or(0),
+                    0,
+                    CapturePhase::Capture,
+                    e,
+                ))
+            })?;
+            commit_step(writer, now_ms()?, &capture, 0, &published, Duration::ZERO).map_err(
+                |e| SessionError::Run(fail_step_event(writer, now_ms().unwrap_or(0), 0, e)),
+            )?;
+            Some(capture)
+        } else {
+            None
+        };
+
         // steps 5-6: spawn and serve until the tree exits
         let spawn_spec = SpawnSpec {
             argv: spec.argv.clone(),
@@ -691,9 +801,13 @@ mod linux {
             ),
         }
         .with_ask_timeout(spec.ask_timeout)
-        .with_snapshot_integrity(spec.snapshot_integrity);
+        .with_snapshot_integrity(spec.snapshot_integrity)
+        .with_barrier_ops(hooks.barrier);
         if let Some(mounts) = cgroup_mounts {
             config = config.with_cgroup_mounts(mounts);
+        }
+        if let Some(capture) = capture.as_ref() {
+            config = config.with_capture(capture);
         }
         config.prompter = hooks.prompter;
         let outcome = run_loop_with_cgroup_kill(child, config, writer, hooks.kill)?;
@@ -713,9 +827,13 @@ mod linux {
                 exit_code,
                 signal,
                 final_step: outcome.final_step,
+                chain_head: outcome.chain_head.clone(),
             },
         )?;
         writer.sync()?;
+        if let Some(head) = outcome.chain_head.as_deref() {
+            eprintln!("leash: snapshot chain head {head}");
+        }
 
         // step 9: the report is rendered from the trace on disk, never from live state
         let trace = std::fs::read_to_string(run_dir.path.join("trace.jsonl"))

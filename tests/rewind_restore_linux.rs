@@ -139,6 +139,16 @@ fn chain_head_hashes_the_documented_line_format() {
     assert_eq!(chain_head(&d).unwrap(), expected);
 }
 
+/// the digests of the first `steps` manifests already in the store.
+fn capture_chain_digests_of(fx: &Fixture, steps: u64) -> Vec<(u64, String)> {
+    (0..steps)
+        .map(|step| {
+            let (_, digest) = load_manifest(&fx.store_fd(), step).unwrap();
+            (step, digest)
+        })
+        .collect()
+}
+
 fn capture_chain(fx: &Fixture, steps: u64) -> Vec<(u64, String)> {
     fs::write(fx.ws.join("a"), b"one").unwrap();
     let mut digests = Vec::new();
@@ -150,11 +160,16 @@ fn capture_chain(fx: &Fixture, steps: u64) -> Vec<(u64, String)> {
     digests
 }
 
+/// the committed step list of a run that committed steps `0..steps`.
+fn committed(steps: u64) -> Vec<u64> {
+    (0..steps).collect()
+}
+
 #[test]
 fn recompute_chain_matches_digests_returned_by_capture() {
     let fx = Fixture::new();
     let digests = capture_chain(&fx, 3);
-    let chain = recompute_chain(&fx.store_fd()).unwrap();
+    let chain = recompute_chain(&fx.store_fd(), &committed(3)).unwrap();
     assert_eq!(chain.head, chain_head(&digests).unwrap());
     assert_eq!(chain.digests, digests);
     assert_eq!(chain.digest(1), Some(digests[1].1.as_str()));
@@ -171,26 +186,34 @@ fn recompute_chain_uses_bytes_on_disk_not_a_trace() {
     let mut bytes = fs::read(&path).unwrap();
     bytes.push(b'\n');
     fs::write(&path, bytes).unwrap();
-    assert_ne!(recompute_chain(&fx.store_fd()).unwrap().head, honest);
+    assert_ne!(
+        recompute_chain(&fx.store_fd(), &committed(1)).unwrap().head,
+        honest
+    );
 }
 
 #[test]
-fn a_deleted_last_manifest_changes_the_head() {
+fn a_committed_step_whose_manifest_was_deleted_is_an_error() {
     let fx = Fixture::new();
-    let digests = capture_chain(&fx, 3);
-    let honest = chain_head(&digests).unwrap();
+    capture_chain(&fx, 3);
     fs::remove_file(fx.store_path.join("manifests/step-000002.json")).unwrap();
-    let after = recompute_chain(&fx.store_fd()).unwrap();
-    assert_ne!(after.head, honest);
+    let err = recompute_chain(&fx.store_fd(), &committed(3)).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Io { path, .. } if path.contains("step-000002")),
+        "{err}"
+    );
+    // the same store with step 2 not committed is a shorter, valid chain
+    let digests = capture_chain_digests_of(&fx, 2);
+    let after = recompute_chain(&fx.store_fd(), &committed(2)).unwrap();
+    assert_eq!(after.head, chain_head(&digests).unwrap());
     assert_eq!(after.digest(2), None);
 }
 
 #[test]
-fn a_deleted_middle_manifest_is_a_gap_naming_the_missing_step() {
+fn a_committed_list_with_a_gap_names_the_missing_step() {
     let fx = Fixture::new();
     capture_chain(&fx, 3);
-    fs::remove_file(fx.store_path.join("manifests/step-000001.json")).unwrap();
-    let err = recompute_chain(&fx.store_fd()).unwrap_err();
+    let err = recompute_chain(&fx.store_fd(), &[0, 2]).unwrap_err();
     assert!(
         matches!(&err, StoreError::InvalidChain { reason } if reason.contains("step 1 is missing")),
         "{err}"
@@ -198,11 +221,10 @@ fn a_deleted_middle_manifest_is_a_gap_naming_the_missing_step() {
 }
 
 #[test]
-fn a_chain_that_starts_after_step_zero_names_step_zero() {
+fn a_committed_list_that_starts_after_step_zero_names_step_zero() {
     let fx = Fixture::new();
     capture_chain(&fx, 2);
-    fs::remove_file(fx.store_path.join("manifests/step-000000.json")).unwrap();
-    let err = recompute_chain(&fx.store_fd()).unwrap_err();
+    let err = recompute_chain(&fx.store_fd(), &[1]).unwrap_err();
     assert!(
         matches!(&err, StoreError::InvalidChain { reason } if reason.contains("step 0 is missing")),
         "{err}"
@@ -210,12 +232,22 @@ fn a_chain_that_starts_after_step_zero_names_step_zero() {
 }
 
 #[test]
-fn an_extra_manifest_changes_the_head() {
+fn an_orphan_manifest_is_not_in_the_chain() {
     let fx = Fixture::new();
     let digests = capture_chain(&fx, 2);
     let honest = chain_head(&digests).unwrap();
+    // step 2 is published but its step event never became durable: it is not committed
     capture(&fx.ws_fd(), &fx.store_fd(), 2, &Limits::default()).unwrap();
-    assert_ne!(recompute_chain(&fx.store_fd()).unwrap().head, honest);
+    assert_eq!(
+        recompute_chain(&fx.store_fd(), &committed(2)).unwrap().head,
+        honest,
+        "the chain over the committed steps ignores the orphan"
+    );
+    assert_ne!(
+        recompute_chain(&fx.store_fd(), &committed(3)).unwrap().head,
+        honest,
+        "counting the orphan as committed would change the head"
+    );
 }
 
 #[test]

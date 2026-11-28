@@ -82,14 +82,28 @@ fn rel_of<'a>(root: &Path, path: &'a Path) -> Result<&'a Path, SnapshotError> {
 /// the worst observed in-burst gap, far below agent think time); FR-17 via ADR-0006.
 pub const STEP_WINDOW: Duration = Duration::from_millis(250);
 
+/// the least time between the end of one capture boundary and the start of the next in a
+/// snapshot run (ADR-0024 decision 14). provisional: it bounds how often the agent is
+/// frozen for a copy, on top of the quiescence window, and is to be tuned against real
+/// agent sessions and workspace sizes.
+pub const MIN_BOUNDARY_INTERVAL: Duration = Duration::from_secs(1);
+
 /// step detection (FR-17, snapshot.md section 1). a pure state machine fed by the run
 /// loop: the loop reports every mutating mediated event, asks for the wakeup deadline,
 /// and polls for boundaries. boundary 0 is run start and is emitted by the caller, so
 /// indices handed out here start at 1. two properties are fixed regardless of the
 /// window: a boundary never falls inside a burst, and run end is always a boundary.
+///
+/// a snapshot run adds a minimum interval between boundaries (ADR-0024 decision 14): a
+/// boundary the window would close is held back until the interval since the previous
+/// boundary ended has passed, and the mutations that arrive meanwhile join it. the loop
+/// reports the end of each boundary with `boundary_ended`.
 pub struct StepClock {
     window: Duration,
+    min_interval: Duration,
     last_mutation: Option<Instant>,
+    /// when the previous boundary ended (or run start was captured)
+    last_boundary_end: Option<Instant>,
     /// the open step has seen a mutation since the last boundary
     pending: bool,
     /// the index the next boundary closes
@@ -97,11 +111,20 @@ pub struct StepClock {
 }
 
 impl StepClock {
-    /// a clock with the given coalescing window; tests inject smaller windows.
+    /// a clock with the given coalescing window and no minimum interval; tests inject
+    /// smaller windows.
     pub fn new(window: Duration) -> Self {
+        Self::with_min_interval(window, Duration::ZERO)
+    }
+
+    /// a clock that also holds boundaries at least `min_interval` apart, measured from the
+    /// end of the previous boundary (`boundary_ended`).
+    pub fn with_min_interval(window: Duration, min_interval: Duration) -> Self {
         Self {
             window,
+            min_interval,
             last_mutation: None,
+            last_boundary_end: None,
             pending: false,
             next_index: 1,
         }
@@ -113,11 +136,24 @@ impl StepClock {
         self.last_mutation = Some(at);
     }
 
-    /// close a boundary if activity has quiesced for the window. returns the index of
-    /// the step this boundary closes.
+    /// report that a boundary (step 0 included) finished at `at`; the minimum interval is
+    /// measured from here.
+    pub fn boundary_ended(&mut self, at: Instant) {
+        self.last_boundary_end = Some(at);
+    }
+
+    /// close a boundary if activity has quiesced for the window and the minimum interval
+    /// since the previous boundary has passed. returns the index of the step this
+    /// boundary closes.
     pub fn poll(&mut self, now: Instant) -> Option<u64> {
         let last = self.last_mutation?;
         if !self.pending || now.duration_since(last) < self.window {
+            return None;
+        }
+        if self
+            .last_boundary_end
+            .is_some_and(|end| now.saturating_duration_since(end) < self.min_interval)
+        {
             return None;
         }
         self.pending = false;
@@ -128,11 +164,14 @@ impl StepClock {
 
     /// when the run loop must wake to close a pending boundary, if any.
     pub fn deadline(&self) -> Option<Instant> {
-        if self.pending {
-            self.last_mutation.map(|last| last + self.window)
-        } else {
-            None
+        if !self.pending {
+            return None;
         }
+        let quiet = self.last_mutation? + self.window;
+        Some(match self.last_boundary_end {
+            Some(end) => quiet.max(end + self.min_interval),
+            None => quiet,
+        })
     }
 
     /// run end is always a boundary, mutations or not: returns the final step index.
@@ -144,13 +183,34 @@ impl StepClock {
     }
 }
 
-/// where the run loop sends step boundaries (FR-11): capture the current workspace
-/// state as the snapshot for the step being closed. the session implements this over
-/// the run directory; a capture failure stops the run fail-closed (snapshot.md
-/// section 6), because a recorded boundary without its snapshot would be a lie.
+/// where the run loop sends step boundaries (FR-11): the snapshot sink of one run. the
+/// session implements it over the run's store. a capture failure stops the run
+/// fail-closed (snapshot.md section 6), because a recorded boundary without its snapshot
+/// would be a lie.
 pub trait BoundaryCapture {
-    /// capture the workspace state as the snapshot for `step`
-    fn capture(&self, step: u64) -> Result<(), SnapshotError>;
+    /// capture the workspace state as the snapshot for `step` and publish it durably.
+    /// `before_publish` runs after the capture and immediately before the manifest is
+    /// published, and an `Err` from it publishes nothing (ADR-0024 decision 10: the
+    /// barrier re-reads `frozen=1` there). returns the digest and statistics the store
+    /// returned.
+    fn capture_gated(
+        &self,
+        step: u64,
+        before_publish: &mut dyn FnMut() -> Result<(), store::StoreError>,
+    ) -> Result<store::Published, store::StoreError>;
+
+    /// capture with no check before publication: step 0 and the final step, where no
+    /// process of the agent's tree exists.
+    fn capture(&self, step: u64) -> Result<store::Published, store::StoreError> {
+        self.capture_gated(step, &mut || Ok(()))
+    }
+
+    /// the step event for `step` is durable: the step is committed and joins the chain.
+    fn committed(&self, step: u64, manifest_digest: &str);
+
+    /// the chain head over every committed step digest, recomputed from the digests
+    /// `capture` returned and never read back from the trace (ADR-0024 decision 16).
+    fn chain_head(&self) -> Result<String, store::StoreError>;
 }
 
 /// the directory name of one step's snapshot inside a run's `snapshots/` directory.
@@ -548,6 +608,68 @@ mod tests {
             assert_eq!(clock.poll(at + STEP_WINDOW), Some(burst + 1));
         }
         assert_eq!(clock.finish(), 4);
+    }
+
+    #[test]
+    fn the_minimum_interval_holds_a_quiesced_boundary_back_and_merges_later_bursts() {
+        let t0 = Instant::now();
+        let min = Duration::from_secs(1);
+        let mut clock = StepClock::with_min_interval(STEP_WINDOW, min);
+        clock.boundary_ended(t0);
+        clock.on_mutation(t0 + Duration::from_millis(100));
+        // quiet for the window, but the interval since the last boundary has not passed
+        assert_eq!(clock.poll(t0 + Duration::from_millis(400)), None);
+        assert_eq!(clock.deadline(), Some(t0 + min));
+        // a second burst inside the held-back window joins the same step
+        clock.on_mutation(t0 + Duration::from_millis(500));
+        assert_eq!(clock.poll(t0 + Duration::from_millis(900)), None);
+        assert_eq!(clock.poll(t0 + min), Some(1));
+        assert_eq!(clock.poll(t0 + Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn the_minimum_interval_is_measured_from_the_end_of_the_previous_boundary() {
+        let t0 = Instant::now();
+        let min = Duration::from_secs(1);
+        let mut clock = StepClock::with_min_interval(STEP_WINDOW, min);
+        clock.boundary_ended(t0);
+        clock.on_mutation(t0 + Duration::from_secs(2));
+        assert_eq!(
+            clock.poll(t0 + Duration::from_secs(2) + STEP_WINDOW),
+            Some(1)
+        );
+        // the capture took a second: the next boundary waits from its end, not its start
+        let ended = t0 + Duration::from_secs(3);
+        clock.boundary_ended(ended);
+        clock.on_mutation(ended - Duration::from_millis(500));
+        assert_eq!(clock.poll(ended + Duration::from_millis(900)), None);
+        assert_eq!(clock.poll(ended + min), Some(2));
+    }
+
+    #[test]
+    fn a_gap_beyond_the_window_and_the_interval_splits_steps() {
+        let t0 = Instant::now();
+        let min = Duration::from_secs(1);
+        let mut clock = StepClock::with_min_interval(STEP_WINDOW, min);
+        clock.boundary_ended(t0);
+        clock.on_mutation(t0 + Duration::from_secs(2));
+        let first = t0 + Duration::from_secs(2) + STEP_WINDOW;
+        assert_eq!(clock.poll(first), Some(1));
+        clock.boundary_ended(first);
+        clock.on_mutation(first + Duration::from_secs(2));
+        assert_eq!(
+            clock.poll(first + Duration::from_secs(2) + STEP_WINDOW),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn run_end_ignores_the_minimum_interval() {
+        let t0 = Instant::now();
+        let mut clock = StepClock::with_min_interval(STEP_WINDOW, Duration::from_secs(1));
+        clock.boundary_ended(t0);
+        clock.on_mutation(t0);
+        assert_eq!(clock.finish(), 1);
     }
 
     #[test]
