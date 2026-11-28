@@ -185,7 +185,9 @@ A manifest with no such event is an orphan: published, never committed.
 Digests still come from the manifests, never from the trace.
 The reader is `store::committed_steps_from_trace`, and `store::published_steps` lists the manifests on disk, orphans included.
 The trace is read as untrusted input.
-The file is opened without following a symlink and must be a regular file of at most 1 GiB (`TRACE_READ_CAP`).
+The file is opened without following a symlink and must be a regular file.
+It has no size cap, because the trace grows with agent activity and a cap would make an honest run un-diffable.
+The read stops at the size the file had when it was opened, so a file that keeps growing cannot extend it.
 Each line is at most 1 MiB (`TRACE_LINE_CAP`) and there are at most 1,000,000 step events (`TRACE_STEP_CAP`).
 Step events must ascend, and a malformed event that could decide commitment is an error.
 A final line with no newline is a write torn by a crash and is ignored.

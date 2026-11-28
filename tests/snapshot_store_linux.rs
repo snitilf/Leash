@@ -13,7 +13,7 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 
 use leash::snapshot::store::{
-    DEFAULT_MAX_FILE_SIZE, EntryKind, Limits, StoreError, TRACE_LINE_CAP, TRACE_READ_CAP, capture,
+    DEFAULT_MAX_FILE_SIZE, EntryKind, Limits, StoreError, TRACE_LINE_CAP, TRACE_STEP_CAP, capture,
     capture_gated, committed_steps_from_trace, load_manifest, published_steps, verify_object,
 };
 
@@ -772,17 +772,33 @@ fn a_symlinked_or_special_trace_is_refused() {
 }
 
 #[test]
-fn an_oversized_trace_or_line_is_refused_not_read() {
+fn a_large_trace_is_read_to_its_end_because_it_grows_with_agent_activity() {
+    use std::io::Write;
     let dir = tempfile::tempdir().unwrap();
-    let big = File::create(dir.path().join("trace.jsonl")).unwrap();
-    // sparse: nothing is written, and the size alone must refuse it
-    big.set_len(TRACE_READ_CAP + 1).unwrap();
-    let err = committed_steps_from_trace(&open_dir(dir.path())).unwrap_err();
-    assert!(
-        matches!(&err, StoreError::InvalidTrace { reason } if reason.contains("read cap")),
-        "{err:?}"
+    let mut out = std::io::BufWriter::new(File::create(dir.path().join("trace.jsonl")).unwrap());
+    // the filler lines are under the line cap, and together they are far larger than any
+    // fixed size cap a long run's trace could be held to: 64 MiB of syscall events between
+    // two steps
+    let filler = format!(
+        r#"{{"seq":1,"ts":1,"type":"syscall","decision":"allow","path":"{}"}}"#,
+        "p".repeat(900)
     );
+    writeln!(out, "{}", step_line(0, 0)).unwrap();
+    for _ in 0..(64 * 1024 * 1024 / (filler.len() + 1)) {
+        writeln!(out, "{filler}").unwrap();
+    }
+    writeln!(out, "{}", step_line(1, 1)).unwrap();
+    out.flush().unwrap();
+    drop(out);
+    assert!(fs::metadata(dir.path().join("trace.jsonl")).unwrap().len() > 60 * 1024 * 1024);
+    assert_eq!(
+        committed_steps_from_trace(&open_dir(dir.path())).unwrap(),
+        [0, 1]
+    );
+}
 
+#[test]
+fn a_line_over_the_line_cap_is_refused() {
     let long = tempfile::tempdir().unwrap();
     let mut text = "x".repeat(TRACE_LINE_CAP + 10);
     text.push('\n');
@@ -790,6 +806,23 @@ fn an_oversized_trace_or_line_is_refused_not_read() {
     let err = committed_steps_from_trace(&open_dir(long.path())).unwrap_err();
     assert!(
         matches!(&err, StoreError::InvalidTrace { reason } if reason.contains("longer than")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn more_step_events_than_the_step_cap_are_refused() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let mut out = std::io::BufWriter::new(File::create(dir.path().join("trace.jsonl")).unwrap());
+    for step in 0..=TRACE_STEP_CAP {
+        writeln!(out, r#"{{"type":"step","step":{step}}}"#).unwrap();
+    }
+    out.flush().unwrap();
+    drop(out);
+    let err = committed_steps_from_trace(&open_dir(dir.path())).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidTrace { reason } if reason.contains("step events")),
         "{err:?}"
     );
 }

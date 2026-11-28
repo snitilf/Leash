@@ -30,10 +30,6 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// maximum manifest file size accepted by `load_manifest` (256 MiB).
 pub const MANIFEST_READ_CAP: u64 = 256 * 1024 * 1024;
 
-/// the most bytes of `trace.jsonl` that `committed_steps_from_trace` reads (1 GiB). the trace
-/// is read as untrusted input: a larger file is refused, not truncated.
-pub const TRACE_READ_CAP: u64 = 1024 * 1024 * 1024;
-
 /// the longest line of `trace.jsonl` that `committed_steps_from_trace` accepts (1 MiB).
 pub const TRACE_LINE_CAP: usize = 1024 * 1024;
 
@@ -745,7 +741,7 @@ mod linux {
     use super::{
         CaptureStats, EntryKind, FileFingerprint, Limits, MANIFEST_READ_CAP,
         MANIFEST_SCHEMA_VERSION, Manifest, ManifestEntry, ManifestTotals, Published, RefusedEntry,
-        StoreError, TRACE_LINE_CAP, TRACE_READ_CAP, TRACE_STEP_CAP, UNCAPTURED_SHA256, XattrAction,
+        StoreError, TRACE_LINE_CAP, TRACE_STEP_CAP, UNCAPTURED_SHA256, XattrAction,
         check_file_unchanged, classify_xattr, hex_encode, is_valid_sha256_hex, manifest_digest,
         parse_manifest, parse_step_filename, step_manifest_filename,
     };
@@ -2345,9 +2341,11 @@ mod linux {
     /// so that step is excluded. digests still come from the manifests, never the trace.
     ///
     /// `run_dir` is a handle on the run directory. the trace is untrusted input: the file is
-    /// opened `O_NOFOLLOW | O_NONBLOCK` and must be a regular file of at most
-    /// `TRACE_READ_CAP` bytes, each line is at most `TRACE_LINE_CAP` bytes, and at most
-    /// `TRACE_STEP_CAP` step events are accepted. a final line without a newline is a write
+    /// opened `O_NOFOLLOW | O_NONBLOCK` and must be a regular file. it has no size cap, because
+    /// it grows with agent activity and a cap would make an honest run un-diffable. the read
+    /// stops at the size the file had when it was opened, so a file that keeps growing cannot
+    /// extend it. each line is at most `TRACE_LINE_CAP` bytes, and at most `TRACE_STEP_CAP`
+    /// step events are accepted. a final line without a newline is a write
     /// torn by a crash and is ignored. `step` events must ascend; any other malformed line
     /// that could be one is `StoreError::InvalidTrace`. a missing trace is an `Io` error with
     /// kind `NotFound`.
@@ -2379,14 +2377,10 @@ mod linux {
             return Err(invalid(format!("{TRACE} is not a regular file")));
         }
         let size = stat_size(&st, TRACE)?;
-        if size > TRACE_READ_CAP {
-            return Err(invalid(format!(
-                "{TRACE} is {size} bytes, over the read cap of {TRACE_READ_CAP}"
-            )));
-        }
 
-        // the cap also bounds a file that grows while it is read
-        let mut reader = BufReader::new(file.take(TRACE_READ_CAP));
+        // the size at open bounds the read, so a file that grows while it is read is not
+        // followed past it. the per-line and step-count caps bound what the content can cost
+        let mut reader = BufReader::new(file.take(size));
         let mut steps: Vec<u64> = Vec::new();
         let mut line: Vec<u8> = Vec::new();
         let mut line_no = 0u64;
