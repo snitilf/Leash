@@ -63,7 +63,7 @@ It never kills anything in a cgroup with that name, and the age limit keeps it f
 It also removes a `leash-<run-id>` cgroup that has no `user.leash.lock` xattr, holds no process and is at least 30 seconds old, which a supervisor killed between creating the cgroup and binding its lock leaves behind, and records it as a `stale_cleanup` event with `processes` 0.
 It only removes such a directory and never kills, so a cgroup that holds a process is left alone whatever its age.
 The age limit keeps it from removing the cgroup of a run that is setting up at that moment.
-Because stale cleanup scans only Leash's current parent cgroup, when each run is launched in its own per-run `systemd-run --user --scope -p Delegate=yes` scope a crashed run's cgroup tree sits under that earlier scope and is not cleaned by a later run in a fresh scope; systemd scope behavior remains unverified because systemd is absent in the codespace.
+Because a run's stale cleanup scans only Leash's current parent cgroup, when each run is launched in its own per-run `systemd-run --user --scope -p Delegate=yes` scope a crashed run's cgroup tree sits under that earlier scope and is not cleaned by a later run in a fresh scope; systemd scope behavior remains unverified because systemd is absent in the codespace.
 Snapshot-enabled runs refuse before spawn when any prerequisite is unavailable.
 Process enumeration and SIGSTOP are not substitutes for this barrier.
 
