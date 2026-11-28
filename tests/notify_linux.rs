@@ -876,6 +876,7 @@ fn enforce_mode_without_policy_is_refused() {
         broker: None,
         resolved_hosts: None,
         capture: None,
+        barrier: leash::supervisor::barrier::BarrierOps::default(),
         snapshot_integrity: false,
         state_root: None,
         cgroup_mounts: None,

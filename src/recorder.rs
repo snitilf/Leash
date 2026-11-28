@@ -130,6 +130,10 @@ pub enum EventBody {
     Step {
         /// the step index this boundary closes
         step: u64,
+        /// the committed snapshot of a snapshot run (ADR-0024 decisions 10, 14, 16); absent
+        /// in a run that takes no snapshots
+        #[serde(flatten)]
+        snapshot: Option<StepSnapshot>,
     },
     /// end of run
     RunEnd {
@@ -139,9 +143,68 @@ pub enum EventBody {
         signal: Option<i32>,
         /// index of the final step
         final_step: u64,
+        /// the chain head over every committed step digest of a snapshot run, recomputed
+        /// from the digests the store returned (ADR-0024 decision 16); absent otherwise
+        #[serde(skip_serializing_if = "Option::is_none")]
+        chain_head: Option<String>,
     },
     /// Leash wrote `cgroup.kill` on a run cgroup (ADR-0024 decisions 12 and 17)
     CgroupKill(CgroupKillEvent),
+    /// a capture boundary failed and the run aborts closed (ADR-0024 decision 10). the
+    /// boundary has no step event
+    CaptureFailed(CaptureFailedEvent),
+}
+
+/// what a committed step of a snapshot run carries beyond its index (trace.md section 2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StepSnapshot {
+    /// lowercase hex sha256 of the exact manifest bytes the store published
+    pub manifest_digest: String,
+    /// microseconds the agent tree was frozen: from the start of the freeze to just before
+    /// the step event is written, because the event must be durable before the thaw.
+    /// zero for step 0 and the final step, where no agent is running
+    pub capture_pause_us: u64,
+    /// what the capture stored
+    pub capture: CaptureSummary,
+}
+
+/// capture statistics of one step (trace.md section 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CaptureSummary {
+    /// entries captured: files, directories and symlinks
+    pub entries: u64,
+    /// sum of regular-file sizes
+    pub bytes: u64,
+    /// content objects this capture added to the store
+    pub new_objects: u64,
+}
+
+/// where in the barrier a boundary failed (ADR-0024 decision 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturePhase {
+    /// `cgroup.freeze=1` was written but `frozen=1` was not confirmed in time
+    Freeze,
+    /// the store could not capture or publish the snapshot, or a limit was hit
+    Capture,
+    /// the cgroup was no longer frozen after the capture
+    FrozenCheck,
+    /// the step event could not be written or made durable
+    StepEvent,
+    /// `cgroup.freeze=0` was written but `frozen=0` was not confirmed in time
+    Thaw,
+}
+
+/// a failed capture boundary (trace.md section 2). written on a best-effort basis,
+/// because the trace itself may be what failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CaptureFailedEvent {
+    /// the step the boundary would have closed
+    pub step: u64,
+    /// the barrier phase that failed
+    pub phase: CapturePhase,
+    /// the error text
+    pub error: String,
 }
 
 /// why Leash killed a run cgroup.
@@ -794,7 +857,10 @@ mod tests {
         let step = Event {
             seq: 7,
             ts: 1_783_535_405_500,
-            body: EventBody::Step { step: 2 },
+            body: EventBody::Step {
+                step: 2,
+                snapshot: None,
+            },
         };
         assert_eq!(
             as_value(&step),
@@ -808,12 +874,81 @@ mod tests {
                 exit_code: Some(0),
                 signal: None,
                 final_step: 3,
+                chain_head: None,
             },
         };
         let ended = as_value(&end);
         assert_eq!(ended["type"], "run_end");
         assert_eq!(ended["exit_code"], 0);
         assert_eq!(ended["final_step"], 3);
+    }
+
+    #[test]
+    fn a_snapshot_step_event_carries_digest_pause_and_capture_stats() {
+        let digest = "ab".repeat(32);
+        let step = Event {
+            seq: 4,
+            ts: 10,
+            body: EventBody::Step {
+                step: 3,
+                snapshot: Some(StepSnapshot {
+                    manifest_digest: digest.clone(),
+                    capture_pause_us: 1234,
+                    capture: CaptureSummary {
+                        entries: 5,
+                        bytes: 99,
+                        new_objects: 2,
+                    },
+                }),
+            },
+        };
+        assert_eq!(
+            as_value(&step),
+            json!({
+                "seq": 4, "ts": 10, "type": "step", "step": 3,
+                "manifest_digest": digest, "capture_pause_us": 1234,
+                "capture": { "entries": 5, "bytes": 99, "new_objects": 2 }
+            })
+        );
+    }
+
+    #[test]
+    fn run_end_carries_a_chain_head_only_when_one_exists() {
+        let end = |chain_head| Event {
+            seq: 1,
+            ts: 1,
+            body: EventBody::RunEnd {
+                exit_code: Some(0),
+                signal: None,
+                final_step: 2,
+                chain_head,
+            },
+        };
+        assert!(as_value(&end(None)).get("chain_head").is_none());
+        assert_eq!(
+            as_value(&end(Some("cd".repeat(32))))["chain_head"],
+            "cd".repeat(32)
+        );
+    }
+
+    #[test]
+    fn a_capture_failure_names_the_step_phase_and_error() {
+        let failed = Event {
+            seq: 9,
+            ts: 2,
+            body: EventBody::CaptureFailed(CaptureFailedEvent {
+                step: 4,
+                phase: CapturePhase::FrozenCheck,
+                error: "thawed".into(),
+            }),
+        };
+        assert_eq!(
+            as_value(&failed),
+            json!({
+                "seq": 9, "ts": 2, "type": "capture_failed", "step": 4,
+                "phase": "frozen_check", "error": "thawed"
+            })
+        );
     }
 
     // --- trace writer: order, failure surfacing, sync ---
@@ -850,7 +985,10 @@ mod tests {
     }
 
     fn step_body(step: u64) -> EventBody {
-        EventBody::Step { step }
+        EventBody::Step {
+            step,
+            snapshot: None,
+        }
     }
 
     #[test]
