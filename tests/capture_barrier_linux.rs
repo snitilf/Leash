@@ -1381,6 +1381,58 @@ fn a_second_run_on_a_locked_workspace_is_refused_before_it_spawns() {
     assert!(matches!(third.exit, ExitDisposition::Exited(0)));
 }
 
+#[test]
+fn a_second_run_with_a_different_state_dir_on_a_locked_workspace_is_refused_before_it_spawns() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("workspace_lock_other_state") {
+        return;
+    }
+    let harness = Harness::new(&[]);
+    let spec = harness.spec("put('up'); wait('release')\n");
+    let first = std::thread::spawn(move || run_session_with_hooks(spec, SessionHooks::default()));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !harness.ws.join("up").exists() {
+        assert!(Instant::now() < deadline, "the first run never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // the second run names the same workspace under another state directory, so the lock file
+    // under its state root is a different file: only a lock on the workspace directory itself
+    // can stop it
+    let other_state = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        harness.state.path().join("policy.toml"),
+        other_state.path().join("policy.toml"),
+    )
+    .unwrap();
+    let mut spec = harness.spec("put('second-agent-ran')\n");
+    spec.state_root = other_state.path().to_path_buf();
+    spec.state_root_spelling = other_state.path().to_path_buf();
+    spec.policy_path = Some(other_state.path().join("policy.toml"));
+    let second = run_session_with_hooks(spec, SessionHooks::default());
+    match &second {
+        Err(SessionError::WorkspaceLock(WorkspaceLockError::Held(_))) => {}
+        other => panic!("expected a refused second run, got {other:?}"),
+    }
+    assert!(!harness.ws.join("second-agent-ran").exists());
+    assert!(
+        !other_state.path().join("runs").exists(),
+        "the refused run created no run directory under the other state root"
+    );
+
+    std::fs::write(harness.ctl.join("release"), "1").unwrap();
+    let outcome = first.join().unwrap().unwrap();
+    assert!(matches!(outcome.exit, ExitDisposition::Exited(0)));
+    // the lock goes with the run: the other state directory can now run the workspace
+    std::fs::remove_file(harness.ws.join("up")).unwrap();
+    let mut spec = harness.spec("put('third')\n");
+    spec.state_root = other_state.path().to_path_buf();
+    spec.state_root_spelling = other_state.path().to_path_buf();
+    spec.policy_path = Some(other_state.path().join("policy.toml"));
+    let third = run_session_with_hooks(spec, SessionHooks::default()).unwrap();
+    assert!(matches!(third.exit, ExitDisposition::Exited(0)));
+}
+
 // ---------------------------------------------------------------------------------------
 // digests on stderr
 // ---------------------------------------------------------------------------------------
