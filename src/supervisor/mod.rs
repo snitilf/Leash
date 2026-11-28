@@ -12,6 +12,7 @@ pub mod ask;
 pub mod broker;
 #[cfg(target_os = "linux")]
 pub mod cgroup;
+pub mod cgroup_mounts;
 pub mod fact;
 pub mod mem;
 pub mod notify;

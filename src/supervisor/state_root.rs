@@ -157,7 +157,7 @@ impl StateRoot {
 }
 
 /// fold `.` and `..` out of an absolute path without touching the filesystem.
-fn normalize_lexically(path: &Path) -> PathBuf {
+pub(crate) fn normalize_lexically(path: &Path) -> PathBuf {
     let mut out = PathBuf::from("/");
     for component in path.components() {
         match component {
@@ -173,7 +173,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 
 /// resolve through symlinks as far as the path exists, then append the rest lexically, so a
 /// not-yet-existing binary under a symlinked directory still resolves.
-fn resolve_leniently(path: &Path) -> PathBuf {
+pub(crate) fn resolve_leniently(path: &Path) -> PathBuf {
     if let Ok(resolved) = path.canonicalize() {
         return resolved;
     }

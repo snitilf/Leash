@@ -129,6 +129,10 @@ pub enum RunError {
     /// snapshot integrity restrictions were requested outside enforce mode.
     #[error("snapshot integrity restrictions require enforce mode")]
     SnapshotIntegrityNeedsEnforce,
+    /// snapshot integrity restrictions were requested without the cgroup2 mounts their
+    /// implicit deny protects (ADR-0024 decision 4).
+    #[error("snapshot integrity restrictions require the cgroup2 mounts of the run")]
+    SnapshotIntegrityNeedsCgroupMounts,
     /// the installed seccomp filter and the run's snapshot flag disagree.
     #[error("snapshot filter mismatch: filter installed {installed}, run requires {required}")]
     SnapshotFilterMismatch {
@@ -192,6 +196,10 @@ pub struct RunConfig<'a> {
     /// policy rule (FR-21, ADR-0024). the enforce constructors require it, so an enforce
     /// run cannot be built without one; record-only runs carry none.
     pub state_root: Option<&'a crate::supervisor::state_root::StateRoot>,
+    /// the cgroup2 mounts of the supervisor's mount namespace, denied as an implicit rule
+    /// before any policy rule in a snapshot-integrity run (ADR-0024 decision 4). required
+    /// when `snapshot_integrity` is set; unused otherwise.
+    pub cgroup_mounts: Option<&'a crate::supervisor::cgroup_mounts::CgroupMounts>,
 }
 
 impl std::fmt::Debug for RunConfig<'_> {
@@ -222,6 +230,7 @@ impl<'a> RunConfig<'a> {
             resolved_hosts: None,
             snapshot_integrity: false,
             state_root: None,
+            cgroup_mounts: None,
         }
     }
 
@@ -245,6 +254,7 @@ impl<'a> RunConfig<'a> {
             resolved_hosts: None,
             snapshot_integrity: false,
             state_root: Some(state_root),
+            cgroup_mounts: None,
         }
     }
 
@@ -270,6 +280,7 @@ impl<'a> RunConfig<'a> {
             resolved_hosts: Some(resolved_hosts),
             snapshot_integrity: false,
             state_root: Some(state_root),
+            cgroup_mounts: None,
         }
     }
 
@@ -285,6 +296,15 @@ impl<'a> RunConfig<'a> {
         self
     }
 
+    /// name the cgroup2 mounts a snapshot-integrity run denies (ADR-0024 decision 4).
+    pub fn with_cgroup_mounts(
+        mut self,
+        mounts: &'a crate::supervisor::cgroup_mounts::CgroupMounts,
+    ) -> Self {
+        self.cgroup_mounts = Some(mounts);
+        self
+    }
+
     /// wire step-boundary capture (FR-11); the session passes the run-directory target.
     pub fn with_capture(mut self, capture: &'a dyn crate::snapshot::BoundaryCapture) -> Self {
         self.capture = Some(capture);
@@ -297,6 +317,9 @@ impl<'a> RunConfig<'a> {
         }
         if self.snapshot_integrity && self.mode != crate::recorder::Mode::Enforce {
             return Err(RunError::SnapshotIntegrityNeedsEnforce);
+        }
+        if self.snapshot_integrity && self.cgroup_mounts.is_none() {
+            return Err(RunError::SnapshotIntegrityNeedsCgroupMounts);
         }
         if self.mode == crate::recorder::Mode::Enforce && self.policy.is_none() {
             return Err(RunError::EnforceWithoutPolicy);
@@ -476,9 +499,11 @@ fn evaluate_tracked(
     evaluate_operand(config, request, false, asks)
 }
 
-/// the implicit state-root deny, ranked before every policy rule (FR-21, ADR-0024). it
-/// applies only in an enforce run that carries the root; `destination` marks the second
-/// operand of a rename or link, where naming an ancestor of the root replaces it.
+/// the implicit denies, ranked before every policy rule: the state root (FR-21, ADR-0024
+/// decision 3), the cgroup2 mounts of a snapshot-integrity run (decision 4), and the
+/// supervisor's `/proc` tree. they apply only in an enforce run that carries the root;
+/// `destination` marks the second operand of a rename or link, where naming an ancestor of
+/// a protected path replaces it.
 fn implicit_state_root_deny(
     config: &RunConfig<'_>,
     request: &Request<'_>,
@@ -488,22 +513,30 @@ fn implicit_state_root_deny(
         return None;
     }
     let root = config.state_root?;
-    let (state_root, supervisor_proc) = match request {
+    let cgroups = config.cgroup_mounts.filter(|_| config.snapshot_integrity);
+    let (state_root, cgroup, supervisor_proc) = match request {
         Request::Fs { path, access } => {
             let path = std::path::Path::new(path);
             (
                 root.denies_fs(path, access, destination),
+                cgroups.is_some_and(|m| m.denies_fs(path, access, destination)),
                 root.denies_proc(path),
             )
         }
         Request::Exec { binary } => {
             let binary = std::path::Path::new(binary);
-            (root.denies_exec(binary), root.denies_proc(binary))
+            (
+                root.denies_exec(binary),
+                cgroups.is_some_and(|m| m.denies_exec(binary)),
+                root.denies_proc(binary),
+            )
         }
-        Request::Net { .. } => (false, false),
+        Request::Net { .. } => (false, false, false),
     };
     let matched = if state_root {
         crate::policy::MatchId::ImplicitStateRoot
+    } else if cgroup {
+        crate::policy::MatchId::ImplicitCgroup
     } else if supervisor_proc {
         crate::policy::MatchId::ImplicitSupervisorProc
     } else {
@@ -3403,6 +3436,108 @@ mod tests {
         );
         assert_eq!(decision.matched_rule, "implicit:state_root");
         assert_eq!(decision.response_decision, Decision::Deny);
+    }
+
+    #[test]
+    fn the_implicit_cgroup_deny_applies_only_to_a_snapshot_integrity_run() {
+        use crate::recorder::FsAccess::{Create, Delete, Read, Write};
+        let p = policy(
+            "schema_version = 1\n\
+             [[fs]]\npath=\"/**\"\nmode=[\"read\",\"write\",\"create\",\"delete\"]\naction=\"allow\"\n\
+             [[exec]]\nbinary=\"/**\"\naction=\"allow\"\n",
+        );
+        let mounts = crate::supervisor::cgroup_mounts::CgroupMounts::from_resolved(vec![
+            "/sys/fs/cgroup".into(),
+        ])
+        .unwrap();
+        let eval = |config: &RunConfig<'_>,
+                    path: &str,
+                    access: &[crate::recorder::FsAccess],
+                    destination: bool| {
+            let mut asks = Vec::new();
+            let eval = evaluate_operand(
+                config,
+                &Request::Fs { path, access },
+                destination,
+                &mut asks,
+            );
+            (eval.decision, eval.matched.to_string())
+        };
+        let snapshot = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
+            .with_snapshot_integrity(true)
+            .with_cgroup_mounts(&mounts);
+        for access in [Read, Write, Create, Delete] {
+            assert_eq!(
+                eval(
+                    &snapshot,
+                    "/sys/fs/cgroup/user.slice/cgroup.procs",
+                    &[access],
+                    false
+                ),
+                (Decision::Deny, "implicit:cgroup".to_string())
+            );
+        }
+        assert_eq!(
+            eval(&snapshot, "/sys/fs", &[Delete], false),
+            (Decision::Deny, "implicit:cgroup".to_string())
+        );
+        assert_eq!(
+            eval(&snapshot, "/sys", &[Create], true),
+            (Decision::Deny, "implicit:cgroup".to_string())
+        );
+        assert_eq!(
+            eval(&snapshot, "/sys/fs", &[Read], false),
+            (Decision::Allow, "fs.1".to_string())
+        );
+        let exec = resolve_decision(
+            &snapshot,
+            &Request::Exec {
+                binary: "/sys/fs/cgroup/x",
+            },
+        );
+        assert_eq!(exec.matched_rule, "implicit:cgroup");
+
+        // the same mounts without the snapshot flag, and a config without mounts, are inert
+        let plain = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
+            .with_cgroup_mounts(&mounts);
+        assert_eq!(
+            eval(&plain, "/sys/fs/cgroup/cgroup.procs", &[Read], false),
+            (Decision::Allow, "fs.1".to_string())
+        );
+        let unmounted = RunConfig::enforce(4242, Attendance::Unattended, &p, test_root())
+            .with_snapshot_integrity(true);
+        assert_eq!(
+            eval(&unmounted, "/sys/fs/cgroup/cgroup.procs", &[Read], false),
+            (Decision::Allow, "fs.1".to_string())
+        );
+        // validate refuses the snapshot run that was built without its mounts
+        assert!(matches!(
+            unmounted.validate(),
+            Err(RunError::SnapshotIntegrityNeedsCgroupMounts)
+        ));
+    }
+
+    #[test]
+    fn the_state_root_deny_keeps_its_own_id_where_a_path_is_in_both_sets() {
+        let p = policy("schema_version = 1\n");
+        let root =
+            crate::supervisor::state_root::StateRoot::from_resolved("/sys/fs/cgroup/state".into())
+                .unwrap();
+        let mounts = crate::supervisor::cgroup_mounts::CgroupMounts::from_resolved(vec![
+            "/sys/fs/cgroup".into(),
+        ])
+        .unwrap();
+        let config = RunConfig::enforce(4242, Attendance::Unattended, &p, &root)
+            .with_snapshot_integrity(true)
+            .with_cgroup_mounts(&mounts);
+        let decision = resolve_decision(
+            &config,
+            &Request::Fs {
+                path: "/sys/fs/cgroup/state/runs",
+                access: &[crate::recorder::FsAccess::Read],
+            },
+        );
+        assert_eq!(decision.matched_rule, "implicit:state_root");
     }
 
     #[test]
