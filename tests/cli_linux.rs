@@ -1006,6 +1006,8 @@ fn enforce_openat2_honors_the_callers_beneath_and_no_symlinks_restrictions() {
         \x20 ('no symlinks, plain', oa(d,b'f',P,NO_SYMLINKS), 'fd'),\n\
         \x20 ('no symlinks, followed', oa(d,b'link',P,NO_SYMLINKS), -errno.ELOOP),\n\
         \x20 ('no restriction, symlink out', oa(d,b'up/target',P,0), 'fd'),\n\
+        \x20 ('beneath, create inside', oa(d,b'made',os.O_WRONLY|os.O_CREAT|os.O_CLOEXEC,BENEATH), 'fd'),\n\
+        \x20 ('beneath, create outside', oa(d,b'../escaped',os.O_WRONLY|os.O_CREAT|os.O_CLOEXEC,BENEATH), -errno.EXDEV),\n\
          ]\n\
          for name, got, want in cases:\n\
         \x20   ok = got >= 0 if want == 'fd' else got == want\n\
@@ -1045,7 +1047,9 @@ fn enforce_openat2_honors_the_callers_beneath_and_no_symlinks_restrictions() {
             })
             .count()
     };
-    assert_eq!(refused("EXDEV"), 4, "{events:#?}");
+    assert_eq!(refused("EXDEV"), 5, "{events:#?}");
+    assert!(ws.path().join("d/made").exists());
+    assert!(!ws.path().join("escaped").exists());
     assert_eq!(refused("ELOOP"), 1, "{events:#?}");
 }
 
