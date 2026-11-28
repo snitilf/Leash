@@ -194,6 +194,20 @@ impl Run {
         })
     }
 
+    /// the denies whose path or destination is `dir` or beneath it. a run also holds the
+    /// loader's probes for libraries that do not exist, which are not denials of the agent's.
+    fn denies_under(&self, dir: &Path) -> Vec<&serde_json::Value> {
+        let beneath = |field: &serde_json::Value| {
+            field
+                .as_str()
+                .is_some_and(|p| Path::new(p).starts_with(dir))
+        };
+        self.denies_seen()
+            .into_iter()
+            .filter(|e| beneath(&e["fact"]["path"]) || beneath(&e["fact"]["dest"]))
+            .collect()
+    }
+
     fn denies_seen(&self) -> Vec<&serde_json::Value> {
         self.events
             .iter()
@@ -777,9 +791,9 @@ fn every_path_and_descriptor_form_of_the_metadata_calls_takes_effect_in_the_work
     let run = session.python(&script).unwrap();
     run.assert_exit_zero();
     assert!(
-        run.denies_seen().is_empty(),
+        run.denies_under(&ws).is_empty(),
         "nothing in the workspace is denied: {:#?}",
-        run.denies_seen()
+        run.denies_under(&ws)
     );
     let file = ws.join("f");
     let link = ws.join("l");
@@ -931,9 +945,9 @@ fn tar_extracts_and_cp_copies_a_tree_with_links_and_times_in_a_snapshot_run() {
     let run = session.run(&["/bin/sh", "-c", &script]).unwrap();
     run.assert_exit_zero();
     assert!(
-        run.denies_seen().is_empty(),
+        run.denies_under(&ws).is_empty(),
         "no denial inside the workspace: {:#?}",
-        run.denies_seen()
+        run.denies_under(&ws)
     );
     let mtime = |path: PathBuf| {
         use std::os::unix::fs::MetadataExt;
