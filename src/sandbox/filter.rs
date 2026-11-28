@@ -447,7 +447,37 @@ mod tests {
                 "snapshot filter traps {nr}"
             );
         }
-        assert_eq!(build_filter(), build_filter_with(false));
+    }
+
+    /// the SHA-256 of the default filter's instruction bytes (opcode, jt, jf and k of every
+    /// instruction, little-endian) as `origin/main` built it before snapshot runs trapped
+    /// anything extra. `build_filter()` is `build_filter_with(false)`, so comparing the two
+    /// would prove nothing; this pin fails the moment a number is added to, removed from, or
+    /// reordered in the tables a run without snapshots installs.
+    const DEFAULT_FILTER_SHA256: &str =
+        "120ac1f5e9613ac0ded7596e1a3942241fc522bd4d5ced20c123ba858cd1be5b";
+
+    fn digest_of(prog: &[SockFilter]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        for ins in prog {
+            hash.update(ins.code.to_le_bytes());
+            hash.update([ins.jt, ins.jf]);
+            hash.update(ins.k.to_le_bytes());
+        }
+        hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn the_default_filter_is_byte_identical_to_the_one_before_snapshot_runs() {
+        assert_eq!(build_filter().len(), 47);
+        assert_eq!(digest_of(&build_filter()), DEFAULT_FILTER_SHA256);
+        assert_eq!(digest_of(&build_filter_with(false)), DEFAULT_FILTER_SHA256);
+        assert_ne!(
+            digest_of(&build_filter_with(true)),
+            DEFAULT_FILTER_SHA256,
+            "the snapshot filter is the one that differs"
+        );
     }
 
     #[test]
