@@ -179,19 +179,22 @@ impl Run {
             matches!(self.exit, ExitDisposition::Exited(0)),
             "the agent script asserts its own expectations: {:?}\n\
              agent output:\n{}\n\
-             denies and failed calls in the trace:\n{:#?}",
+             the trace, without the probes for names that do not exist:\n{}",
             self.exit,
             self.output,
             self.failures()
         );
     }
 
-    /// the events a failure is explained by: every deny and every call answered with an errno.
-    fn failures(&self) -> Vec<&serde_json::Value> {
+    /// the trace one event per line, without the realization probes for names that do not
+    /// exist (a loader searching its library paths), so a failure is explained by what is left.
+    fn failures(&self) -> String {
         self.events
             .iter()
-            .filter(|e| e["decision"] == "deny" || !e["errno"].is_null())
-            .collect()
+            .filter(|e| !(e["matched_rule"] == "failsafe:realization" && e["errno"] == "ENOENT"))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn run_cgroup(&self) -> PathBuf {
