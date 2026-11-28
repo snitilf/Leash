@@ -21,13 +21,10 @@ fn open_dir(path: &Path) -> File {
         .unwrap()
 }
 
-/// create a workspace directory without any inherited default posix acl, which capture
-/// refuses as unsupported metadata.
+/// create a workspace directory. it keeps any default ACL its parent hands down, because
+/// capture records ACLs.
 fn create_workspace_dir(path: &Path) {
     fs::create_dir(path).unwrap();
-    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
-    // SAFETY: c_path and the static attribute name are NUL-terminated.
-    let _ = unsafe { libc::removexattr(c_path.as_ptr(), c"system.posix_acl_default".as_ptr()) };
 }
 
 fn set_mtime(path: &Path, sec: i64) {
