@@ -124,6 +124,8 @@ promised by a sibling file and consolidated here so the audit is in one place.
   Content hashes detect corruption, not forgery, because a rewritten manifest with matching new objects passes them (ADR-0024 rule 15).
   What bounds it: step events carry manifest digests, `run_end` carries a chain head printed at run end, `leash rewind --expect <digest>` refuses a mismatch, and rewind confines every write beneath the workspace.
   The ADR-0022 custodian would close it and is deferred.
+  - A forged store without `--expect` can set ACLs, including named entries and a directory default ACL that governs files created later.
+    This stays inside the workspace and is no stronger than a forged mode.
 - **Single-layer reads of the store under a read grant.**
   A read-only policy grant (read or execute rights) that overlaps the state root or any cgroup2 mount is allowed and stamped into the trace as the residual `landlock:snapshot_store_read_overlap` in `landlock_residuals`, once per run; only the seccomp layer denies those reads (ADR-0024 rule 5).
   What bounds it: the implicit first-ranked deny still covers every read, and the overlap is visible in the trace.
