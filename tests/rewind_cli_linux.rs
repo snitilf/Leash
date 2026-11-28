@@ -876,7 +876,7 @@ fn a_held_workspace_lock_is_refused() {
     let out = f.rewind(&[]);
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("another leash run or rewind owns this workspace"),
+        stderr(&out).contains("the workspace directory is locked by another process"),
         "{}",
         stderr(&out)
     );
@@ -898,7 +898,7 @@ fn a_workspace_lock_taken_under_another_state_directory_is_refused() {
     let out = f.rewind(&[]);
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("another leash run or rewind owns this workspace"),
+        stderr(&out).contains("the workspace directory is locked by another process"),
         "{}",
         stderr(&out)
     );
