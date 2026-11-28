@@ -79,8 +79,8 @@ const RESOLVE_HONORED: u64 =
 struct ChildResolve {
     /// the honored `RESOLVE_*` bits; zero when the caller asked for none
     bits: u64,
-    /// the directory a relative `given` starts from; `None` when it could not be read
-    dir: Option<PathBuf>,
+    /// where a relative `given` starts from; `None` when that could not be read
+    anchor: Option<DirAnchor>,
     /// the path as the caller spelled it, before it was anchored
     given: PathBuf,
 }
@@ -447,6 +447,16 @@ pub(crate) trait Notifier {
     fn read_u64(&self, pid: u32, addr: u64) -> Result<u64, MemReadError>;
     /// the kernel's answer for a relative path's anchor: readlink of /proc cwd or fd/N.
     fn dir_prefix(&self, pid: u32, anchor: DirAnchor) -> io::Result<PathBuf>;
+    /// the directory object a relative path's anchor is, as an `O_PATH` descriptor.
+    ///
+    /// this opens the magic link `/proc/<pid>/cwd` or `/proc/<pid>/fd/<n>`. the kernel follows
+    /// such a link by jumping to the object the process holds, so no path text is walked, and
+    /// the result is the real directory even when its name has changed or is out of the
+    /// supervisor's reach. the open is safe because it targets the agent's own working directory
+    /// or descriptor and yields only a base to resolve from, never an object a policy decision
+    /// is about. the caller checks `id_valid` after it returns and before it uses the result,
+    /// so a recycled pid is never believed.
+    fn open_anchor(&self, pid: u32, anchor: DirAnchor) -> io::Result<OwnedFd>;
     /// whether `target` is the supervised root or a descendant of it.
     fn process_in_tree(&self, root: u32, target: u32) -> io::Result<bool>;
 }
@@ -1194,7 +1204,7 @@ fn handle_fs<N: Notifier, S: TraceSink>(
                         unsupported_errno,
                         resolve: ChildResolve {
                             bits: resolve & RESOLVE_HONORED,
-                            dir: anchored.dir,
+                            anchor: anchored.anchor,
                             given: anchored.given,
                         },
                     },
@@ -1496,13 +1506,22 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
             if let Some(errno) = unsupported_errno {
                 broker.borrow_mut().release(primary)?;
                 BrokerResult::Errno(errno)
-            } else if let Some(errno) = child_resolve_refusal(&resolve, flags) {
-                broker.borrow_mut().release(primary)?;
-                resolve_refused = true;
-                BrokerResult::Errno(errno)
             } else {
-                o_path = flags & crate::supervisor::fact::flags::O_PATH != 0;
-                broker.borrow_mut().commit_open(primary, flags, mode)?
+                match child_resolve_refusal(kernel, notif, &resolve, flags)? {
+                    ResolveCheck::Dropped => {
+                        broker.borrow_mut().release(primary)?;
+                        return Ok(Handled::Dropped);
+                    }
+                    ResolveCheck::Refused(errno) => {
+                        broker.borrow_mut().release(primary)?;
+                        resolve_refused = true;
+                        BrokerResult::Errno(errno)
+                    }
+                    ResolveCheck::Allowed => {
+                        o_path = flags & crate::supervisor::fact::flags::O_PATH != 0;
+                        broker.borrow_mut().commit_open(primary, flags, mode)?
+                    }
+                }
             }
         }
         FsInvocation::Mutation(operation) => {
@@ -1533,50 +1552,73 @@ fn handle_fs_enforce<N: Notifier, S: TraceSink>(
     )
 }
 
-/// the errno an `openat2` caller's own `resolve` restrictions give the path it spelled, or
-/// `None` when they allow it (or there are none).
+/// what the caller's own `openat2` `resolve` restrictions say about the path it spelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolveCheck {
+    /// the restrictions allow it, or there are none
+    Allowed,
+    /// the restrictions refuse it with this errno
+    Refused(i32),
+    /// the notification died while it was checked
+    Dropped,
+}
+
+/// the answer an `openat2` caller's own `resolve` restrictions give the path it spelled.
 ///
 /// the restrictions only narrow how the caller's spelling may resolve, so the object opened is
 /// still the one the policy judged, pinned by the broker. they are checked by resolving the
-/// spelling once more, without opening anything, from the directory it starts from with the
-/// caller's own bits. only the answers the restrictions themselves cause are returned,
-/// `EXDEV` and `ELOOP`; any other failure is left to the real open, which answers it. a
-/// spelling that cannot be checked at all is refused `EOPNOTSUPP`, as every `resolve` was
-/// before they were honored.
+/// spelling once more, without opening anything, with the caller's own bits. a relative
+/// spelling starts from the agent's real directory object, opened as an `O_PATH` descriptor
+/// through its `/proc/<pid>` magic link, and never from the text that link reads back as, which
+/// can name a different directory from the supervisor's root. the notification is checked
+/// valid after that open and before the handle is used. an absolute spelling resolves from
+/// the supervisor's own root, as the kernel resolves it for any caller. only the answers the
+/// restrictions themselves cause are returned, `EXDEV` and `ELOOP`; any other failure is
+/// left to the real open, which answers it. a spelling that cannot be checked at all is
+/// refused `EOPNOTSUPP`, as every `resolve` was before they were honored.
 #[cfg(target_os = "linux")]
-fn child_resolve_refusal(check: &ChildResolve, flags: u64) -> Option<i32> {
+fn child_resolve_refusal<N: Notifier>(
+    kernel: &N,
+    notif: &SeccompNotif,
+    check: &ChildResolve,
+    flags: u64,
+) -> Result<ResolveCheck, RunError> {
     use std::ffi::CString;
     if check.bits == 0 {
-        return None;
+        return Ok(ResolveCheck::Allowed);
     }
-    let base_dir = if check.given.is_absolute() {
-        std::path::Path::new("/")
-    } else if let Some(dir) = check.dir.as_deref() {
-        dir
+    let base = if check.given.is_absolute() {
+        None
+    } else if let Some(anchor) = check.anchor {
+        match kernel.open_anchor(notif.pid, anchor) {
+            Ok(base) => {
+                if !kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+                    return Ok(ResolveCheck::Dropped);
+                }
+                Some(base)
+            }
+            // the anchor is no directory: the real open answers that, as the kernel would
+            Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => {
+                return Ok(ResolveCheck::Allowed);
+            }
+            Err(_) => {
+                return if kernel.id_valid(notif.id).map_err(RunError::Notify)? {
+                    Ok(ResolveCheck::Refused(libc::EOPNOTSUPP))
+                } else {
+                    Ok(ResolveCheck::Dropped)
+                };
+            }
+        }
     } else {
-        return Some(libc::EOPNOTSUPP);
+        return Ok(ResolveCheck::Refused(libc::EOPNOTSUPP));
     };
-    let Ok(base_path) = CString::new(base_dir.as_os_str().as_bytes()) else {
-        return Some(libc::EOPNOTSUPP);
-    };
-    // SAFETY: base_path is a nul-terminated path and the flags are a fixed valid set.
-    let base_fd = unsafe {
-        libc::open(
-            base_path.as_ptr(),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if base_fd < 0 {
-        return Some(libc::EOPNOTSUPP);
-    }
-    // SAFETY: base_fd was just returned by open and nothing else owns it.
-    let base = unsafe { OwnedFd::from_raw_fd(base_fd) };
+    let base_fd = base.as_ref().map_or(libc::AT_FDCWD, AsRawFd::as_raw_fd);
     let probe = |spelling: &std::path::Path, extra: i32| -> Result<(), i32> {
         let Ok(spelling) = CString::new(spelling.as_os_str().as_bytes()) else {
             return Ok(());
         };
         crate::supervisor::broker::openat2(
-            base.as_raw_fd(),
+            base_fd,
             &spelling,
             u64::try_from(libc::O_PATH | libc::O_CLOEXEC | extra).unwrap_or_default(),
             0,
@@ -1585,27 +1627,43 @@ fn child_resolve_refusal(check: &ChildResolve, flags: u64) -> Option<i32> {
         .map(drop)
         .map_err(|error| error.raw_os_error().unwrap_or(0))
     };
-    let honored =
-        i32::try_from(flags & (libc::O_NOFOLLOW | libc::O_DIRECTORY) as u64).unwrap_or_default();
+    // O_CREAT|O_EXCL does not follow a final symlink: an existing one is EEXIST, not a
+    // symlink to resolve, so the kernel never applies the restrictions to where it leads
+    let create_exclusive = (libc::O_CREAT | libc::O_EXCL) as u64;
+    let no_follow = if flags & create_exclusive == create_exclusive {
+        libc::O_NOFOLLOW
+    } else {
+        0
+    };
+    let honored = i32::try_from(flags & (libc::O_NOFOLLOW | libc::O_DIRECTORY) as u64)
+        .unwrap_or_default()
+        | no_follow;
     let refusal = |errno: i32| matches!(errno, libc::EXDEV | libc::ELOOP).then_some(errno);
-    match probe(&check.given, honored) {
+    let refused = match probe(&check.given, honored) {
         Ok(()) => None,
         // a create names something that does not exist yet: its directory is what resolves
-        Err(libc::ENOENT) if flags & libc::O_CREAT as u64 != 0 => {
-            let parent = match check.given.parent() {
-                Some(parent) if parent.as_os_str().is_empty() => std::path::Path::new("."),
-                Some(parent) => parent,
-                None => return None,
-            };
-            probe(parent, libc::O_DIRECTORY).err().and_then(refusal)
-        }
+        Err(libc::ENOENT) if flags & libc::O_CREAT as u64 != 0 => match check.given.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => {
+                probe(std::path::Path::new("."), libc::O_DIRECTORY)
+                    .err()
+                    .and_then(refusal)
+            }
+            Some(parent) => probe(parent, libc::O_DIRECTORY).err().and_then(refusal),
+            None => None,
+        },
         Err(errno) => refusal(errno),
-    }
+    };
+    Ok(refused.map_or(ResolveCheck::Allowed, ResolveCheck::Refused))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn child_resolve_refusal(_check: &ChildResolve, _flags: u64) -> Option<i32> {
-    None
+fn child_resolve_refusal<N: Notifier>(
+    _kernel: &N,
+    _notif: &SeccompNotif,
+    _check: &ChildResolve,
+    _flags: u64,
+) -> Result<ResolveCheck, RunError> {
+    Ok(ResolveCheck::Allowed)
 }
 
 /// how an allowed filesystem syscall's broker result is to be delivered.
@@ -2392,8 +2450,8 @@ struct Anchored {
     path: PathBuf,
     /// the path was empty and `path` is the anchor itself
     empty: bool,
-    /// the directory a relative spelling starts from, when it was read
-    dir: Option<PathBuf>,
+    /// where a relative spelling starts from, when its directory could be read
+    anchor: Option<DirAnchor>,
     /// the spelling the caller gave
     given: PathBuf,
 }
@@ -2410,7 +2468,7 @@ fn read_anchored_parts<N: Notifier>(
     let unanchored = |given: PathBuf| Anchored {
         path: given.clone(),
         empty: false,
-        dir: None,
+        anchor: None,
         given,
     };
     if given.is_absolute() || !arg.anchor {
@@ -2426,13 +2484,13 @@ fn read_anchored_parts<N: Notifier>(
         Ok(prefix) if empty => Ok(Anchored {
             path: prefix.clone(),
             empty: true,
-            dir: Some(prefix),
+            anchor: Some(anchor),
             given,
         }),
         Ok(prefix) => Ok(Anchored {
             path: prefix.join(&given),
             empty: false,
-            dir: Some(prefix),
+            anchor: Some(anchor),
             given,
         }),
         Err(_) => Ok(unanchored(given)),
@@ -2597,6 +2655,25 @@ mod linux {
                 DirAnchor::Fd(fd) => format!("/proc/{pid}/fd/{fd}"),
             };
             std::fs::read_link(link)
+        }
+        fn open_anchor(&self, pid: u32, anchor: DirAnchor) -> io::Result<OwnedFd> {
+            let link = match anchor {
+                DirAnchor::Cwd => format!("/proc/{pid}/cwd"),
+                DirAnchor::Fd(fd) => format!("/proc/{pid}/fd/{fd}"),
+            };
+            let link = std::ffi::CString::new(link).map_err(io::Error::other)?;
+            // SAFETY: link is a nul-terminated path and the flags are a fixed valid set.
+            let fd = unsafe {
+                libc::open(
+                    link.as_ptr(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: open returned a new descriptor that nothing else owns.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
         }
         fn process_in_tree(&self, root: u32, target: u32) -> io::Result<bool> {
             process_in_tree(root, target)
@@ -2966,6 +3043,9 @@ mod tests {
         sent: RefCell<Vec<String>>,
         send_errno: Option<i32>,  // error every send with this errno
         addfd_errno: Option<i32>, // refuse every ADDFD with this errno
+        // the real directory `open_anchor` hands back, whatever the scripted link text says
+        anchor_dir: Option<PathBuf>,
+        anchor_errno: Option<i32>, // refuse every `open_anchor` with this errno
     }
 
     impl FakeNotifier {
@@ -3080,6 +3160,15 @@ mod tests {
                     .get(&fd)
                     .map(PathBuf::from)
                     .ok_or_else(|| io::Error::other("no such fd")),
+            }
+        }
+        fn open_anchor(&self, _pid: u32, _anchor: DirAnchor) -> io::Result<OwnedFd> {
+            if let Some(errno) = self.anchor_errno {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            match &self.anchor_dir {
+                Some(dir) => Ok(OwnedFd::from(std::fs::File::open(dir)?)),
+                None => Err(io::Error::from_raw_os_error(libc::ENOSYS)),
             }
         }
         fn process_in_tree(&self, root: u32, target: u32) -> io::Result<bool> {
@@ -3527,6 +3616,130 @@ mod tests {
         assert_eq!(events[0]["matched_rule"], "failsafe:realization");
         assert_eq!(events[0]["errno"], "EMFILE");
         assert_eq!(events[0]["fact"]["path"], "/ws/file");
+    }
+
+    /// a check of `given` under `bits` from the scripted anchor, for the unit tests of the
+    /// caller's `resolve` restrictions.
+    #[cfg(target_os = "linux")]
+    fn resolve_check(
+        kernel: &FakeNotifier,
+        bits: u64,
+        anchor: Option<DirAnchor>,
+        given: &str,
+        flags: u64,
+    ) -> ResolveCheck {
+        let check = ChildResolve {
+            bits,
+            anchor,
+            given: PathBuf::from(given),
+        };
+        child_resolve_refusal(kernel, &notif(437, [0; 6]), &check, flags).unwrap()
+    }
+
+    /// the check starts from the directory object the agent holds, not from the text the link
+    /// to it reads as: the scripted text names nothing, and the real directory decides.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resolve_check_starts_from_the_real_directory_not_its_link_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/f"), b"f").unwrap();
+        let kernel = FakeNotifier {
+            cwd: "/nonexistent/where/the/text/points",
+            anchor_dir: Some(dir.path().to_path_buf()),
+            ..FakeNotifier::default()
+        };
+        let beneath = RESOLVE_BENEATH;
+        let cwd = Some(DirAnchor::Cwd);
+        assert_eq!(
+            resolve_check(&kernel, beneath, cwd, "sub/f", 0),
+            ResolveCheck::Allowed
+        );
+        assert_eq!(
+            resolve_check(&kernel, beneath, cwd, "sub/../../x", 0),
+            ResolveCheck::Refused(libc::EXDEV)
+        );
+        assert_eq!(
+            resolve_check(&kernel, beneath, cwd, "/etc/passwd", 0),
+            ResolveCheck::Refused(libc::EXDEV)
+        );
+        assert_eq!(
+            resolve_check(&kernel, 0, cwd, "../x", 0),
+            ResolveCheck::Allowed,
+            "no restriction, nothing to check"
+        );
+    }
+
+    /// a relative spelling whose directory cannot be opened is refused `EOPNOTSUPP`, never
+    /// allowed unchecked, and a notification that died meanwhile is dropped instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resolve_check_that_cannot_open_its_directory_is_refused_unless_the_notification_died() {
+        let cwd = Some(DirAnchor::Cwd);
+        let refused = FakeNotifier {
+            anchor_errno: Some(libc::EACCES),
+            ..FakeNotifier::default()
+        };
+        assert_eq!(
+            resolve_check(&refused, RESOLVE_BENEATH, cwd, "f", 0),
+            ResolveCheck::Refused(libc::EOPNOTSUPP)
+        );
+        assert_eq!(
+            resolve_check(&refused, RESOLVE_BENEATH, None, "f", 0),
+            ResolveCheck::Refused(libc::EOPNOTSUPP),
+            "a directory that was never read has nothing to open"
+        );
+        let died = FakeNotifier {
+            anchor_errno: Some(libc::ESRCH),
+            id_valid_script: RefCell::new(vec![false]),
+            ..FakeNotifier::default()
+        };
+        assert_eq!(
+            resolve_check(&died, RESOLVE_BENEATH, cwd, "f", 0),
+            ResolveCheck::Dropped
+        );
+    }
+
+    /// the handle is believed only while the notification is valid: a pid recycled after the
+    /// open must not decide the answer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resolve_check_is_dropped_when_the_notification_dies_after_the_directory_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = FakeNotifier {
+            anchor_dir: Some(dir.path().to_path_buf()),
+            id_valid_script: RefCell::new(vec![false]),
+            ..FakeNotifier::default()
+        };
+        assert_eq!(
+            resolve_check(&kernel, RESOLVE_BENEATH, Some(DirAnchor::Cwd), "../x", 0),
+            ResolveCheck::Dropped
+        );
+    }
+
+    /// `O_CREAT|O_EXCL` does not follow a final symlink, so one that leaves the directory is
+    /// not a refusal the restriction causes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exclusive_create_does_not_follow_a_final_symlink_in_the_resolve_check() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("..", dir.path().join("up")).unwrap();
+        let kernel = FakeNotifier {
+            anchor_dir: Some(dir.path().to_path_buf()),
+            ..FakeNotifier::default()
+        };
+        let cwd = Some(DirAnchor::Cwd);
+        let exclusive = (libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL) as u64;
+        assert_eq!(
+            resolve_check(&kernel, RESOLVE_BENEATH, cwd, "up", exclusive),
+            ResolveCheck::Allowed
+        );
+        let plain = (libc::O_WRONLY | libc::O_CREAT) as u64;
+        assert_eq!(
+            resolve_check(&kernel, RESOLVE_BENEATH, cwd, "up", plain),
+            ResolveCheck::Refused(libc::EXDEV),
+            "without O_EXCL the symlink is followed"
+        );
     }
 
     /// record precedes respond on the second event too: when it cannot be written the run
