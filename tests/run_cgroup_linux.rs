@@ -1953,3 +1953,86 @@ fn a_lock_that_cannot_be_bound_removes_the_run_cgroup_and_records_the_abort() {
     );
     assert_eq!(session_exit_code(result), ExitCode::from(125));
 }
+
+#[test]
+fn an_old_empty_run_cgroup_that_never_got_its_lock_is_removed_without_a_kill() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("unbound_removed") {
+        return;
+    }
+    let session = Session::new();
+    let parent = CgroupParent::locate().unwrap();
+    // what a supervisor killed between creating the cgroup and binding its lock leaves
+    let id = generate_run_id(SystemTime::now()).unwrap();
+    let leftover = parent.path().join(format!("leash-{id}"));
+    std::fs::create_dir(&leftover).unwrap();
+    let _cleanup = EmptyCgroupGuard(leftover.clone());
+    backdate(&leftover);
+
+    let run = session.run(&["/bin/true"]).unwrap();
+    run.assert_exit_zero();
+
+    assert!(!leftover.exists(), "the empty unbound run cgroup stays");
+    let cleanup: Vec<_> = run
+        .of_type("cgroup_kill")
+        .into_iter()
+        .filter(|e| e["reason"] == "stale_cleanup")
+        .collect();
+    assert_eq!(cleanup.len(), 1, "{:?}", run.events);
+    assert_eq!(cleanup[0]["cgroup"], format!("leash-{id}"));
+    assert_eq!(cleanup[0]["processes"], 0);
+    assert!(cleanup[0].get("error").is_none(), "{:?}", cleanup[0]);
+    assert!(
+        cleanup[0].get("removal_error").is_none(),
+        "{:?}",
+        cleanup[0]
+    );
+}
+
+#[test]
+fn a_young_empty_run_cgroup_may_be_a_run_about_to_bind_its_lock_and_is_left_alone() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("unbound_young_untouched") {
+        return;
+    }
+    let session = Session::new();
+    let parent = CgroupParent::locate().unwrap();
+    let id = generate_run_id(SystemTime::now()).unwrap();
+    let young = parent.path().join(format!("leash-{id}"));
+    std::fs::create_dir(&young).unwrap();
+    let _cleanup = EmptyCgroupGuard(young.clone());
+
+    let run = session.run(&["/bin/true"]).unwrap();
+    run.assert_exit_zero();
+
+    assert!(young.exists(), "a run that is setting up was removed");
+}
+
+#[test]
+fn a_populated_run_cgroup_without_a_lock_is_never_killed_or_removed() {
+    let _guard = spawn_lock();
+    if !common::delegated_cgroup_or_skip("unbound_populated_untouched") {
+        return;
+    }
+    let session = Session::new();
+    let parent = CgroupParent::locate().unwrap();
+    let id = generate_run_id(SystemTime::now()).unwrap();
+    let mut populated = Leftover::new_unbound(&parent, &format!("leash-{id}"));
+    backdate(&populated.cgroup);
+
+    let run = session.run(&["/bin/true"]).unwrap();
+    run.assert_exit_zero();
+
+    assert!(
+        populated.cgroup.exists(),
+        "the populated cgroup was removed"
+    );
+    assert!(populated.sleeper_alive(), "a process in it was killed");
+    assert!(
+        run.of_type("cgroup_kill")
+            .iter()
+            .all(|e| e["reason"] != "stale_cleanup"),
+        "nothing was cleaned: {:?}",
+        run.events
+    );
+}
